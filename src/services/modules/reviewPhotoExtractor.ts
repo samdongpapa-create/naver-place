@@ -24,11 +24,13 @@ export class ReviewPhotoExtractor {
       logs.push('[리뷰&사진] 리뷰 수 찾는 중...');
       
       const reviewPatterns = [
-        /"reviewCount["\s:]+(\d+)/i,
-        /방문자리뷰\s*(\d+)/i,
-        /리뷰\s*(\d+)/i,
-        /"visitorReviewCount["\s:]+(\d+)/i
-      ];
+  /"reviewCount["\s:]+([0-9,]+)/i,
+  /"visitorReviewCount["\s:]+([0-9,]+)/i,
+  /방문자리뷰\s*([0-9,]+)/i,
+  /리뷰\s*([0-9,]+)/i
+];
+
+reviewCount = parseInt(match[1].replace(/,/g, ''), 10);
       
       for (const pattern of reviewPatterns) {
         const match = content.match(pattern);
