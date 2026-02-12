@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["nodejs-18_x", "playwright-driver", "chromium"]
+
+[phases.install]
+cmds = ["npm install", "npx playwright install chromium --with-deps"]
+
+[phases.build]
+cmds = ["npm run build"]
+
+[start]
+cmd = "npm start"
