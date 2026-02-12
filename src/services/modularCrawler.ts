@@ -13,6 +13,8 @@ export interface CrawlResult {
   error?: string;
 }
 
+type Context = Page | Frame;
+
 export class ModularCrawler {
   private browser: Browser | null = null;
 
@@ -52,41 +54,37 @@ export class ModularCrawler {
 
       // 페이지 로드
       allLogs.push('\n=== 페이지 로딩 ===');
-      await page.goto(mobileUrl, {
-        waitUntil: 'load',
-        timeout: 60000
-      });
+      await page.goto(mobileUrl, { waitUntil: 'load', timeout: 60000 });
       allLogs.push('페이지 로드 완료');
-      await page.waitForTimeout(3000);
 
-      // iframe 접근
+      // ✅ 리다이렉트된 최종 URL도 로그에 남김
+      try {
+        allLogs.push(`최종 URL: ${page.url()}`);
+      } catch {}
+
+      await page.waitForTimeout(2500);
+
+      // ✅ iframe 있으면 사용, 없으면 page 자체를 컨텍스트로 사용
       allLogs.push('\n=== iframe 접근 ===');
-      await page.waitForSelector('iframe#entryIframe', {
-        timeout: 30000,
-        state: 'attached'
-      });
+      const frame = await this.tryGetEntryFrame(page, allLogs);
 
-      const frameElement = await page.$('iframe#entryIframe');
-      if (!frameElement) {
-        throw new Error('iframe을 찾을 수 없습니다');
+      const context: Context = frame ?? page;
+      if (frame) {
+        allLogs.push('iframe 접근 성공 → frame 컨텍스트 사용');
+      } else {
+        allLogs.push('iframe 없음 → page 컨텍스트 사용');
       }
 
-      const frame = await frameElement.contentFrame();
-      if (!frame) {
-        throw new Error('iframe 콘텐츠에 접근할 수 없습니다');
-      }
-
-      allLogs.push('iframe 접근 성공');
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(1500);
 
       // 기본 정보 추출 (이름, 주소)
       allLogs.push('\n=== 기본 정보 추출 ===');
-      const name = await this.extractName(frame);
-      const address = await this.extractAddress(frame);
+      const name = await this.extractName(context);
+      const address = await this.extractAddress(context);
       allLogs.push(`이름: ${name}`);
       allLogs.push(`주소: ${address}`);
 
-      // 2. 키워드 추출
+      // 2. 키워드 추출 (이미 page+frame 지원)
       allLogs.push('\n=== 2단계: 키워드 추출 ===');
       const keywordResult = await KeywordExtractor.extract(page, frame);
       allLogs.push(...keywordResult.logs);
@@ -101,7 +99,7 @@ export class ModularCrawler {
       const directionsResult = await DirectionsExtractor.extract(page, frame);
       allLogs.push(...directionsResult.logs);
 
-      // 5. 리뷰&사진 추출
+      // 5. 리뷰&사진 추출 (frame optional로 바꿈)
       allLogs.push('\n=== 5단계: 리뷰&사진 추출 ===');
       const reviewPhotoResult = await ReviewPhotoExtractor.extract(page, frame);
       allLogs.push(...reviewPhotoResult.logs);
@@ -126,50 +124,88 @@ export class ModularCrawler {
         logs: allLogs
       };
     } catch (error: any) {
-      await page.close();
-      allLogs.push(`\n❌ 오류 발생: ${error.message}`);
+      try {
+        await page.close();
+      } catch {}
+
+      allLogs.push(`\n❌ 오류 발생: ${error?.message || String(error)}`);
 
       return {
         success: false,
         logs: allLogs,
-        error: error.message
+        error: error?.message || String(error)
       };
     }
   }
 
-  private async extractName(frame: Frame): Promise<string> {
-    const selectors = ['.Fc1rA', '.GHAhO', 'h1'];
+  /**
+   * entryIframe이 있으면 Frame 반환, 없으면 null
+   * - 구조가 바뀌거나 iframe 없는 케이스 대응
+   */
+  private async tryGetEntryFrame(page: Page, logs: string[]): Promise<Frame | null> {
+    try {
+      // 1) 짧게 먼저 기다려보고
+      logs.push('entryIframe 탐색(빠른 시도) ...');
+      const el = await page.waitForSelector('iframe#entryIframe', {
+        timeout: 8000,
+        state: 'attached'
+      }).catch(() => null);
+
+      if (el) {
+        const fr = await el.contentFrame();
+        if (fr) return fr;
+      }
+
+      // 2) 혹시 id가 다르거나 내부 frame이 이미 생성된 케이스
+      logs.push('entryIframe 없음 → frames()로 재탐색 ...');
+      const frames = page.frames();
+      const found = frames.find(f => (f.url() || '').includes('entry') || (f.name() || '').includes('entry'));
+      if (found) return found;
+
+      return null;
+    } catch (e: any) {
+      logs.push(`iframe 탐색 중 예외(무시하고 page로 진행): ${e?.message || String(e)}`);
+      return null;
+    }
+  }
+
+  private async extractName(context: Context): Promise<string> {
+    const selectors = ['.Fc1rA', '.GHAhO', 'h1', 'h2'];
 
     for (const selector of selectors) {
       try {
-        const element = await frame.$(selector);
+        const element = await context.$(selector);
         if (element) {
           const text = await element.textContent();
-          if (text && text.trim().length > 0) {
-            return text.trim();
-          }
+          if (text && text.trim().length > 0) return text.trim();
         }
-      } catch (e) {
+      } catch {
         continue;
       }
     }
 
+    // fallback: title
+    try {
+      if ('title' in context) {
+        const t = await context.title();
+        if (t?.trim()) return t.trim();
+      }
+    } catch {}
+
     return '이름 없음';
   }
 
-  private async extractAddress(frame: Frame): Promise<string> {
-    const selectors = ['.LDgIH', '.IH3UA'];
+  private async extractAddress(context: Context): Promise<string> {
+    const selectors = ['.LDgIH', '.IH3UA', 'span[role="text"]', 'address'];
 
     for (const selector of selectors) {
       try {
-        const element = await frame.$(selector);
+        const element = await context.$(selector);
         if (element) {
           const text = await element.textContent();
-          if (text && text.trim().length > 0) {
-            return text.trim();
-          }
+          if (text && text.trim().length > 0) return text.trim();
         }
-      } catch (e) {
+      } catch {
         continue;
       }
     }
