@@ -52,30 +52,44 @@ export class ModularCrawler {
       const placeId = UrlConverter.extractPlaceId(mobileUrl);
       allLogs.push(`Place ID: ${placeId}`);
 
-      // 페이지 로드
+      // 2) 1차 페이지 로딩
       allLogs.push('\n=== 페이지 로딩 ===');
       await page.goto(mobileUrl, { waitUntil: 'load', timeout: 60000 });
       allLogs.push('페이지 로드 완료');
-
-      // ✅ 리다이렉트된 최종 URL도 로그에 남김
-      try {
-        allLogs.push(`최종 URL: ${page.url()}`);
-      } catch {}
-
+      allLogs.push(`최종 URL: ${page.url()}`);
       await page.waitForTimeout(2500);
 
-      // ✅ iframe 있으면 사용, 없으면 page 자체를 컨텍스트로 사용
+      // 3) iframe 시도
       allLogs.push('\n=== iframe 접근 ===');
-      const frame = await this.tryGetEntryFrame(page, allLogs);
+      let frame = await this.tryGetEntryFrame(page, allLogs);
+
+      // ✅ 핵심: /place/{id}에서 iframe이 없으면 /home 으로 2차 진입 시도
+      if (!frame && this.looksLikeShellPlaceUrl(page.url(), placeId)) {
+        const homeUrl = this.toHomeUrl(page.url(), placeId);
+        allLogs.push(`iframe 없음 + shell URL 감지 → /home 재시도: ${homeUrl}`);
+
+        await page.goto(homeUrl, { waitUntil: 'load', timeout: 60000 });
+        allLogs.push('(/home) 페이지 로드 완료');
+        allLogs.push(`(/home) 최종 URL: ${page.url()}`);
+        await page.waitForTimeout(2500);
+
+        // 다시 iframe 찾기
+        allLogs.push('\n=== iframe 재탐색(/home) ===');
+        frame = await this.tryGetEntryFrame(page, allLogs);
+      }
 
       const context: Context = frame ?? page;
       if (frame) {
         allLogs.push('iframe 접근 성공 → frame 컨텍스트 사용');
       } else {
+        // 여기까지 왔는데도 iframe이 없으면,
+        // 아직도 shell이거나, 구조가 또 다른 케이스
         allLogs.push('iframe 없음 → page 컨텍스트 사용');
+        const htmlLen = (await page.content()).length;
+        allLogs.push(`page HTML 길이(디버그): ${htmlLen}`);
       }
 
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(1200);
 
       // 기본 정보 추출 (이름, 주소)
       allLogs.push('\n=== 기본 정보 추출 ===');
@@ -84,7 +98,7 @@ export class ModularCrawler {
       allLogs.push(`이름: ${name}`);
       allLogs.push(`주소: ${address}`);
 
-      // 2. 키워드 추출 (이미 page+frame 지원)
+      // 2. 키워드 추출
       allLogs.push('\n=== 2단계: 키워드 추출 ===');
       const keywordResult = await KeywordExtractor.extract(page, frame);
       allLogs.push(...keywordResult.logs);
@@ -99,7 +113,7 @@ export class ModularCrawler {
       const directionsResult = await DirectionsExtractor.extract(page, frame);
       allLogs.push(...directionsResult.logs);
 
-      // 5. 리뷰&사진 추출 (frame optional로 바꿈)
+      // 5. 리뷰&사진 추출
       allLogs.push('\n=== 5단계: 리뷰&사진 추출 ===');
       const reviewPhotoResult = await ReviewPhotoExtractor.extract(page, frame);
       allLogs.push(...reviewPhotoResult.logs);
@@ -118,11 +132,7 @@ export class ModularCrawler {
         keywords: keywordResult.keywords
       };
 
-      return {
-        success: true,
-        data: placeData,
-        logs: allLogs
-      };
+      return { success: true, data: placeData, logs: allLogs };
     } catch (error: any) {
       try {
         await page.close();
@@ -140,23 +150,19 @@ export class ModularCrawler {
 
   /**
    * entryIframe이 있으면 Frame 반환, 없으면 null
-   * - 구조가 바뀌거나 iframe 없는 케이스 대응
    */
   private async tryGetEntryFrame(page: Page, logs: string[]): Promise<Frame | null> {
     try {
-      // 1) 짧게 먼저 기다려보고
       logs.push('entryIframe 탐색(빠른 시도) ...');
-      const el = await page.waitForSelector('iframe#entryIframe', {
-        timeout: 8000,
-        state: 'attached'
-      }).catch(() => null);
+      const el = await page
+        .waitForSelector('iframe#entryIframe', { timeout: 8000, state: 'attached' })
+        .catch(() => null);
 
       if (el) {
         const fr = await el.contentFrame();
         if (fr) return fr;
       }
 
-      // 2) 혹시 id가 다르거나 내부 frame이 이미 생성된 케이스
       logs.push('entryIframe 없음 → frames()로 재탐색 ...');
       const frames = page.frames();
       const found = frames.find(f => (f.url() || '').includes('entry') || (f.name() || '').includes('entry'));
@@ -166,6 +172,43 @@ export class ModularCrawler {
     } catch (e: any) {
       logs.push(`iframe 탐색 중 예외(무시하고 page로 진행): ${e?.message || String(e)}`);
       return null;
+    }
+  }
+
+  /**
+   * /place/{id} 같은 shell URL인지 판단
+   * - iframe이 없고, URL이 /place/{id}로 끝나는 경우가 흔함
+   */
+  private looksLikeShellPlaceUrl(currentUrl: string, placeId: string): boolean {
+    try {
+      const u = new URL(currentUrl);
+      const path = u.pathname.replace(/\/+$/, '');
+      // 예: /place/1443688242
+      return path === `/place/${placeId}`;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * /place/{id} → /place/{id}/home 으로 변환
+   */
+  private toHomeUrl(currentUrl: string, placeId: string): string {
+    try {
+      const u = new URL(currentUrl);
+      const path = u.pathname.replace(/\/+$/, '');
+      if (path === `/place/${placeId}`) {
+        u.pathname = `/place/${placeId}/home`;
+        return u.toString();
+      }
+      // 혹시 다른 형태면 마지막에 /home 붙이기
+      if (!path.endsWith('/home')) {
+        u.pathname = `${path}/home`;
+      }
+      return u.toString();
+    } catch {
+      // fallback
+      return `https://m.place.naver.com/place/${placeId}/home`;
     }
   }
 
