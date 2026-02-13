@@ -24,7 +24,7 @@ export class DirectionsExtractor {
       const fromPage = await this.extractFromHtml(await page.content(), logs, 'page');
       if (fromPage) return { directions: fromPage, logs };
 
-      // 3) DOM fallback (라벨 주변 텍스트만 뽑고, 길면 자동 요약/컷)
+      // 3) DOM fallback (라벨 주변에서 "무조건" 텍스트 가져온 뒤, 밖에서 컷)
       logs.push('[오시는길] HTML 실패 → DOM fallback 시도');
 
       const raw = await page.evaluate(() => {
@@ -36,39 +36,40 @@ export class DirectionsExtractor {
 
         const nodes: any[] = Array.from(d.querySelectorAll('h1,h2,h3,strong,span,div,p,li') || []);
 
-        // 라벨 찾기
         const labelEl = nodes.find((node: any) => {
           const t = normalize(node?.textContent || '');
           return labels.some(l => t === l || t.includes(l));
         });
 
-        const pickText = (node: any) => {
-          if (!node) return '';
-          const t = normalize(node.textContent || '');
-          const cleaned = t
+        const cleanLabel = (t: string) =>
+          t
             .replace(/오시는길|오시는 길|찾아오는길|찾아오는 길|오시는방법|방문 안내/g, '')
             .replace(/^[:\-]\s*/, '')
             .trim();
-          return cleaned;
-        };
 
-        // ✅ 1) 라벨이 있으면: "라벨의 카드(가까운 부모)"에서만 텍스트 추출
+        const textOf = (node: any) => cleanLabel(normalize(node?.textContent || ''));
+
+        // ✅ 1) 라벨이 있으면: 조상으로 올라가며 가장 "긴 텍스트"를 하나 잡는다(상한 없음)
         if (labelEl) {
+          let best = '';
           let cur: any = labelEl;
-          for (let i = 0; i < 6; i++) {
+
+          for (let i = 0; i < 10; i++) {
             cur = cur?.parentElement || null;
-            const txt = pickText(cur);
-            // 너무 긴 카드(전체페이지)면 제외
-            if (txt && txt.length >= 10 && txt.length <= 2000) return txt;
+            if (!cur) break;
+            const t = textOf(cur);
+            if (t.length > best.length) best = t;
           }
 
-          // 다음 형제에서 텍스트
+          // 다음 형제도 후보로
           const next = labelEl?.nextElementSibling || null;
-          const nextTxt = pickText(next);
-          if (nextTxt && nextTxt.length <= 2000) return nextTxt;
+          const nextText = textOf(next);
+          if (nextText.length > best.length) best = nextText;
+
+          return best || '';
         }
 
-        // ✅ 2) 라벨이 못 잡히면: 이동 힌트 문장만 “선별”해서 합치기 (전체 body 반환 금지)
+        // ✅ 2) 라벨이 없으면: 페이지 전체에서 "이동 관련 문장"만 골라서 합치기(전체 body 반환 금지)
         const body = normalize(d.body?.innerText || '');
         const lines = body
           .split(/\n|\r|•|·/g)
@@ -79,7 +80,7 @@ export class DirectionsExtractor {
           /출구|도보|미터|m\b|분\b|역\b|버스|주차|주차장|길찾기|건물|층|입구/.test(s)
         );
 
-        return picked.slice(0, 10).join('\n');
+        return picked.slice(0, 12).join('\n');
       });
 
       const cleaned = this.postProcess(String(raw || ''));
