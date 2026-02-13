@@ -10,7 +10,7 @@ export class ReviewPhotoExtractor {
     try {
       logs.push('[리뷰&사진] 추출 시작');
 
-      // 1) 홈에서 리뷰는 최대값으로 잡기
+      // 1) 홈에서 리뷰: 최대값
       const homeHtml = await page.content();
 
       const reviewCount = this.extractMaxNumber(homeHtml, [
@@ -19,7 +19,7 @@ export class ReviewPhotoExtractor {
         /방문자리뷰\s*([0-9,]+)/gi
       ], logs, '리뷰');
 
-      // 홈에서 사진은 오탐이 많으니 참고만(탭 숫자 가능)
+      // 홈 사진 힌트(오탐 가능)
       const homePhotoHint = this.extractMaxNumber(homeHtml, [
         /"photoCount"[\s":]+([0-9,]+)/gi,
         /"imageCount"[\s":]+([0-9,]+)/gi,
@@ -28,7 +28,7 @@ export class ReviewPhotoExtractor {
 
       logs.push(`[리뷰&사진] 홈 기준 - 리뷰:${reviewCount}, 사진후보:${homePhotoHint}`);
 
-      // 2) 사진 탭으로 이동해서 DOM으로 “사진 n”을 직접 찾는다
+      // 2) 사진 탭으로 이동
       const photoUrl = this.buildPhotoUrl(page.url());
       logs.push(`[리뷰&사진] 사진탭 이동: ${photoUrl}`);
 
@@ -36,55 +36,71 @@ export class ReviewPhotoExtractor {
 
       try {
         await page.goto(photoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(1800);
+        await page.waitForTimeout(2000);
 
-        // DOM에서 숫자 찾기 (줄바꿈 유지 후 라인 스캔)
-        const domNum = await page.evaluate(() => {
+        // ✅ 2-1) DOM에서 “사진 1,234” 텍스트를 최우선으로 찾는다
+        const domResult = await page.evaluate(() => {
           const d: any = (globalThis as any).document;
-          if (!d || !d.body) return 0;
+          if (!d || !d.body) return { best: 0, samples: [] as string[] };
+
+          const normalizeLine = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
 
           const raw = String(d.body.innerText || '');
           const lines = raw
             .split(/\r?\n|•|·/g)
-            .map(s => (s || '').replace(/\s+/g, ' ').trim())
+            .map(normalizeLine)
             .filter(s => s.length > 0 && s.length <= 200);
 
-          // "사진 1,234" 같은 패턴을 최우선
+          const samples: string[] = [];
           const nums: number[] = [];
 
+          // 우선순위 1: “사진 1,234” (정확)
           for (const line of lines) {
-            // 예: "사진 1,234", "사진(1,234)", "사진 · 1,234"
-            const m = line.match(/사진\s*[\(\·:]?\s*([0-9][0-9,]{0,})/);
+            const m = line.match(/^사진\s*([0-9][0-9,]{0,})$/) || line.match(/사진\s*[:\(\·]?\s*([0-9][0-9,]{0,})/);
             if (m?.[1]) {
               const n = parseInt(m[1].replace(/,/g, ''), 10);
-              if (!Number.isNaN(n) && n > 0) nums.push(n);
+              if (!Number.isNaN(n) && n > 0) {
+                nums.push(n);
+                if (samples.length < 8) samples.push(line);
+              }
             }
           }
 
-          // 그래도 없으면, 페이지 전체에서 "사진" 근처 숫자 찾기
+          // 우선순위 2: “전체 사진”, “포토”, “이미지” 등 변형
           if (!nums.length) {
-            const all = raw.replace(/\s+/g, ' ');
-            const m2 = all.match(/사진[^0-9]{0,10}([0-9][0-9,]{0,})/);
-            if (m2?.[1]) {
-              const n = parseInt(m2[1].replace(/,/g, ''), 10);
-              if (!Number.isNaN(n) && n > 0) nums.push(n);
+            for (const line of lines) {
+              const m =
+                line.match(/(전체\s*)?(사진|포토|이미지)\s*[:\(\·]?\s*([0-9][0-9,]{0,})/) ||
+                line.match(/([0-9][0-9,]{0,})\s*(장|개)\s*(사진|포토|이미지)/);
+              if (m) {
+                const rawNum = m[3] || m[1];
+                const n = parseInt(String(rawNum).replace(/,/g, ''), 10);
+                if (!Number.isNaN(n) && n > 0) {
+                  nums.push(n);
+                  if (samples.length < 8) samples.push(line);
+                }
+              }
             }
           }
 
-          if (!nums.length) return 0;
-          return Math.max(...nums);
+          const best = nums.length ? Math.max(...nums) : 0;
+          return { best, samples };
         });
 
-        if (domNum && domNum > 0) {
-          photoCount = domNum;
-          logs.push(`[리뷰&사진] 사진탭 DOM에서 photoCount 발견: ${photoCount}`);
+        logs.push(`[리뷰&사진] 사진탭 DOM samples: ${(domResult?.samples || []).join(' | ')}`);
+
+        if (domResult?.best && domResult.best > 0) {
+          photoCount = domResult.best;
+          logs.push(`[리뷰&사진] 사진탭 DOM에서 photoCount 확정: ${photoCount}`);
         } else {
-          // DOM이 실패하면 HTML에서도 한 번 더 최대값 시도
+          // ✅ 2-2) DOM 실패 시 HTML 키 확장해서 최대값
           const photoHtml = await page.content();
           const htmlNum = this.extractMaxNumber(photoHtml, [
             /"totalPhotoCount"[\s":]+([0-9,]+)/gi,
             /"photoTotalCount"[\s":]+([0-9,]+)/gi,
             /"imageTotalCount"[\s":]+([0-9,]+)/gi,
+            /"ugcPhotoCount"[\s":]+([0-9,]+)/gi,
+            /"placePhotoCount"[\s":]+([0-9,]+)/gi,
             /"photoCount"[\s":]+([0-9,]+)/gi,
             /"imageCount"[\s":]+([0-9,]+)/gi
           ], logs, '사진(탭-HTML)');
@@ -96,9 +112,15 @@ export class ReviewPhotoExtractor {
         logs.push(`[리뷰&사진] 사진탭 이동/추출 실패: ${e?.message || String(e)}`);
       }
 
-      // 3) 탭 숫자 오탐 컷: 1~4는 버림, 5도 애매하면(선택) 보류
+      // ✅ 3) 오탐 컷 강화:
+      // - 1~4 무조건 오탐
+      // - "5"도 탭 숫자일 가능성이 높아서: 리뷰가 수천인데 사진이 5면 비정상 → 0 처리
       if (photoCount > 0 && photoCount < 5) {
         logs.push(`[리뷰&사진] 사진 최종값 ${photoCount}는 오탐 가능 → 0 처리`);
+        photoCount = 0;
+      }
+      if (photoCount === 5 && reviewCount >= 200) {
+        logs.push('[리뷰&사진] 사진=5 & 리뷰가 많음 → 탭 숫자 오탐으로 판단, 0 처리');
         photoCount = 0;
       }
 
