@@ -24,61 +24,65 @@ export class DirectionsExtractor {
       const fromPage = await this.extractFromHtml(await page.content(), logs, 'page');
       if (fromPage) return { directions: fromPage, logs };
 
-      // 3) DOM fallback
+      // 3) DOM fallback (라벨 주변 텍스트만 뽑고, 길면 자동 요약/컷)
       logs.push('[오시는길] HTML 실패 → DOM fallback 시도');
 
-      const domText = await page.evaluate(() => {
+      const raw = await page.evaluate(() => {
         const d: any = (globalThis as any).document;
         if (!d) return '';
 
-        const labels = ['오시는길', '오시는 길', '찾아오는길', '찾아오는 길', '오시는방법', '방문 안내'];
         const normalize = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
+        const labels = ['오시는길', '오시는 길', '찾아오는길', '찾아오는 길', '오시는방법', '방문 안내'];
 
         const nodes: any[] = Array.from(d.querySelectorAll('h1,h2,h3,strong,span,div,p,li') || []);
+
+        // 라벨 찾기
         const labelEl = nodes.find((node: any) => {
           const t = normalize(node?.textContent || '');
           return labels.some(l => t === l || t.includes(l));
         });
 
-        const pickLongText = (node: any) => {
+        const pickText = (node: any) => {
           if (!node) return '';
           const t = normalize(node.textContent || '');
-          if (t.length < 10) return '';
           const cleaned = t
             .replace(/오시는길|오시는 길|찾아오는길|찾아오는 길|오시는방법|방문 안내/g, '')
             .replace(/^[:\-]\s*/, '')
             .trim();
-          return cleaned.length >= 10 ? cleaned : '';
+          return cleaned;
         };
 
-        // 라벨을 못 찾으면, 페이지 전체에서 이동 힌트 문장 찾기
-        if (!labelEl) {
-          const body = normalize(d.body?.innerText || '');
-          const parts = body
-            .split(/\n|\r|\t|•|·/g)
-            .map(s => normalize(s))
-            .filter(s => s.length >= 10);
-          const hint = parts.find(s => /출구|도보|미터|m|분|역|버스|주차|주차장|길찾기/.test(s));
-          return hint || '';
+        // ✅ 1) 라벨이 있으면: "라벨의 카드(가까운 부모)"에서만 텍스트 추출
+        if (labelEl) {
+          let cur: any = labelEl;
+          for (let i = 0; i < 6; i++) {
+            cur = cur?.parentElement || null;
+            const txt = pickText(cur);
+            // 너무 긴 카드(전체페이지)면 제외
+            if (txt && txt.length >= 10 && txt.length <= 2000) return txt;
+          }
+
+          // 다음 형제에서 텍스트
+          const next = labelEl?.nextElementSibling || null;
+          const nextTxt = pickText(next);
+          if (nextTxt && nextTxt.length <= 2000) return nextTxt;
         }
 
-        // 부모로 올라가며 텍스트 찾기
-        let cur: any = labelEl;
-        for (let i = 0; i < 7; i++) {
-          cur = cur?.parentElement || null;
-          const text = pickLongText(cur);
-          if (text) return text;
-        }
+        // ✅ 2) 라벨이 못 잡히면: 이동 힌트 문장만 “선별”해서 합치기 (전체 body 반환 금지)
+        const body = normalize(d.body?.innerText || '');
+        const lines = body
+          .split(/\n|\r|•|·/g)
+          .map(s => normalize(s))
+          .filter(s => s.length >= 8 && s.length <= 200);
 
-        // 다음 형제
-        const next = labelEl?.nextElementSibling || null;
-        const nextText = pickLongText(next);
-        if (nextText) return nextText;
+        const picked = lines.filter(s =>
+          /출구|도보|미터|m\b|분\b|역\b|버스|주차|주차장|길찾기|건물|층|입구/.test(s)
+        );
 
-        return '';
+        return picked.slice(0, 10).join('\n');
       });
 
-      const cleaned = String(domText || '').trim();
+      const cleaned = this.postProcess(String(raw || ''));
       if (cleaned) {
         logs.push(`[오시는길] DOM fallback 성공 (${cleaned.length}자)`);
         return { directions: cleaned, logs };
@@ -95,7 +99,6 @@ export class DirectionsExtractor {
   private static async extractFromHtml(html: string, logs: string[], label: string): Promise<string> {
     logs.push(`[오시는길] ${label} HTML 길이: ${html.length}`);
 
-    // matchAll 제거 -> match만 사용 (g 필요 없음)
     const patterns: RegExp[] = [
       /"wayToCome"\s*:\s*"([^"]{10,8000})"/,
       /"directions"\s*:\s*"([^"]{10,8000})"/,
@@ -117,12 +120,26 @@ export class DirectionsExtractor {
     }
 
     if (best) {
-      logs.push(`[오시는길] ${label} 패턴 성공 (${best.length}자)`);
-      return best;
+      const processed = this.postProcess(best);
+      logs.push(`[오시는길] ${label} 패턴 성공 (${processed.length}자)`);
+      return processed;
     }
 
     logs.push(`[오시는길] ${label} 패턴 실패`);
     return '';
+  }
+
+  private static postProcess(s: string): string {
+    const t = s
+      .replace(/\r/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+
+    // 너무 길면 상위 12줄만 + 최대 800자 컷
+    const lines = t.split('\n').map(x => x.trim()).filter(Boolean);
+    const top = lines.slice(0, 12).join('\n');
+
+    return top.length > 800 ? top.slice(0, 800).trim() : top;
   }
 
   private static clean(s: string) {
