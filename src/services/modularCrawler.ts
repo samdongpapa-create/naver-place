@@ -7,15 +7,22 @@ import { DirectionsExtractor } from './modules/directionsExtractor';
 import { ReviewPhotoExtractor } from './modules/reviewPhotoExtractor';
 import { NextDataParser } from './modules/nextDataParser';
 import { UiExpander } from './modules/uiExpander';
+import { PriceExtractor } from './modules/priceExtractor';
 
 export interface CrawlResult {
   success: boolean;
-  data?: PlaceData;
+  data?: PlaceDataWithPrice;
   logs: string[];
   error?: string;
 }
 
 type ContextType = Page | Frame;
+
+export type MenuItem = { name: string; price: string; desc: string };
+export type PlaceDataWithPrice = PlaceData & {
+  menuCount?: number;
+  menus?: MenuItem[];
+};
 
 export class ModularCrawler {
   private browser: Browser | null = null;
@@ -55,7 +62,7 @@ export class ModularCrawler {
       const placeId = placeIdMaybe;
 
       logs.push(`Place ID: ${placeId}`);
-      logs.push('*** DEPLOY CHECK: modularCrawler vFINAL-EXPAND-20260213 ***');
+      logs.push('*** DEPLOY CHECK: modularCrawler vFINAL-EXPAND-PRICE-20260213 ***');
 
       context = await this.browser!.newContext({
         userAgent:
@@ -173,8 +180,22 @@ export class ModularCrawler {
         directions = d.directions;
       }
 
+      // ✅ 가격/메뉴 (리뷰/사진 전에 실행: page가 /photo로 이동되기 전에 안정적으로 뽑기)
+      logs.push('\n=== 5단계: 가격/메뉴 ===');
+      let menuCount = 0;
+      let menus: MenuItem[] = [];
+
+      try {
+        const p = await PriceExtractor.extract(page, frame);
+        logs.push(...p.logs);
+        menuCount = p.menuCount;
+        menus = (p.menus || []).slice(0, 30);
+      } catch (e: any) {
+        logs.push(`[가격/메뉴] 모듈 오류(무시): ${e?.message || String(e)}`);
+      }
+
       // 리뷰/사진
-      logs.push('\n=== 5단계: 리뷰/사진 ===');
+      logs.push('\n=== 6단계: 리뷰/사진 ===');
       let reviewCount = nextFallback.reviewCount ?? 0;
       let photoCount = nextFallback.photoCount ?? 0;
 
@@ -190,7 +211,17 @@ export class ModularCrawler {
 
       return {
         success: true,
-        data: { name, address, reviewCount, photoCount, description, directions, keywords },
+        data: {
+          name,
+          address,
+          reviewCount,
+          photoCount,
+          description,
+          directions,
+          keywords,
+          menuCount,
+          menus
+        },
         logs
       };
     } catch (err: any) {
