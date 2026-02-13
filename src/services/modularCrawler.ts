@@ -54,9 +54,9 @@ export class ModularCrawler {
       const placeId = placeIdMaybe;
 
       logs.push(`Place ID: ${placeId}`);
-      logs.push('*** DEPLOY CHECK: modularCrawler vFINAL-20260213 ***');
+      logs.push('*** DEPLOY CHECK: modularCrawler vFINAL-ADDR-20260213 ***');
 
-      // ✅ Playwright context 방식 (UA/Viewport 설정은 여기서!)
+      // ✅ context에서 UA/Viewport 세팅
       context = await this.browser!.newContext({
         userAgent:
           'Mozilla/5.0 (Linux; Android 13; SM-G991N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36',
@@ -69,9 +69,7 @@ export class ModularCrawler {
       const page = await context.newPage();
       logs.push('*** UA/CONTEXT SET OK ***');
 
-      // =============================
       // 1차 로딩
-      // =============================
       logs.push('\n=== 페이지 로딩 ===');
       await page.goto(mobileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await page.waitForTimeout(2500);
@@ -79,11 +77,9 @@ export class ModularCrawler {
       logs.push('페이지 로드 완료');
       logs.push(`최종 URL: ${page.url()}`);
 
-      // =============================
       // iframe 탐색
-      // =============================
       logs.push('\n=== iframe 접근 ===');
-      let frame = await this.tryGetEntryFrame(page, logs);
+      let frame = await this.tryGetEntryFrame(page);
 
       // shell이면 /home 재시도
       if (!frame && this.isShellUrl(page.url(), placeId)) {
@@ -96,14 +92,12 @@ export class ModularCrawler {
         logs.push('(/home) 페이지 로드 완료');
         logs.push(`(/home) 최종 URL: ${page.url()}`);
 
-        frame = await this.tryGetEntryFrame(page, logs);
+        frame = await this.tryGetEntryFrame(page);
       }
 
       const contentContext: ContextType = frame ?? page;
 
-      // =============================
-      // NEXT fallback
-      // =============================
+      // NEXT fallback (있으면 쓰고, 없어도 DOM/regex로 계속 감)
       let nextFallback: Partial<PlaceData> = {};
       if (!frame) {
         logs.push('*** NEXT FALLBACK CODE PATH ENTERED ***');
@@ -132,19 +126,23 @@ export class ModularCrawler {
         logs.push('iframe 접근 성공');
       }
 
-      // =============================
-      // 기본 정보
-      // =============================
+      // 기본 정보 (주소는 DOM 실패 시 HTML regex fallback 추가)
       logs.push('\n=== 기본 정보 추출 ===');
-      const name = nextFallback.name || (await this.extractName(contentContext));
-      const address = nextFallback.address || (await this.extractAddress(contentContext));
+      const name = nextFallback.name || (await this.extractName(contentContext)) || '이름 없음';
+      let address = nextFallback.address || (await this.extractAddress(contentContext)) || '';
+
+      if (!address || address === '주소 없음') {
+        logs.push('[주소] DOM에서 실패 → HTML regex fallback 시도');
+        const html = await page.content();
+        address = this.extractAddressFromHtml(html) || '';
+      }
+
+      if (!address) address = '주소 없음';
 
       logs.push(`이름: ${name}`);
       logs.push(`주소: ${address}`);
 
-      // =============================
       // 키워드
-      // =============================
       logs.push('\n=== 2단계: 키워드 ===');
       let keywords = nextFallback.keywords || [];
       if (!keywords.length) {
@@ -153,9 +151,7 @@ export class ModularCrawler {
         keywords = k.keywords;
       }
 
-      // =============================
       // 상세설명
-      // =============================
       logs.push('\n=== 3단계: 상세설명 ===');
       let description = nextFallback.description || '';
       if (!description) {
@@ -164,9 +160,7 @@ export class ModularCrawler {
         description = d.description;
       }
 
-      // =============================
       // 오시는길
-      // =============================
       logs.push('\n=== 4단계: 오시는길 ===');
       let directions = nextFallback.directions || '';
       if (!directions) {
@@ -175,14 +169,13 @@ export class ModularCrawler {
         directions = d.directions;
       }
 
-      // =============================
       // 리뷰/사진
-      // =============================
       logs.push('\n=== 5단계: 리뷰/사진 ===');
       let reviewCount = nextFallback.reviewCount ?? 0;
       let photoCount = nextFallback.photoCount ?? 0;
 
-      if (reviewCount === 0 && photoCount === 0) {
+      // 둘 다 0이거나, 사진이 1 같은 오탐일 때만 extractor 재시도
+      if ((reviewCount === 0 && photoCount === 0) || (photoCount > 0 && photoCount < 5)) {
         const r = await ReviewPhotoExtractor.extract(page, frame);
         logs.push(...r.logs);
         reviewCount = r.reviewCount;
@@ -206,20 +199,20 @@ export class ModularCrawler {
         },
         logs
       };
-
     } catch (err: any) {
-      if (context) await context.close();
+      try {
+        if (context) await context.close();
+      } catch {}
       logs.push(`❌ 오류: ${err?.message || String(err)}`);
       return { success: false, logs, error: err?.message || String(err) };
     }
   }
 
-  private async tryGetEntryFrame(page: Page, logs: string[]): Promise<Frame | null> {
+  private async tryGetEntryFrame(page: Page): Promise<Frame | null> {
     try {
-      const el = await page.waitForSelector('iframe#entryIframe', {
-        timeout: 8000,
-        state: 'attached'
-      }).catch(() => null);
+      const el = await page
+        .waitForSelector('iframe#entryIframe', { timeout: 8000, state: 'attached' })
+        .catch(() => null);
 
       if (el) {
         const fr = await el.contentFrame();
@@ -258,7 +251,13 @@ export class ModularCrawler {
   }
 
   private async extractAddress(context: ContextType): Promise<string> {
-    const selectors = ['.LDgIH', '.IH3UA', 'address'];
+    const selectors = [
+      '.LDgIH',
+      '.IH3UA',
+      'address',
+      'span[class*="address"]',
+      'div[class*="address"]'
+    ];
     for (const sel of selectors) {
       try {
         const el = await context.$(sel);
@@ -269,5 +268,26 @@ export class ModularCrawler {
       } catch {}
     }
     return '주소 없음';
+  }
+
+  private extractAddressFromHtml(html: string): string | null {
+    // 네이버가 스크립트/JSON으로 박아두는 주소 키들 후보
+    const patterns = [
+      /"roadAddress"\s*:\s*"([^"]+)"/,
+      /"roadAddr"\s*:\s*"([^"]+)"/,
+      /"address"\s*:\s*"([^"]{5,200})"/,
+      /"addr"\s*:\s*"([^"]{5,200})"/
+    ];
+
+    for (const p of patterns) {
+      const m = html.match(p);
+      if (m?.[1]) {
+        return m[1]
+          .replace(/\\n/g, ' ')
+          .replace(/\\"/g, '"')
+          .trim();
+      }
+    }
+    return null;
   }
 }
