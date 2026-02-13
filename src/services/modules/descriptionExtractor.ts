@@ -1,61 +1,67 @@
 import { Page, Frame } from 'playwright';
 
-export class DirectionsExtractor {
+export class DescriptionExtractor {
   static async extract(
     page: Page,
     frame?: Frame | null
-  ): Promise<{ directions: string; logs: string[] }> {
+  ): Promise<{ description: string; logs: string[] }> {
     const logs: string[] = [];
 
     try {
-      logs.push('[오시는길] 추출 시작');
+      logs.push('[상세설명] 추출 시작');
 
+      // iframe 우선
       if (frame) {
-        logs.push('[오시는길] iframe에서 우선 추출 시도');
+        logs.push('[상세설명] iframe에서 추출 시도');
         const fromFrame = await this.extractFromHtml(await frame.content(), logs, 'iframe');
-        if (fromFrame) return { directions: fromFrame, logs };
+        if (fromFrame) {
+          return { description: fromFrame, logs };
+        }
       } else {
-        logs.push('[오시는길] frame 없음 → iframe 추출 스킵');
+        logs.push('[상세설명] frame 없음 → iframe 스킵');
       }
 
-      logs.push('[오시는길] page에서 fallback 추출 시도');
+      // page fallback
+      logs.push('[상세설명] page에서 fallback 추출');
       const fromPage = await this.extractFromHtml(await page.content(), logs, 'page');
-      if (fromPage) return { directions: fromPage, logs };
+      if (fromPage) {
+        return { description: fromPage, logs };
+      }
 
-      logs.push('[오시는길] 추출 실패');
-      return { directions: '', logs };
+      logs.push('[상세설명] 추출 실패');
+      return { description: '', logs };
+
     } catch (error: any) {
-      logs.push(`[오시는길] 오류: ${error?.message || String(error)}`);
-      return { directions: '', logs };
+      logs.push(`[상세설명] 오류: ${error?.message || String(error)}`);
+      return { description: '', logs };
     }
   }
 
-  private static async extractFromHtml(html: string, logs: string[], label: string): Promise<string> {
-    logs.push(`[오시는길] ${label} HTML 길이: ${html.length}`);
+  private static async extractFromHtml(
+    html: string,
+    logs: string[],
+    label: string
+  ): Promise<string> {
 
-    // ✅ 네이버에서 오시는길/안내문에 쓰는 키들 후보를 넓게 잡음
+    logs.push(`[상세설명] ${label} HTML 길이: ${html.length}`);
+
     const patterns = [
-      /"wayToCome"\s*:\s*"([^"]{10,4000})"/,
-      /"directions"\s*:\s*"([^"]{10,4000})"/,
-      /"route"\s*:\s*"([^"]{10,4000})"/,
-      /"transport"\s*:\s*"([^"]{10,4000})"/,
-      /"comeRoute"\s*:\s*"([^"]{10,4000})"/,
-      /"visitGuide"\s*:\s*"([^"]{10,4000})"/,
-      /"guide"\s*:\s*"([^"]{10,4000})"/
+      /"description"\s*:\s*"([^"]{20,5000})"/,
+      /"placeDescription"\s*:\s*"([^"]{20,5000})"/,
+      /"intro"\s*:\s*"([^"]{20,5000})"/,
+      /"businessSummary"\s*:\s*"([^"]{20,5000})"/
     ];
 
     for (const p of patterns) {
       const m = html.match(p);
       if (m?.[1]) {
-        const text = this.clean(m[1]);
-        if (text.length >= 10) {
-          logs.push(`[오시는길] ${label}에서 패턴 매칭 성공 (${text.length}자)`);
-          return text;
-        }
+        const cleaned = this.clean(m[1]);
+        logs.push(`[상세설명] ${label} 패턴 매칭 성공 (${cleaned.length}자)`);
+        return cleaned;
       }
     }
 
-    logs.push(`[오시는길] ${label} 패턴 매칭 실패`);
+    logs.push(`[상세설명] ${label} 패턴 매칭 실패`);
     return '';
   }
 
