@@ -22,7 +22,14 @@ export class ModularCrawler {
   async initialize(): Promise<void> {
     this.browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--single-process'
+      ]
     });
   }
 
@@ -52,15 +59,22 @@ export class ModularCrawler {
       const placeIdMaybe = UrlConverter.extractPlaceId(mobileUrl);
       if (!placeIdMaybe) throw new Error('Place ID를 추출할 수 없습니다. URL 형식을 확인하세요.');
       const placeId: string = placeIdMaybe;
-
       allLogs.push(`Place ID: ${placeId}`);
 
-      // ✅ 헤드리스에서 너무 “봇” 티 안 나게 최소 세팅
+      // ✅ “배포된 코드가 바뀌었는지” 확인용 고유 로그
+      allLogs.push('*** DEPLOY CHECK: modularCrawler vNEXT-20260213 ***');
+
+      // ✅ UA/헤더/뷰포트 세팅
       await page.setViewportSize({ width: 390, height: 844 });
       await page.setExtraHTTPHeaders({
         'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
       });
+      await page.setUserAgent(
+        'Mozilla/5.0 (Linux; Android 13; SM-G991N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36'
+      );
+      allLogs.push('*** UA/HEADERS SET OK ***');
 
+      // 1차 로딩
       allLogs.push('\n=== 페이지 로딩 ===');
       await page.goto(mobileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await page.waitForTimeout(2500);
@@ -68,11 +82,11 @@ export class ModularCrawler {
       allLogs.push('페이지 로드 완료');
       allLogs.push(`최종 URL: ${page.url()}`);
 
-      // iframe 접근
+      // iframe 탐색
       allLogs.push('\n=== iframe 접근 ===');
       let frame = await this.tryGetEntryFrame(page, allLogs);
 
-      // /place/{id} shell이면 /home 재시도
+      // shell이면 /home 재시도
       if (!frame && this.looksLikeShellPlaceUrl(page.url(), placeId)) {
         const homeUrl = this.toHomeUrl(page.url(), placeId);
         allLogs.push(`iframe 없음 + shell URL 감지 → /home 재시도: ${homeUrl}`);
@@ -89,10 +103,10 @@ export class ModularCrawler {
 
       const context: Context = frame ?? page;
 
-      // ✅ iframe이 없으면: __NEXT_DATA__ 파싱 시도
+      // ✅ iframe이 없으면 NEXT fallback 시도 (로그가 무조건 찍혀야 정상)
       let nextFallback: Partial<PlaceData> = {};
       if (!frame) {
-        allLogs.push('iframe 없음 → __NEXT_DATA__ 파싱 fallback 시도');
+        allLogs.push('*** NEXT FALLBACK CODE PATH ENTERED ***');
         const html = await page.content();
         allLogs.push(`page HTML 길이(디버그): ${html.length}`);
 
@@ -119,14 +133,14 @@ export class ModularCrawler {
         allLogs.push('iframe 접근 성공 → frame 컨텍스트 사용');
       }
 
-      // 기본 정보 추출 (이름, 주소) — nextFallback 우선
+      // 기본 정보
       allLogs.push('\n=== 기본 정보 추출 ===');
       const name = nextFallback.name || (await this.extractName(context));
       const address = nextFallback.address || (await this.extractAddress(context));
       allLogs.push(`이름: ${name}`);
       allLogs.push(`주소: ${address}`);
 
-      // 이하 항목들도 nextFallback이 있으면 우선 사용, 없으면 기존 extractor 시도
+      // 키워드
       allLogs.push('\n=== 2단계: 키워드 추출 ===');
       let keywords = nextFallback.keywords || [];
       if (!keywords.length) {
@@ -137,6 +151,7 @@ export class ModularCrawler {
         allLogs.push(`[키워드] NEXT fallback 사용: ${keywords.join(', ')}`);
       }
 
+      // 상세설명
       allLogs.push('\n=== 3단계: 상세설명 추출 ===');
       let description = nextFallback.description || '';
       if (!description) {
@@ -147,6 +162,7 @@ export class ModularCrawler {
         allLogs.push(`[상세설명] NEXT fallback 사용 (${description.length}자)`);
       }
 
+      // 오시는길
       allLogs.push('\n=== 4단계: 오시는길 추출 ===');
       let directions = nextFallback.directions || '';
       if (!directions) {
@@ -157,6 +173,7 @@ export class ModularCrawler {
         allLogs.push(`[오시는길] NEXT fallback 사용 (${directions.length}자)`);
       }
 
+      // 리뷰/사진
       allLogs.push('\n=== 5단계: 리뷰&사진 추출 ===');
       let reviewCount = nextFallback.reviewCount ?? 0;
       let photoCount = nextFallback.photoCount ?? 0;
@@ -198,12 +215,10 @@ export class ModularCrawler {
         const fr = await el.contentFrame();
         if (fr) return fr;
       }
-
       logs.push('entryIframe 없음 → frames()로 재탐색 ...');
       const frames = page.frames();
       const found = frames.find(f => (f.url() || '').includes('entry') || (f.name() || '').includes('entry'));
       if (found) return found;
-
       return null;
     } catch (e: any) {
       logs.push(`iframe 탐색 중 예외(무시하고 page로 진행): ${e?.message || String(e)}`);
@@ -240,10 +255,10 @@ export class ModularCrawler {
     const selectors = ['.Fc1rA', '.GHAhO', 'h1', 'h2'];
     for (const selector of selectors) {
       try {
-        const element = await context.$(selector);
-        if (element) {
-          const text = await element.textContent();
-          if (text && text.trim().length > 0) return text.trim();
+        const el = await context.$(selector);
+        if (el) {
+          const t = await el.textContent();
+          if (t?.trim()) return t.trim();
         }
       } catch {}
     }
@@ -260,10 +275,10 @@ export class ModularCrawler {
     const selectors = ['.LDgIH', '.IH3UA', 'span[role="text"]', 'address'];
     for (const selector of selectors) {
       try {
-        const element = await context.$(selector);
-        if (element) {
-          const text = await element.textContent();
-          if (text && text.trim().length > 0) return text.trim();
+        const el = await context.$(selector);
+        if (el) {
+          const t = await el.textContent();
+          if (t?.trim()) return t.trim();
         }
       } catch {}
     }
