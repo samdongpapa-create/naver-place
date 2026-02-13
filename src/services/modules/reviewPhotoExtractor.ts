@@ -10,23 +10,15 @@ export class ReviewPhotoExtractor {
     try {
       logs.push('[리뷰&사진] 추출 시작');
 
-      // 1) 홈에서 리뷰: 최대값
+      // 1) 홈에서 리뷰 수는 최대값으로
       const homeHtml = await page.content();
-
       const reviewCount = this.extractMaxNumber(homeHtml, [
         /"visitorReviewCount"[\s":]+([0-9,]+)/gi,
         /"reviewCount"[\s":]+([0-9,]+)/gi,
         /방문자리뷰\s*([0-9,]+)/gi
       ], logs, '리뷰');
 
-      // 홈 사진 힌트(오탐 가능)
-      const homePhotoHint = this.extractMaxNumber(homeHtml, [
-        /"photoCount"[\s":]+([0-9,]+)/gi,
-        /"imageCount"[\s":]+([0-9,]+)/gi,
-        /사진\s*([0-9,]+)/gi
-      ], logs, '사진(홈)');
-
-      logs.push(`[리뷰&사진] 홈 기준 - 리뷰:${reviewCount}, 사진후보:${homePhotoHint}`);
+      logs.push(`[리뷰&사진] 홈 기준 - 리뷰:${reviewCount}`);
 
       // 2) 사진 탭으로 이동
       const photoUrl = this.buildPhotoUrl(page.url());
@@ -38,62 +30,61 @@ export class ReviewPhotoExtractor {
         await page.goto(photoUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.waitForTimeout(2000);
 
-        // ✅ 2-1) DOM에서 “사진 1,234” 텍스트를 최우선으로 찾는다
-        const domResult = await page.evaluate(() => {
-          const d: any = (globalThis as any).document;
-          if (!d || !d.body) return { best: 0, samples: [] as string[] };
+        // ✅ 핵심: "업체사진" 탭 텍스트에서 숫자 뽑기
+        // 2-1) 먼저 탭 라벨에 숫자가 있으면 바로 파싱
+        const tabTextBefore = await this.getTabText(page, '업체사진');
+        logs.push(`[리뷰&사진] 업체사진 탭 텍스트(전): ${tabTextBefore || '(없음)'}`);
 
-          const normalizeLine = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
+        const parsedBefore = this.parseCountFromText(tabTextBefore);
+        if (parsedBefore > 0) {
+          photoCount = parsedBefore;
+          logs.push(`[리뷰&사진] 업체사진 탭에서 count 파싱 성공(전): ${photoCount}`);
+        }
 
-          const raw = String(d.body.innerText || '');
-          const lines = raw
-            .split(/\r?\n|•|·/g)
-            .map(normalizeLine)
-            .filter(s => s.length > 0 && s.length <= 200);
+        // 2-2) 탭을 클릭해서 "업체사진" 뷰로 전환 (전환 후 텍스트 다시 파싱)
+        const clicked = await this.clickTab(page, '업체사진');
+        logs.push(`[리뷰&사진] 업체사진 탭 클릭: ${clicked ? '성공' : '실패/이미선택'}`);
 
-          const samples: string[] = [];
-          const nums: number[] = [];
+        await page.waitForTimeout(1200);
 
-          // 우선순위 1: “사진 1,234” (정확)
-          for (const line of lines) {
-            const m = line.match(/^사진\s*([0-9][0-9,]{0,})$/) || line.match(/사진\s*[:\(\·]?\s*([0-9][0-9,]{0,})/);
-            if (m?.[1]) {
-              const n = parseInt(m[1].replace(/,/g, ''), 10);
-              if (!Number.isNaN(n) && n > 0) {
-                nums.push(n);
-                if (samples.length < 8) samples.push(line);
-              }
-            }
+        const tabTextAfter = await this.getTabText(page, '업체사진');
+        logs.push(`[리뷰&사진] 업체사진 탭 텍스트(후): ${tabTextAfter || '(없음)'}`);
+
+        const parsedAfter = this.parseCountFromText(tabTextAfter);
+        if (parsedAfter > photoCount) {
+          photoCount = parsedAfter;
+          logs.push(`[리뷰&사진] 업체사진 탭에서 count 파싱 성공(후): ${photoCount}`);
+        }
+
+        // 2-3) 그래도 없으면 DOM 전체에서 "업체사진" 근처 숫자 찾기 (안전장치)
+        if (photoCount === 0) {
+          const domNear = await page.evaluate(() => {
+            const d: any = (globalThis as any).document;
+            if (!d || !d.body) return '';
+
+            const normalize = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
+            const raw = String(d.body.innerText || '');
+            const lines = raw
+              .split(/\r?\n|•|·/g)
+              .map(normalize)
+              .filter(s => s.length > 0 && s.length <= 200);
+
+            // "업체사진 123" / "업체 사진 123" / "업체사진(123)" 같은 라인 찾기
+            const hit = lines.find(s => /업체\s*사진|업체사진/.test(s));
+            return hit || '';
+          });
+
+          logs.push(`[리뷰&사진] DOM에서 업체사진 라인: ${domNear || '(없음)'}`);
+
+          const domParsed = this.parseCountFromText(domNear);
+          if (domParsed > 0) {
+            photoCount = domParsed;
+            logs.push(`[리뷰&사진] DOM 업체사진 라인에서 count 파싱 성공: ${photoCount}`);
           }
+        }
 
-          // 우선순위 2: “전체 사진”, “포토”, “이미지” 등 변형
-          if (!nums.length) {
-            for (const line of lines) {
-              const m =
-                line.match(/(전체\s*)?(사진|포토|이미지)\s*[:\(\·]?\s*([0-9][0-9,]{0,})/) ||
-                line.match(/([0-9][0-9,]{0,})\s*(장|개)\s*(사진|포토|이미지)/);
-              if (m) {
-                const rawNum = m[3] || m[1];
-                const n = parseInt(String(rawNum).replace(/,/g, ''), 10);
-                if (!Number.isNaN(n) && n > 0) {
-                  nums.push(n);
-                  if (samples.length < 8) samples.push(line);
-                }
-              }
-            }
-          }
-
-          const best = nums.length ? Math.max(...nums) : 0;
-          return { best, samples };
-        });
-
-        logs.push(`[리뷰&사진] 사진탭 DOM samples: ${(domResult?.samples || []).join(' | ')}`);
-
-        if (domResult?.best && domResult.best > 0) {
-          photoCount = domResult.best;
-          logs.push(`[리뷰&사진] 사진탭 DOM에서 photoCount 확정: ${photoCount}`);
-        } else {
-          // ✅ 2-2) DOM 실패 시 HTML 키 확장해서 최대값
+        // 2-4) 마지막 fallback: /photo HTML에서 관련 키 최대값(있으면)
+        if (photoCount === 0) {
           const photoHtml = await page.content();
           const htmlNum = this.extractMaxNumber(photoHtml, [
             /"totalPhotoCount"[\s":]+([0-9,]+)/gi,
@@ -101,31 +92,27 @@ export class ReviewPhotoExtractor {
             /"imageTotalCount"[\s":]+([0-9,]+)/gi,
             /"ugcPhotoCount"[\s":]+([0-9,]+)/gi,
             /"placePhotoCount"[\s":]+([0-9,]+)/gi,
-            /"photoCount"[\s":]+([0-9,]+)/gi,
-            /"imageCount"[\s":]+([0-9,]+)/gi
+            /"businessPhotoCount"[\s":]+([0-9,]+)/gi,
+            /"ownerPhotoCount"[\s":]+([0-9,]+)/gi
           ], logs, '사진(탭-HTML)');
 
           photoCount = htmlNum;
-          logs.push(`[리뷰&사진] 사진탭 HTML 기준 photoCount: ${photoCount}`);
+          logs.push(`[리뷰&사진] 사진탭 HTML fallback photoCount: ${photoCount}`);
         }
+
       } catch (e: any) {
         logs.push(`[리뷰&사진] 사진탭 이동/추출 실패: ${e?.message || String(e)}`);
       }
 
-      // ✅ 3) 오탐 컷 강화:
-      // - 1~4 무조건 오탐
-      // - "5"도 탭 숫자일 가능성이 높아서: 리뷰가 수천인데 사진이 5면 비정상 → 0 처리
+      // 오탐 컷: 1~4는 무조건 오탐
       if (photoCount > 0 && photoCount < 5) {
-        logs.push(`[리뷰&사진] 사진 최종값 ${photoCount}는 오탐 가능 → 0 처리`);
-        photoCount = 0;
-      }
-      if (photoCount === 5 && reviewCount >= 200) {
-        logs.push('[리뷰&사진] 사진=5 & 리뷰가 많음 → 탭 숫자 오탐으로 판단, 0 처리');
+        logs.push(`[리뷰&사진] photoCount=${photoCount} 오탐 가능 → 0 처리`);
         photoCount = 0;
       }
 
-      logs.push(`[리뷰&사진] 최종 결과 - 리뷰: ${reviewCount}, 사진: ${photoCount}`);
+      logs.push(`[리뷰&사진] 최종 결과 - 리뷰: ${reviewCount}, 업체사진: ${photoCount}`);
       return { reviewCount, photoCount, logs };
+
     } catch (error: any) {
       logs.push(`[리뷰&사진] 오류: ${error?.message || String(error)}`);
       return { reviewCount: 0, photoCount: 0, logs };
@@ -136,18 +123,59 @@ export class ReviewPhotoExtractor {
     try {
       const u = new URL(currentUrl);
       const path = u.pathname.replace(/\/+$/, '');
-
       if (path.endsWith('/home')) {
         u.pathname = path.replace(/\/home$/, '/photo');
         return u.toString();
       }
-      if (!path.endsWith('/photo')) {
-        u.pathname = `${path}/photo`;
-      }
+      if (!path.endsWith('/photo')) u.pathname = `${path}/photo`;
       return u.toString();
     } catch {
       return currentUrl;
     }
+  }
+
+  private static parseCountFromText(text?: string | null): number {
+    if (!text) return 0;
+    const t = String(text);
+
+    // "업체사진 1,234" / "업체사진(1234)" / "업체 사진 · 123" 등
+    const m =
+      t.match(/업체\s*사진[^0-9]{0,10}([0-9][0-9,]{0,})/) ||
+      t.match(/업체사진[^0-9]{0,10}([0-9][0-9,]{0,})/) ||
+      t.match(/\(([0-9][0-9,]{0,})\)/);
+
+    if (!m?.[1]) return 0;
+    const n = parseInt(m[1].replace(/,/g, ''), 10);
+    return Number.isNaN(n) ? 0 : n;
+  }
+
+  private static async getTabText(page: Page, tabLabel: string): Promise<string> {
+    const candidates = [
+      page.locator('a,button,div[role="tab"]', { hasText: tabLabel }).first(),
+      page.locator(`text=${tabLabel}`).first()
+    ];
+
+    for (const loc of candidates) {
+      try {
+        if (await loc.count().catch(() => 0)) {
+          const txt = await loc.textContent().catch(() => '');
+          if (txt && txt.trim()) return txt.trim();
+        }
+      } catch {}
+    }
+    return '';
+  }
+
+  private static async clickTab(page: Page, tabLabel: string): Promise<boolean> {
+    const loc = page.locator('a,button,div[role="tab"]', { hasText: tabLabel }).first();
+    try {
+      if (await loc.count().catch(() => 0)) {
+        await loc.scrollIntoViewIfNeeded().catch(() => {});
+        await loc.click({ timeout: 1500 }).catch(() => {});
+        return true;
+      }
+    } catch {}
+    return false;
   }
 
   private static extractMaxNumber(
