@@ -1,4 +1,4 @@
-import { chromium, Browser, Page, Frame } from 'playwright';
+import { chromium, Browser, Page, Frame, BrowserContext } from 'playwright';
 import { PlaceData } from '../types';
 import { UrlConverter } from './modules/urlConverter';
 import { KeywordExtractor } from './modules/keywordExtractor';
@@ -14,7 +14,7 @@ export interface CrawlResult {
   error?: string;
 }
 
-type Context = Page | Frame;
+type ContextType = Page | Frame;
 
 export class ModularCrawler {
   private browser: Browser | null = null;
@@ -33,89 +33,90 @@ export class ModularCrawler {
     });
   }
 
-  async close(): Promise<void> {
-    if (this.browser) {
-      await this.browser.close();
-      this.browser = null;
-    }
-  }
-
   async crawlPlace(originalUrl: string): Promise<CrawlResult> {
-    const allLogs: string[] = [];
+    const logs: string[] = [];
 
     if (!this.browser) {
       await this.initialize();
     }
 
-    const page = await this.browser!.newPage();
+    let context: BrowserContext | null = null;
 
     try {
-      allLogs.push('=== 1단계: URL 변환 ===');
-      allLogs.push(`원본 URL: ${originalUrl}`);
+      logs.push('=== 1단계: URL 변환 ===');
+      logs.push(`원본 URL: ${originalUrl}`);
 
       const mobileUrl = UrlConverter.convertToMobileUrl(originalUrl);
-      allLogs.push(`변환된 URL: ${mobileUrl}`);
+      logs.push(`변환된 URL: ${mobileUrl}`);
 
       const placeIdMaybe = UrlConverter.extractPlaceId(mobileUrl);
-      if (!placeIdMaybe) throw new Error('Place ID를 추출할 수 없습니다. URL 형식을 확인하세요.');
-      const placeId: string = placeIdMaybe;
-      allLogs.push(`Place ID: ${placeId}`);
+      if (!placeIdMaybe) throw new Error('Place ID 추출 실패');
+      const placeId = placeIdMaybe;
 
-      // ✅ “배포된 코드가 바뀌었는지” 확인용 고유 로그
-      allLogs.push('*** DEPLOY CHECK: modularCrawler vNEXT-20260213 ***');
+      logs.push(`Place ID: ${placeId}`);
+      logs.push('*** DEPLOY CHECK: modularCrawler vFINAL-20260213 ***');
 
-      // ✅ UA/헤더/뷰포트 세팅
-      await page.setViewportSize({ width: 390, height: 844 });
-      await page.setExtraHTTPHeaders({
-        'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
+      // ✅ Playwright context 방식 (UA/Viewport 설정은 여기서!)
+      context = await this.browser!.newContext({
+        userAgent:
+          'Mozilla/5.0 (Linux; Android 13; SM-G991N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36',
+        viewport: { width: 390, height: 844 },
+        extraHTTPHeaders: {
+          'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
+        }
       });
-      await page.setUserAgent(
-        'Mozilla/5.0 (Linux; Android 13; SM-G991N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36'
-      );
-      allLogs.push('*** UA/HEADERS SET OK ***');
 
+      const page = await context.newPage();
+      logs.push('*** UA/CONTEXT SET OK ***');
+
+      // =============================
       // 1차 로딩
-      allLogs.push('\n=== 페이지 로딩 ===');
+      // =============================
+      logs.push('\n=== 페이지 로딩 ===');
       await page.goto(mobileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await page.waitForTimeout(2500);
 
-      allLogs.push('페이지 로드 완료');
-      allLogs.push(`최종 URL: ${page.url()}`);
+      logs.push('페이지 로드 완료');
+      logs.push(`최종 URL: ${page.url()}`);
 
+      // =============================
       // iframe 탐색
-      allLogs.push('\n=== iframe 접근 ===');
-      let frame = await this.tryGetEntryFrame(page, allLogs);
+      // =============================
+      logs.push('\n=== iframe 접근 ===');
+      let frame = await this.tryGetEntryFrame(page, logs);
 
       // shell이면 /home 재시도
-      if (!frame && this.looksLikeShellPlaceUrl(page.url(), placeId)) {
-        const homeUrl = this.toHomeUrl(page.url(), placeId);
-        allLogs.push(`iframe 없음 + shell URL 감지 → /home 재시도: ${homeUrl}`);
+      if (!frame && this.isShellUrl(page.url(), placeId)) {
+        const homeUrl = `https://m.place.naver.com/place/${placeId}/home`;
+        logs.push(`iframe 없음 + shell 감지 → /home 재시도: ${homeUrl}`);
 
         await page.goto(homeUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.waitForTimeout(2500);
 
-        allLogs.push('(/home) 페이지 로드 완료');
-        allLogs.push(`(/home) 최종 URL: ${page.url()}`);
+        logs.push('(/home) 페이지 로드 완료');
+        logs.push(`(/home) 최종 URL: ${page.url()}`);
 
-        allLogs.push('\n=== iframe 재탐색(/home) ===');
-        frame = await this.tryGetEntryFrame(page, allLogs);
+        frame = await this.tryGetEntryFrame(page, logs);
       }
 
-      const context: Context = frame ?? page;
+      const contentContext: ContextType = frame ?? page;
 
-      // ✅ iframe이 없으면 NEXT fallback 시도 (로그가 무조건 찍혀야 정상)
+      // =============================
+      // NEXT fallback
+      // =============================
       let nextFallback: Partial<PlaceData> = {};
       if (!frame) {
-        allLogs.push('*** NEXT FALLBACK CODE PATH ENTERED ***');
+        logs.push('*** NEXT FALLBACK CODE PATH ENTERED ***');
+
         const html = await page.content();
-        allLogs.push(`page HTML 길이(디버그): ${html.length}`);
+        logs.push(`page HTML 길이: ${html.length}`);
 
         const next = NextDataParser.extractNextData(html);
-        allLogs.push(...next.logs);
+        logs.push(...next.logs);
 
         if (next.ok && next.data) {
           const fields = NextDataParser.extractFields(next.data);
-          allLogs.push(...fields.logs);
+          logs.push(...fields.logs);
 
           nextFallback = {
             name: fields.name,
@@ -126,156 +127,141 @@ export class ModularCrawler {
             description: fields.description ?? '',
             directions: fields.directions ?? ''
           };
-        } else {
-          allLogs.push('[NEXT] __NEXT_DATA__ 자체가 없음 → 네이버가 shell만 내려주는 상태(차단/제한 가능성 높음)');
         }
       } else {
-        allLogs.push('iframe 접근 성공 → frame 컨텍스트 사용');
+        logs.push('iframe 접근 성공');
       }
 
+      // =============================
       // 기본 정보
-      allLogs.push('\n=== 기본 정보 추출 ===');
-      const name = nextFallback.name || (await this.extractName(context));
-      const address = nextFallback.address || (await this.extractAddress(context));
-      allLogs.push(`이름: ${name}`);
-      allLogs.push(`주소: ${address}`);
+      // =============================
+      logs.push('\n=== 기본 정보 추출 ===');
+      const name = nextFallback.name || (await this.extractName(contentContext));
+      const address = nextFallback.address || (await this.extractAddress(contentContext));
 
+      logs.push(`이름: ${name}`);
+      logs.push(`주소: ${address}`);
+
+      // =============================
       // 키워드
-      allLogs.push('\n=== 2단계: 키워드 추출 ===');
+      // =============================
+      logs.push('\n=== 2단계: 키워드 ===');
       let keywords = nextFallback.keywords || [];
       if (!keywords.length) {
-        const keywordResult = await KeywordExtractor.extract(page, frame);
-        allLogs.push(...keywordResult.logs);
-        keywords = keywordResult.keywords;
-      } else {
-        allLogs.push(`[키워드] NEXT fallback 사용: ${keywords.join(', ')}`);
+        const k = await KeywordExtractor.extract(page, frame);
+        logs.push(...k.logs);
+        keywords = k.keywords;
       }
 
+      // =============================
       // 상세설명
-      allLogs.push('\n=== 3단계: 상세설명 추출 ===');
+      // =============================
+      logs.push('\n=== 3단계: 상세설명 ===');
       let description = nextFallback.description || '';
       if (!description) {
-        const descResult = await DescriptionExtractor.extract(page, frame);
-        allLogs.push(...descResult.logs);
-        description = descResult.description;
-      } else {
-        allLogs.push(`[상세설명] NEXT fallback 사용 (${description.length}자)`);
+        const d = await DescriptionExtractor.extract(page, frame);
+        logs.push(...d.logs);
+        description = d.description;
       }
 
+      // =============================
       // 오시는길
-      allLogs.push('\n=== 4단계: 오시는길 추출 ===');
+      // =============================
+      logs.push('\n=== 4단계: 오시는길 ===');
       let directions = nextFallback.directions || '';
       if (!directions) {
-        const directionsResult = await DirectionsExtractor.extract(page, frame);
-        allLogs.push(...directionsResult.logs);
-        directions = directionsResult.directions;
-      } else {
-        allLogs.push(`[오시는길] NEXT fallback 사용 (${directions.length}자)`);
+        const d = await DirectionsExtractor.extract(page, frame);
+        logs.push(...d.logs);
+        directions = d.directions;
       }
 
+      // =============================
       // 리뷰/사진
-      allLogs.push('\n=== 5단계: 리뷰&사진 추출 ===');
+      // =============================
+      logs.push('\n=== 5단계: 리뷰/사진 ===');
       let reviewCount = nextFallback.reviewCount ?? 0;
       let photoCount = nextFallback.photoCount ?? 0;
+
       if (reviewCount === 0 && photoCount === 0) {
-        const reviewPhotoResult = await ReviewPhotoExtractor.extract(page, frame);
-        allLogs.push(...reviewPhotoResult.logs);
-        reviewCount = reviewPhotoResult.reviewCount;
-        photoCount = reviewPhotoResult.photoCount;
-      } else {
-        allLogs.push(`[리뷰&사진] NEXT fallback 사용 - 리뷰:${reviewCount}, 사진:${photoCount}`);
+        const r = await ReviewPhotoExtractor.extract(page, frame);
+        logs.push(...r.logs);
+        reviewCount = r.reviewCount;
+        photoCount = r.photoCount;
       }
 
-      await page.close();
-      allLogs.push('\n=== 크롤링 완료 ===');
+      await context.close();
 
-      const placeData: PlaceData = {
-        name,
-        address,
-        reviewCount,
-        photoCount,
-        description,
-        directions,
-        keywords
+      logs.push('\n=== 크롤링 완료 ===');
+
+      return {
+        success: true,
+        data: {
+          name,
+          address,
+          reviewCount,
+          photoCount,
+          description,
+          directions,
+          keywords
+        },
+        logs
       };
 
-      return { success: true, data: placeData, logs: allLogs };
-    } catch (error: any) {
-      try { await page.close(); } catch {}
-      allLogs.push(`\n❌ 오류 발생: ${error?.message || String(error)}`);
-      return { success: false, logs: allLogs, error: error?.message || String(error) };
+    } catch (err: any) {
+      if (context) await context.close();
+      logs.push(`❌ 오류: ${err?.message || String(err)}`);
+      return { success: false, logs, error: err?.message || String(err) };
     }
   }
 
   private async tryGetEntryFrame(page: Page, logs: string[]): Promise<Frame | null> {
     try {
-      logs.push('entryIframe 탐색(빠른 시도) ...');
-      const el = await page.waitForSelector('iframe#entryIframe', { timeout: 8000, state: 'attached' }).catch(() => null);
+      const el = await page.waitForSelector('iframe#entryIframe', {
+        timeout: 8000,
+        state: 'attached'
+      }).catch(() => null);
+
       if (el) {
         const fr = await el.contentFrame();
         if (fr) return fr;
       }
-      logs.push('entryIframe 없음 → frames()로 재탐색 ...');
+
       const frames = page.frames();
-      const found = frames.find(f => (f.url() || '').includes('entry') || (f.name() || '').includes('entry'));
-      if (found) return found;
-      return null;
-    } catch (e: any) {
-      logs.push(`iframe 탐색 중 예외(무시하고 page로 진행): ${e?.message || String(e)}`);
+      const found = frames.find(f => (f.url() || '').includes('entry'));
+      return found || null;
+    } catch {
       return null;
     }
   }
 
-  private looksLikeShellPlaceUrl(currentUrl: string, placeId: string): boolean {
+  private isShellUrl(url: string, placeId: string): boolean {
     try {
-      const u = new URL(currentUrl);
-      const path = u.pathname.replace(/\/+$/, '');
-      return path === `/place/${placeId}`;
+      const u = new URL(url);
+      return u.pathname.replace(/\/+$/, '') === `/place/${placeId}`;
     } catch {
       return false;
     }
   }
 
-  private toHomeUrl(currentUrl: string, placeId: string): string {
-    try {
-      const u = new URL(currentUrl);
-      const path = u.pathname.replace(/\/+$/, '');
-      if (path === `/place/${placeId}`) {
-        u.pathname = `/place/${placeId}/home`;
-        return u.toString();
-      }
-      if (!path.endsWith('/home')) u.pathname = `${path}/home`;
-      return u.toString();
-    } catch {
-      return `https://m.place.naver.com/place/${placeId}/home`;
-    }
-  }
-
-  private async extractName(context: Context): Promise<string> {
+  private async extractName(context: ContextType): Promise<string> {
     const selectors = ['.Fc1rA', '.GHAhO', 'h1', 'h2'];
-    for (const selector of selectors) {
+    for (const sel of selectors) {
       try {
-        const el = await context.$(selector);
+        const el = await context.$(sel);
         if (el) {
           const t = await el.textContent();
           if (t?.trim()) return t.trim();
         }
       } catch {}
     }
-    try {
-      if ('title' in context) {
-        const t = await context.title();
-        if (t?.trim()) return t.trim();
-      }
-    } catch {}
     return '이름 없음';
   }
 
-  private async extractAddress(context: Context): Promise<string> {
-    const selectors = ['.LDgIH', '.IH3UA', 'span[role="text"]', 'address'];
-    for (const selector of selectors) {
+  private async extractAddress(context: ContextType): Promise<string> {
+    const selectors = ['.LDgIH', '.IH3UA', 'address'];
+    for (const sel of selectors) {
       try {
-        const el = await context.$(selector);
+        const el = await context.$(sel);
         if (el) {
           const t = await el.textContent();
           if (t?.trim()) return t.trim();
