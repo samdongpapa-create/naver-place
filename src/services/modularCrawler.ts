@@ -6,6 +6,7 @@ import { DescriptionExtractor } from './modules/descriptionExtractor';
 import { DirectionsExtractor } from './modules/directionsExtractor';
 import { ReviewPhotoExtractor } from './modules/reviewPhotoExtractor';
 import { NextDataParser } from './modules/nextDataParser';
+import { UiExpander } from './modules/uiExpander';
 
 export interface CrawlResult {
   success: boolean;
@@ -54,9 +55,8 @@ export class ModularCrawler {
       const placeId = placeIdMaybe;
 
       logs.push(`Place ID: ${placeId}`);
-      logs.push('*** DEPLOY CHECK: modularCrawler vFINAL-ADDR-20260213 ***');
+      logs.push('*** DEPLOY CHECK: modularCrawler vFINAL-EXPAND-20260213 ***');
 
-      // ✅ context에서 UA/Viewport 세팅
       context = await this.browser!.newContext({
         userAgent:
           'Mozilla/5.0 (Linux; Android 13; SM-G991N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36',
@@ -95,13 +95,17 @@ export class ModularCrawler {
         frame = await this.tryGetEntryFrame(page);
       }
 
+      // ✅ 여기서 “더보기/정보 더보기” 먼저 펼치기
+      logs.push('\n=== UI 확장(더보기 클릭) ===');
+      const uiLogs = await UiExpander.expandAll(page, frame);
+      logs.push(...uiLogs);
+
       const contentContext: ContextType = frame ?? page;
 
-      // NEXT fallback (있으면 쓰고, 없어도 DOM/regex로 계속 감)
+      // NEXT fallback
       let nextFallback: Partial<PlaceData> = {};
       if (!frame) {
         logs.push('*** NEXT FALLBACK CODE PATH ENTERED ***');
-
         const html = await page.content();
         logs.push(`page HTML 길이: ${html.length}`);
 
@@ -126,7 +130,7 @@ export class ModularCrawler {
         logs.push('iframe 접근 성공');
       }
 
-      // 기본 정보 (주소는 DOM 실패 시 HTML regex fallback 추가)
+      // 기본 정보 (주소: DOM 실패 시 HTML regex fallback)
       logs.push('\n=== 기본 정보 추출 ===');
       const name = nextFallback.name || (await this.extractName(contentContext)) || '이름 없음';
       let address = nextFallback.address || (await this.extractAddress(contentContext)) || '';
@@ -174,7 +178,6 @@ export class ModularCrawler {
       let reviewCount = nextFallback.reviewCount ?? 0;
       let photoCount = nextFallback.photoCount ?? 0;
 
-      // 둘 다 0이거나, 사진이 1 같은 오탐일 때만 extractor 재시도
       if ((reviewCount === 0 && photoCount === 0) || (photoCount > 0 && photoCount < 5)) {
         const r = await ReviewPhotoExtractor.extract(page, frame);
         logs.push(...r.logs);
@@ -183,20 +186,11 @@ export class ModularCrawler {
       }
 
       await context.close();
-
       logs.push('\n=== 크롤링 완료 ===');
 
       return {
         success: true,
-        data: {
-          name,
-          address,
-          reviewCount,
-          photoCount,
-          description,
-          directions,
-          keywords
-        },
+        data: { name, address, reviewCount, photoCount, description, directions, keywords },
         logs
       };
     } catch (err: any) {
@@ -251,13 +245,7 @@ export class ModularCrawler {
   }
 
   private async extractAddress(context: ContextType): Promise<string> {
-    const selectors = [
-      '.LDgIH',
-      '.IH3UA',
-      'address',
-      'span[class*="address"]',
-      'div[class*="address"]'
-    ];
+    const selectors = ['.LDgIH', '.IH3UA', 'address', 'span[class*="address"]', 'div[class*="address"]'];
     for (const sel of selectors) {
       try {
         const el = await context.$(sel);
@@ -271,21 +259,16 @@ export class ModularCrawler {
   }
 
   private extractAddressFromHtml(html: string): string | null {
-    // 네이버가 스크립트/JSON으로 박아두는 주소 키들 후보
     const patterns = [
       /"roadAddress"\s*:\s*"([^"]+)"/,
       /"roadAddr"\s*:\s*"([^"]+)"/,
       /"address"\s*:\s*"([^"]{5,200})"/,
       /"addr"\s*:\s*"([^"]{5,200})"/
     ];
-
     for (const p of patterns) {
       const m = html.match(p);
       if (m?.[1]) {
-        return m[1]
-          .replace(/\\n/g, ' ')
-          .replace(/\\"/g, '"')
-          .trim();
+        return m[1].replace(/\\n/g, ' ').replace(/\\"/g, '"').trim();
       }
     }
     return null;
