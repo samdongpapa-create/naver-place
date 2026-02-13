@@ -10,7 +10,7 @@ export class DirectionsExtractor {
     try {
       logs.push('[오시는길] 추출 시작');
 
-      // 1) HTML 패턴 (iframe -> page 순)
+      // 1) HTML 패턴 (iframe -> page)
       if (frame) {
         logs.push('[오시는길] iframe HTML 시도');
         const fromFrame = await this.extractFromHtml(await frame.content(), logs, 'iframe');
@@ -23,29 +23,32 @@ export class DirectionsExtractor {
       const fromPage = await this.extractFromHtml(await page.content(), logs, 'page');
       if (fromPage) return { directions: fromPage, logs };
 
-      // 2) ✅ DOM fallback (더보기 클릭 후 실제 문장이 DOM에 풀림)
+      // 2) ✅ DOM fallback (타입은 전부 any로 처리해서 tsconfig(dom lib) 없이도 빌드되게)
       logs.push('[오시는길] HTML 실패 → DOM fallback 시도');
 
       const domText = await page.evaluate(() => {
+        // 타입 이슈 방지용: 전부 any 기반
+        const d: any = (globalThis as any).document;
+        if (!d) return '';
+
         const labels = ['오시는길', '오시는 길', '찾아오는길', '찾아오는 길', '오시는방법', '방문 안내'];
 
-        const normalize = (s: string) => s.replace(/\s+/g, ' ').trim();
+        const normalize = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
 
-        // label을 포함한 요소 찾기
-        const nodes = Array.from(document.querySelectorAll('h1,h2,h3,strong,span,div,p,li'));
-        const labelEl = nodes.find(el => {
-          const t = normalize(el.textContent || '');
+        const nodeList: any = d.querySelectorAll('h1,h2,h3,strong,span,div,p,li');
+        const nodes: any[] = Array.from(nodeList || []);
+
+        const labelEl = nodes.find((node: any) => {
+          const t = normalize(node?.textContent || '');
           return labels.some(l => t === l || t.includes(l));
         });
 
         if (!labelEl) return '';
 
-        const pickLongText = (el: Element | null) => {
-          if (!el) return '';
-          const t = normalize(el.textContent || '');
-          // 너무 짧으면 무시
+        const pickLongText = (node: any) => {
+          if (!node) return '';
+          const t = normalize(node.textContent || '');
           if (t.length < 10) return '';
-          // 라벨만 있는 텍스트 제거
           const cleaned = t
             .replace(/오시는길|오시는 길|찾아오는길|찾아오는 길|오시는방법|방문 안내/g, '')
             .replace(/^[:\-]\s*/, '')
@@ -53,34 +56,31 @@ export class DirectionsExtractor {
           return cleaned.length >= 10 ? cleaned : '';
         };
 
-        // 1) 같은 카드(부모)에서 긴 텍스트 시도
-        let cur: Element | null = labelEl;
+        // 1) 부모로 올라가며 텍스트 추출
+        let cur: any = labelEl;
         for (let i = 0; i < 6; i++) {
           cur = cur?.parentElement || null;
           const text = pickLongText(cur);
           if (text) return text;
         }
 
-        // 2) 다음 형제에서 시도
-        const next = (labelEl as HTMLElement).nextElementSibling;
+        // 2) 다음 형제
+        const next = labelEl?.nextElementSibling || null;
         const nextText = pickLongText(next);
         if (nextText) return nextText;
 
-        // 3) 조상에서 못 찾으면, 페이지 전체에서 “출구/도보/미터/분/역” 같은 이동 정보 문장 추출
-        const body = normalize(document.body.innerText || '');
-        const candidates = body
+        // 3) 페이지 전체에서 이동 힌트 문장 하나라도 잡기
+        const body = normalize(d.body?.innerText || '');
+        const parts = body
           .split(/\n|\r|\t|•|·/g)
           .map(s => normalize(s))
           .filter(s => s.length >= 10);
 
-        const moveHint = candidates.find(s =>
-          /출구|도보|m|미터|분|역|버스|주차|주차장|길찾기/.test(s)
-        );
-
-        return moveHint || '';
+        const hint = parts.find(s => /출구|도보|m|미터|분|역|버스|주차|주차장|길찾기/.test(s));
+        return hint || '';
       });
 
-      const cleaned = (domText || '').trim();
+      const cleaned = String(domText || '').trim();
       if (cleaned) {
         logs.push(`[오시는길] DOM fallback 성공 (${cleaned.length}자)`);
         return { directions: cleaned, logs };
