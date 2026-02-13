@@ -49,8 +49,15 @@ export class ModularCrawler {
       const mobileUrl = UrlConverter.convertToMobileUrl(originalUrl);
       allLogs.push(`변환된 URL: ${mobileUrl}`);
 
-      const placeId = UrlConverter.extractPlaceId(mobileUrl);
-      allLogs.push(`Place ID: ${placeId}`);
+      const placeIdMaybe = UrlConverter.extractPlaceId(mobileUrl);
+
+if (!placeIdMaybe) {
+  throw new Error('Place ID를 추출할 수 없습니다. URL 형식을 확인하세요.');
+}
+
+const placeId: string = placeIdMaybe;
+allLogs.push(`Place ID: ${placeId}`);
+
 
       // 2) 1차 페이지 로딩
       allLogs.push('\n=== 페이지 로딩 ===');
