@@ -1,7 +1,6 @@
-import { PlaceData, ScoreResult, CategoryScores, DiagnosisReport, CompetitorData } from '../types';
+import { PlaceData, ScoreResult, CategoryScores, DiagnosisReport } from '../types';
 
 export class DiagnosisService {
-  
   // 점수를 등급으로 변환
   private scoreToGrade(score: number): 'S' | 'A' | 'B' | 'C' | 'D' | 'F' {
     if (score >= 95) return 'S';
@@ -35,11 +34,8 @@ export class DiagnosisService {
       }
     }
 
-    return {
-      score: Math.max(0, score),
-      grade: this.scoreToGrade(Math.max(0, score)),
-      issues
-    };
+    score = Math.max(0, Math.min(100, score));
+    return { score, grade: this.scoreToGrade(score), issues };
   }
 
   // 오시는길 평가
@@ -61,11 +57,8 @@ export class DiagnosisService {
       }
     }
 
-    return {
-      score: Math.max(0, score),
-      grade: this.scoreToGrade(Math.max(0, score)),
-      issues
-    };
+    score = Math.max(0, Math.min(100, score));
+    return { score, grade: this.scoreToGrade(score), issues };
   }
 
   // 대표키워드 평가
@@ -73,7 +66,7 @@ export class DiagnosisService {
     const issues: string[] = [];
     let score = 100;
 
-    if (keywords.length === 0) {
+    if (!keywords || keywords.length === 0) {
       issues.push('대표키워드가 설정되지 않았습니다');
       score = 0;
     } else if (keywords.length < 3) {
@@ -84,11 +77,8 @@ export class DiagnosisService {
       score -= 20;
     }
 
-    return {
-      score: Math.max(0, score),
-      grade: this.scoreToGrade(Math.max(0, score)),
-      issues
-    };
+    score = Math.max(0, Math.min(100, score));
+    return { score, grade: this.scoreToGrade(score), issues };
   }
 
   // 리뷰 평가
@@ -96,7 +86,7 @@ export class DiagnosisService {
     const issues: string[] = [];
     let score = 100;
 
-    if (reviewCount === 0) {
+    if (!reviewCount || reviewCount === 0) {
       issues.push('리뷰가 없습니다. 고객 리뷰 유도가 필요합니다');
       score = 0;
     } else if (reviewCount < 10) {
@@ -110,11 +100,8 @@ export class DiagnosisService {
       score = 80;
     }
 
-    return {
-      score: Math.max(0, score),
-      grade: this.scoreToGrade(Math.max(0, score)),
-      issues
-    };
+    score = Math.max(0, Math.min(100, score));
+    return { score, grade: this.scoreToGrade(score), issues };
   }
 
   // 사진 평가
@@ -122,7 +109,7 @@ export class DiagnosisService {
     const issues: string[] = [];
     let score = 100;
 
-    if (photoCount === 0) {
+    if (!photoCount || photoCount === 0) {
       issues.push('사진이 없습니다. 매장 사진 등록이 필요합니다');
       score = 0;
     } else if (photoCount < 10) {
@@ -136,11 +123,74 @@ export class DiagnosisService {
       score = 80;
     }
 
-    return {
-      score: Math.max(0, score),
-      grade: this.scoreToGrade(Math.max(0, score)),
-      issues
-    };
+    score = Math.max(0, Math.min(100, score));
+    return { score, grade: this.scoreToGrade(score), issues };
+  }
+
+  // ✅ 가격/메뉴 평가 (menuCount / menus 기반)
+  evaluatePrice(placeData: PlaceData): ScoreResult {
+    const issues: string[] = [];
+
+    const menuCount = placeData.menuCount ?? 0;
+    const menus = Array.isArray(placeData.menus) ? placeData.menus : [];
+
+    // 크롤링/데이터 자체가 없을 때
+    if (placeData.menuCount === undefined) {
+      issues.push('가격/메뉴 데이터를 수집하지 못했습니다 (표시/등록 여부 확인 필요)');
+      return { score: 0, grade: 'F', issues };
+    }
+
+    // 메뉴가 0
+    if (menuCount <= 0) {
+      issues.push('가격/메뉴가 없거나 노출되지 않습니다');
+      return { score: 0, grade: 'F', issues };
+    }
+
+    // 1) 메뉴 수 기반 기본 점수
+    let score = 0;
+    if (menuCount < 5) score = 40;
+    else if (menuCount < 10) score = 60;
+    else if (menuCount < 20) score = 80;
+    else if (menuCount < 30) score = 95;
+    else score = 100;
+
+    issues.push(`총 메뉴 수: ${menuCount}개`);
+
+    // 2) 메뉴 품질(가격 표기 비율/문의 비율) 반영
+    // menus가 없을 수도 있으니(목록 미제공) 있을 때만 품질 평가
+    if (menus.length > 0) {
+      const total = menus.length;
+
+      const hasNumericPrice = (p: string) => /[0-9][0-9,]*\s*원/.test(p || '');
+      const isInquiry = (p: string) => /문의|별도|상담|협의/.test(p || '');
+
+      const priced = menus.filter(m => hasNumericPrice(m.price)).length;
+      const inquiry = menus.filter(m => isInquiry(m.price)).length;
+
+      const pricedRatio = priced / total;
+      const inquiryRatio = inquiry / total;
+
+      // 가격 표기 비율이 낮으면 감점
+      if (pricedRatio < 0.6) {
+        issues.push(`가격 표기 메뉴 비율이 낮습니다 (${Math.round(pricedRatio * 100)}%)`);
+        score -= 20;
+      } else if (pricedRatio < 0.8) {
+        issues.push(`가격 표기 메뉴를 더 늘리면 좋습니다 (${Math.round(pricedRatio * 100)}%)`);
+        score -= 10;
+      }
+
+      // 문의/협의 비율이 너무 높으면 감점
+      if (inquiryRatio > 0.35) {
+        issues.push(`‘문의/협의’ 비율이 높습니다 (${Math.round(inquiryRatio * 100)}%)`);
+        score -= 15;
+      }
+    } else {
+      // 목록은 없고 count만 있을 때(현재 너 UI 요구엔 충분)
+      issues.push('메뉴 상세 목록은 제공되지 않았습니다(총 메뉴 수만 반영)');
+    }
+
+    score = Math.max(0, Math.min(100, score));
+    return { score, grade: this.scoreToGrade(score), issues };
   }
 
   // 전체 진단 생성
@@ -150,15 +200,20 @@ export class DiagnosisService {
       directions: this.evaluateDirections(placeData.directions),
       keywords: this.evaluateKeywords(placeData.keywords),
       reviews: this.evaluateReviews(placeData.reviewCount),
-      photos: this.evaluatePhotos(placeData.photoCount)
+      photos: this.evaluatePhotos(placeData.photoCount),
+
+      // ✅ 추가
+      price: this.evaluatePrice(placeData)
     };
 
+    // ✅ 6개 항목 평균으로 총점 계산
     const totalScore = Math.round(
       (scores.description.score +
-       scores.directions.score +
-       scores.keywords.score +
-       scores.reviews.score +
-       scores.photos.score) / 5
+        scores.directions.score +
+        scores.keywords.score +
+        scores.reviews.score +
+        scores.photos.score +
+        scores.price.score) / 6
     );
 
     const report: DiagnosisReport = {
@@ -207,6 +262,15 @@ export class DiagnosisService {
       improvements.photoGuidance = this.generatePhotoGuidance();
     }
 
+    // ✅ 가격/메뉴 가이드(원하면)
+    if (scores.price.score < 80) {
+      improvements.priceGuidance =
+        `가격/메뉴 탭을 강화하면 전환이 좋아집니다.\n` +
+        `- 메뉴(시술)명을 고객이 바로 이해하게 작성\n` +
+        `- 가능하면 '문의' 대신 실제 가격 표기 비율을 높이기\n` +
+        `- 대표 메뉴(주력 시술) 10~20개는 가격을 명확히 표기 권장\n`;
+    }
+
     return improvements;
   }
 
@@ -218,98 +282,55 @@ export class DiagnosisService {
 - 특징 2: [차별화된 서비스/제품]
 - 특징 3: [전문성 또는 경험]
 
-📍 위치: ${placeData.address}
+🕒 영업시간: [영업시간 입력]
+📍 위치: [주요 랜드마크/역에서 오시는 길]
+💰 가격/서비스: [대표 서비스/메뉴 간단 안내]
 
-⏰ 영업시간:
-- 평일: [영업시간 입력]
-- 주말: [영업시간 입력]
-
-💰 가격대: [가격 정보 입력]
-
-📞 문의: [전화번호]
-
-[추가 안내사항이나 특별 프로모션 정보]`;
+#추천 #키워드 #지역명`;
   }
 
-  private generateDirectionsImprovement(placeData: PlaceData): string {
-    return `📍 ${placeData.address}
+  private generateDirectionsImprovement(_placeData: PlaceData): string {
+    return `🚇 지하철:
+- [역명] [출구 번호]에서 도보 [N]분
 
-🚇 지하철 이용 시:
-- [호선] [역명] [출구]번 출구에서 도보 [분]
-- 상세 경로: [구체적인 이동 경로]
+🚌 버스:
+- [정류장명] 하차 후 도보 [N]분
 
-🚌 버스 이용 시:
-- [버스 노선] [정류장명] 하차
-- 하차 후 [이동 방법]
+🚗 주차:
+- [주차 가능 여부/요금/무료 조건]
+- [인근 주차장 안내]
 
-🚗 자가용 이용 시:
-- 주차: [주차 가능 여부 및 위치]
-- 내비게이션: [건물명 또는 도로명 주소]
-
-💡 Tip: [찾아오는 데 도움이 되는 추가 정보]`;
+📌 찾는 팁:
+- [건물명/간판/층수/입구 설명]`;
   }
 
   private generateKeywordImprovements(placeData: PlaceData): string[] {
-    // 기존 키워드 기반으로 추천 키워드 생성
-    const recommendations = [
-      `${placeData.name.split(' ')[0]}`,
-      '맛집',
-      '추천',
-      '인기',
-      '유명'
+    const base = placeData.name || '매장';
+    return [
+      `${base} 추천`,
+      `근처 ${base}`,
+      `${base} 후기`,
+      `${base} 가격`,
+      `${base} 예약`
     ];
-    return recommendations.slice(0, 5);
   }
 
   private generateReviewGuidance(): string {
-    return `📝 리뷰 개선 가이드:
-
-1. 고객 리뷰 유도 방법:
-   - 방문 후 리뷰 작성 시 소정의 혜택 제공
-   - QR 코드를 통한 간편한 리뷰 작성 유도
-   - SNS 이벤트 연계
-
-2. 긍정 리뷰 확보 전략:
-   - 우수한 서비스 제공으로 자연스러운 긍정 리뷰 유도
-   - 고객 피드백에 신속하게 응답
-   - 단골 고객 관리 강화
-
-3. 리뷰 답변 가이드:
-   - 모든 리뷰에 성실하게 답변
-   - 부정 리뷰에도 진정성 있는 개선 의지 표현
-   - 감사 인사와 함께 재방문 유도`;
+    return `리뷰를 늘리려면 '요청 타이밍'이 중요합니다.
+- 시술/서비스 직후 만족도가 높을 때 안내
+- 사진 첨부 리뷰 유도(전/후, 매장, 제품 등)
+- 고객이 쓰기 쉬운 예시 문장 제공`;
   }
 
   private generatePhotoGuidance(): string {
-    return `📸 사진 개선 가이드:
-
-1. 필수 사진 종류:
-   - 외관 사진 (낮/밤 각 1장 이상)
-   - 내부 인테리어 (다양한 앵글 5장 이상)
-   - 대표 메뉴/상품 (각 1장 이상)
-   - 상세 메뉴/상품 사진
-
-2. 사진 촬영 팁:
-   - 자연광 활용 (낮 시간대 촬영)
-   - 깔끔한 구도와 정리된 공간
-   - 고해상도 이미지 사용
-   - 계절별, 시간대별 다양한 사진
-
-3. 업데이트 주기:
-   - 월 1회 이상 새로운 사진 추가
-   - 시즌 메뉴나 이벤트 사진 즉시 업로드
-   - 오래된 사진은 주기적으로 교체`;
+    return `사진은 '신뢰'를 만드는 핵심입니다.
+- 대표 사진: 매장 외관/내부/좌석/디자이너/시술결과
+- 카테고리별로 균형 있게 업로드(전후/매장/제품/가격표)
+- 최소 30장 이상 유지 권장`;
   }
 
-  private generateRecommendedKeywords(placeData: PlaceData): string[] {
-    // 업종별 추천 키워드 (실제로는 더 정교한 로직 필요)
-    const baseKeywords = [
-      `${placeData.address.split(' ')[0]}맛집`,
-      `${placeData.address.split(' ')[1]}핫플`,
-      '인스타감성',
-      '데이트코스',
-      '분위기좋은'
-    ];
-    return baseKeywords;
+  private generateRecommendedKeywords(_placeData: PlaceData): string[] {
+    // (기존 로직이 있으면 그걸 유지해도 됨)
+    return [];
   }
 }
