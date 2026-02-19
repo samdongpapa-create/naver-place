@@ -19,8 +19,6 @@ export interface CrawlResult {
 type ContextType = Page | Frame;
 
 export type PlaceDataWithExtras = PlaceData & {
-  // PlaceData에 이미 menuCount/menus/recentReviewCount30d가 들어가도,
-  // 기존 코드 호환을 위해 유지(중복이어도 문제없음)
   menuCount?: number;
   menus?: MenuItem[];
   recentReviewCount30d?: number;
@@ -63,10 +61,6 @@ export class ModularCrawler {
       if (!placeIdMaybe) throw new Error("Place ID 추출 실패");
       const placeId = placeIdMaybe;
 
-      // ✅ 업종 slug 감지(예: hairshop/cafe/restaurant/...)
-      const categorySlug = this.detectCategorySlug(mobileUrl);
-      logs.push(`categorySlug: ${categorySlug || "(unknown)"}`);
-
       logs.push(`Place ID: ${placeId}`);
       logs.push("*** DEPLOY CHECK: modularCrawler vFINAL-EXPAND-PRICE-PHOTOFIX-20260213 ***");
 
@@ -74,9 +68,7 @@ export class ModularCrawler {
         userAgent:
           "Mozilla/5.0 (Linux; Android 13; SM-G991N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
         viewport: { width: 390, height: 844 },
-        extraHTTPHeaders: {
-          "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
-        }
+        extraHTTPHeaders: { "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7" }
       });
 
       const page = await context.newPage();
@@ -89,6 +81,11 @@ export class ModularCrawler {
 
       logs.push("페이지 로드 완료");
       logs.push(`최종 URL: ${page.url()}`);
+
+      // ✅ 핵심: redirect된 최종 URL(page.url()) 기준으로 slug 재감지
+      // 원본이 /place/{id} 여도 최종은 /hairshop/{id}/home 같은 형태임
+      const categorySlug = this.detectCategorySlug(page.url());
+      logs.push(`categorySlug: ${categorySlug || "(unknown)"}`);
 
       // iframe 탐색
       logs.push("\n=== iframe 접근 ===");
@@ -194,16 +191,16 @@ export class ModularCrawler {
       menuCount = p.menuCount;
       menus = p.menus;
 
-      // 리뷰/사진 (+ 최근30일 리뷰수)
+      // 리뷰/사진 (+ 최근30일)
       logs.push("\n=== 6단계: 리뷰/사진 ===");
       let reviewCount = nextFallback.reviewCount ?? 0;
       let photoCount = nextFallback.photoCount ?? 0;
 
+      // ✅ slug 전달 (이제 /hairshop/.../photo 로 들어가서 사진탭 파싱 성공 확률↑)
       const r = await ReviewPhotoExtractor.extract(page, frame, placeId, categorySlug);
       logs.push(...r.logs);
       reviewCount = r.reviewCount || reviewCount;
       photoCount = r.photoCount || photoCount;
-
       const recentReviewCount30d = r.recentReviewCount30d;
 
       await context.close();
@@ -236,15 +233,11 @@ export class ModularCrawler {
 
   private async tryGetEntryFrame(page: Page): Promise<Frame | null> {
     try {
-      const el = await page
-        .waitForSelector("iframe#entryIframe", { timeout: 8000, state: "attached" })
-        .catch(() => null);
-
+      const el = await page.waitForSelector("iframe#entryIframe", { timeout: 8000, state: "attached" }).catch(() => null);
       if (el) {
         const fr = await el.contentFrame();
         if (fr) return fr;
       }
-
       const frames = page.frames();
       const found = frames.find(f => (f.url() || "").includes("entry"));
       return found || null;
@@ -314,9 +307,7 @@ export class ModularCrawler {
     ];
     for (const p of patterns) {
       const m = html.match(p);
-      if (m?.[1]) {
-        return m[1].replace(/\\n/g, " ").replace(/\\"/g, '"').trim();
-      }
+      if (m?.[1]) return m[1].replace(/\\n/g, " ").replace(/\\"/g, '"').trim();
     }
     return null;
   }
