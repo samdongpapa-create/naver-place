@@ -16,11 +16,14 @@ export interface PlaceData {
   // ✅ 추가
   menuCount?: number;
   menus?: MenuItem[];
+
+  // ✅ 추가: 최근 30일 리뷰 수 (크롤링 가능하면 채워짐, 없으면 undefined)
+  recentReviewCount30d?: number;
 }
 
 export interface ScoreResult {
   score: number;
-  grade: 'S' | 'A' | 'B' | 'C' | 'D' | 'F';
+  grade: "S" | "A" | "B" | "C" | "D" | "F";
   issues: string[];
 }
 
@@ -44,13 +47,16 @@ export interface CompetitorData {
 
   // ✅ 추가(옵션)
   menuCount?: number;
+
+  // ✅ 추가(옵션): 최근 30일 리뷰 수
+  recentReviewCount30d?: number;
 }
 
 export interface DiagnosisReport {
   placeData: PlaceData;
   scores: CategoryScores;
   totalScore: number;
-  totalGrade: 'S' | 'A' | 'B' | 'C' | 'D' | 'F';
+  totalGrade: "S" | "A" | "B" | "C" | "D" | "F";
   isPaid: boolean;
   improvements?: {
     description?: string;
