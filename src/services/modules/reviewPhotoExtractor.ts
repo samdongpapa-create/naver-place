@@ -5,7 +5,7 @@ export class ReviewPhotoExtractor {
     page: Page,
     _frame: Frame | null,
     placeId: string,
-    categorySlug?: string // hairshop/cafe/restaurant...
+    categorySlug?: string
   ): Promise<{ reviewCount: number; photoCount: number; recentReviewCount30d?: number; logs: string[] }> {
     const logs: string[] = [];
     logs.push("[리뷰&사진] 추출 시작");
@@ -18,13 +18,12 @@ export class ReviewPhotoExtractor {
       // =========================
       // 1) 리뷰 총량: home에서 추출
       // =========================
-      let homeUrl = this.buildUrl("home", placeId, categorySlug);
+      const homeUrl = this.buildUrl("home", placeId, categorySlug);
       logs.push(`[리뷰&사진] 홈 이동(리뷰 기준): ${homeUrl}`);
 
       await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
       await page.waitForTimeout(1800);
 
-      // redirect 후 slug 보정
       if (!categorySlug) {
         const redirectedSlug = this.detectSlugFromUrl(page.url());
         if (redirectedSlug) {
@@ -46,7 +45,7 @@ export class ReviewPhotoExtractor {
       logs.push(`[리뷰&사진] 홈 기준 - 리뷰:${reviewCount}`);
 
       // =========================
-      // 2) 최근 30일 리뷰 수: 방문자리뷰 페이지에서 날짜 파싱
+      // 2) 최근 30일 리뷰 수
       // =========================
       const reviewUrls = this.buildVisitorReviewUrls(placeId, categorySlug);
 
@@ -87,22 +86,18 @@ export class ReviewPhotoExtractor {
       }
 
       // =========================
-      // 3) 업체사진 수: photo 탭에서 추출 (강화판)
+      // 3) 사진 수: photo 탭에서 추출 (강화)
       // =========================
       const photoUrl = this.buildUrl("photo", placeId, categorySlug);
       logs.push(`[리뷰&사진] 사진탭 이동: ${photoUrl}`);
 
       await page.goto(photoUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-
-      // ✅ 렌더링 늦는 케이스 대응: 네트워크 idle + 추가 대기
       await page.waitForLoadState("networkidle").catch(() => {});
       await page.waitForTimeout(2200);
 
-      // ✅ 스크롤로 lazy render 유도
       await this.scrollNudge(page);
       await page.waitForTimeout(1200);
 
-      // photo 페이지 redirect되면 slug 보정
       if (!categorySlug) {
         const redirectedSlug = this.detectSlugFromUrl(page.url());
         if (redirectedSlug) {
@@ -111,17 +106,17 @@ export class ReviewPhotoExtractor {
         }
       }
 
-      // 3-0) 페이지 텍스트가 정말 비었는지 체크
-      const bodyTextLen = await page.evaluate(() => {
-        const t = (document.body?.innerText || "").trim();
-        return t.length;
-      }).catch(() => 0);
+      const bodyTextLen = await page
+        .evaluate(() => {
+          const d = (globalThis as any).document;
+          const t = (d?.body?.innerText || "").trim();
+          return t.length;
+        })
+        .catch(() => 0);
       logs.push(`[리뷰&사진] photo bodyText length: ${bodyTextLen}`);
 
-      // 3-1) 탭 후보 라벨 확장
       const tabLabels = ["업체사진", "매장사진", "사진", "방문자사진", "리뷰사진"];
 
-      // 3-2) 탭 텍스트에서 바로 파싱
       for (const label of tabLabels) {
         const txt = await this.getTabText(page, label);
         if (txt) logs.push(`[리뷰&사진] 탭 텍스트 후보(${label}): ${txt}`);
@@ -132,7 +127,6 @@ export class ReviewPhotoExtractor {
         }
       }
 
-      // 3-3) 탭 클릭 시도(업체사진/매장사진/사진 순)
       for (const label of ["업체사진", "매장사진", "사진"]) {
         const clicked = await this.clickTab(page, label);
         logs.push(`[리뷰&사진] 탭 클릭(${label}): ${clicked ? "성공" : "실패/없음/이미선택"}`);
@@ -154,17 +148,19 @@ export class ReviewPhotoExtractor {
         }
       }
 
-      // 3-4) 탭 영역 전체 텍스트에서 “가장 큰 숫자”를 잡는 방법 (실전에서 강함)
       if (photoCount === 0) {
-        const tabAreaText = await page.evaluate(() => {
-          const el =
-            document.querySelector('[role="tablist"]') ||
-            document.querySelector("nav") ||
-            document.querySelector("header") ||
-            document.body;
-          const t = (el?.textContent || "").replace(/\s+/g, " ").trim();
-          return t.slice(0, 2000); // 너무 길면 컷
-        }).catch(() => "");
+        const tabAreaText = await page
+          .evaluate(() => {
+            const d = (globalThis as any).document;
+            const el =
+              d?.querySelector?.('[role="tablist"]') ||
+              d?.querySelector?.("nav") ||
+              d?.querySelector?.("header") ||
+              d?.body;
+            const t = (el?.textContent || "").replace(/\s+/g, " ").trim();
+            return t.slice(0, 2000);
+          })
+          .catch(() => "");
 
         logs.push(`[리뷰&사진] 탭영역 text(일부): ${tabAreaText ? tabAreaText : "(없음)"}`);
 
@@ -175,23 +171,25 @@ export class ReviewPhotoExtractor {
         }
       }
 
-      // 3-5) DOM 전체에서 “사진/업체사진/매장사진” 포함 라인 찾아 파싱
       if (photoCount === 0) {
-        const domLine = await page.evaluate(() => {
-          const raw = String(document.body?.innerText || "");
-          const lines = raw
-            .split(/\r?\n|•|·/g)
-            .map(s => (s || "").replace(/\s+/g, " ").trim())
-            .filter(Boolean);
+        const domLine = await page
+          .evaluate(() => {
+            const d = (globalThis as any).document;
+            const raw = String(d?.body?.innerText || "");
+            const lines = raw
+              .split(/\r?\n|•|·/g)
+              .map((s: string) => (s || "").replace(/\s+/g, " ").trim())
+              .filter(Boolean);
 
-          const hit =
-            lines.find(s => /업체\s*사진|업체사진/.test(s) && s.length <= 200) ||
-            lines.find(s => /매장\s*사진|매장사진/.test(s) && s.length <= 200) ||
-            lines.find(s => /방문자\s*사진|방문자사진/.test(s) && s.length <= 200) ||
-            lines.find(s => /^사진\s*[0-9,]+/.test(s) && s.length <= 200);
+            const hit =
+              lines.find((s: string) => /업체\s*사진|업체사진/.test(s) && s.length <= 200) ||
+              lines.find((s: string) => /매장\s*사진|매장사진/.test(s) && s.length <= 200) ||
+              lines.find((s: string) => /방문자\s*사진|방문자사진/.test(s) && s.length <= 200) ||
+              lines.find((s: string) => /^사진\s*[0-9,]+/.test(s) && s.length <= 200);
 
-          return hit || "";
-        });
+            return hit || "";
+          })
+          .catch(() => "");
 
         logs.push(`[리뷰&사진] DOM 라인 후보: ${domLine ? domLine : "(없음)"}`);
 
@@ -202,7 +200,6 @@ export class ReviewPhotoExtractor {
         }
       }
 
-      // 3-6) HTML에서 키 기반 파싱(마지막 보조)
       if (photoCount === 0) {
         const photoHtml = await page.content();
 
@@ -223,9 +220,6 @@ export class ReviewPhotoExtractor {
         }
       }
 
-      // =========================
-      // 오탐 컷(기존)
-      // =========================
       if (photoCount > 0 && photoCount < 5) {
         logs.push(`[리뷰&사진] photoCount=${photoCount} 오탐 가능 → 0 처리`);
         photoCount = 0;
@@ -280,9 +274,15 @@ export class ReviewPhotoExtractor {
   // -------------------------
   private static async scrollNudge(page: Page) {
     try {
-      await page.evaluate(() => window.scrollTo(0, 600));
+      await page.evaluate(() => {
+        const w = (globalThis as any).window;
+        w?.scrollTo?.(0, 600);
+      });
       await page.waitForTimeout(250);
-      await page.evaluate(() => window.scrollTo(0, 0));
+      await page.evaluate(() => {
+        const w = (globalThis as any).window;
+        w?.scrollTo?.(0, 0);
+      });
     } catch {}
   }
 
@@ -317,12 +317,10 @@ export class ReviewPhotoExtractor {
     return false;
   }
 
-  // "업체사진 123" / "업체사진(123)" / "사진 1,234" 등 최대한 커버
   private static parseCountFromAnyText(text?: string | null, label?: string): number {
     if (!text) return 0;
     const t = String(text);
 
-    // label이 있으면 label 근처 숫자 우선
     if (label) {
       const m =
         t.match(new RegExp(`${label}[^0-9]{0,12}([0-9][0-9,]{0,})`)) ||
@@ -333,7 +331,6 @@ export class ReviewPhotoExtractor {
       }
     }
 
-    // 없으면 텍스트에서 아무 숫자라도
     return this.extractMaxNumberFromLooseText(t);
   }
 
@@ -375,7 +372,6 @@ export class ReviewPhotoExtractor {
   private static extractDates(html: string): Date[] {
     const out: Date[] = [];
 
-    // "2026.02.19"
     const m1 = html.matchAll(/(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})/g);
     for (const m of m1) {
       const y = parseInt(m[1], 10);
@@ -385,7 +381,6 @@ export class ReviewPhotoExtractor {
       if (dt) out.push(dt);
     }
 
-    // "2026-02-19"
     const m2 = html.matchAll(/(\d{4})-(\d{2})-(\d{2})/g);
     for (const m of m2) {
       const y = parseInt(m[1], 10);
@@ -406,7 +401,7 @@ export class ReviewPhotoExtractor {
   }
 
   // -------------------------
-  // Generic number parser (HTML key-based)
+  // HTML key-based max number
   // -------------------------
   private static extractMaxNumber(html: string, regexList: RegExp[]): number {
     const nums: number[] = [];
