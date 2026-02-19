@@ -1,3 +1,9 @@
+export interface MenuItem {
+  name: string;
+  price: string; // "24,000원" / "문의" / "별도" 등
+  desc: string;
+}
+
 export interface PlaceData {
   name: string;
   address: string;
@@ -6,6 +12,10 @@ export interface PlaceData {
   description: string;
   directions: string;
   keywords: string[];
+
+  // ✅ 추가
+  menuCount?: number;
+  menus?: MenuItem[];
 }
 
 export interface ScoreResult {
@@ -20,6 +30,9 @@ export interface CategoryScores {
   keywords: ScoreResult;
   reviews: ScoreResult;
   photos: ScoreResult;
+
+  // ✅ 추가
+  price: ScoreResult;
 }
 
 export interface CompetitorData {
@@ -28,6 +41,9 @@ export interface CompetitorData {
   keywords: string[];
   reviewCount: number;
   photoCount: number;
+
+  // ✅ 추가(옵션)
+  menuCount?: number;
 }
 
 export interface DiagnosisReport {
@@ -42,6 +58,9 @@ export interface DiagnosisReport {
     keywords?: string[];
     reviewGuidance?: string;
     photoGuidance?: string;
+
+    // ✅ 추가(원하면 유료에만 가이드 노출 가능)
+    priceGuidance?: string;
   };
   competitors?: CompetitorData[];
   recommendedKeywords?: string[];
