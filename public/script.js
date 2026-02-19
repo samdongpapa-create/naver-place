@@ -177,89 +177,6 @@ async function diagnosePaid() {
     }
 }
 
-/**
- * ✅ 가격/메뉴 섹션 DOM을 보장 생성
- * - HTML에 menuSummary/menuList가 없어도 자동 생성됨
- */
-function ensureMenuSection() {
-    // 이미 존재하면 OK
-    let summaryEl = document.getElementById('menuSummary');
-    let listEl = document.getElementById('menuList');
-    if (summaryEl && listEl) return { summaryEl, listEl };
-
-    const anchor = document.getElementById('categoryScores');
-    const reportSection = document.getElementById('reportSection');
-
-    const wrap = document.createElement('div');
-    wrap.className = 'improvement-card';
-    wrap.style.marginTop = '18px';
-
-    wrap.innerHTML = `
-        <h3 class="section-title">💰 가격 / 메뉴</h3>
-        <p id="menuSummary" style="color:#666; margin-bottom:12px;">메뉴 정보를 불러오는 중...</p>
-        <div id="menuList"></div>
-    `;
-
-    if (anchor && anchor.parentNode) {
-        anchor.parentNode.insertBefore(wrap, anchor.nextSibling);
-    } else if (reportSection) {
-        reportSection.appendChild(wrap);
-    }
-
-    summaryEl = wrap.querySelector('#menuSummary');
-    listEl = wrap.querySelector('#menuList');
-    return { summaryEl, listEl };
-}
-
-/**
- * ✅ 메뉴 데이터 표시
- * - 백엔드 응답이 data.placeData.menuCount / data.placeData.menus 일 수도 있고
- * - data.menuCount / data.menus 일 수도 있어서 둘 다 지원
- */
-function renderMenu(data) {
-    const { summaryEl, listEl } = ensureMenuSection();
-
-    const menuCount =
-        (data?.placeData && data.placeData.menuCount !== undefined ? data.placeData.menuCount : undefined) ??
-        (data?.menuCount !== undefined ? data.menuCount : undefined);
-
-    const menus =
-        (data?.placeData && Array.isArray(data.placeData.menus) ? data.placeData.menus : null) ??
-        (Array.isArray(data?.menus) ? data.menus : null) ??
-        [];
-
-    if (menuCount === undefined) {
-        summaryEl.textContent = '가격/메뉴 데이터가 아직 응답에 포함되지 않았습니다.';
-        listEl.innerHTML = '';
-        return;
-    }
-
-    summaryEl.innerHTML = `총 메뉴 수: <strong>${menuCount}</strong>`;
-
-    if (!Array.isArray(menus) || menus.length === 0) {
-        listEl.innerHTML = `<div style="color:#999;">메뉴 목록을 찾지 못했습니다.</div>`;
-        return;
-    }
-
-    const items = menus.slice(0, 12).map(m => {
-        const name = (m?.name || '').toString().trim();
-        const price = (m?.price || '').toString().trim();
-        const desc = (m?.desc || '').toString().trim();
-
-        return `
-            <div style="padding:10px 0; border-top:1px solid #eee;">
-                <div style="font-weight:700;">${name || '메뉴명 없음'}</div>
-                <div style="color:#333; margin-top:2px;">
-                    ${price ? price : '<span style="color:#999;">가격 정보 없음</span>'}
-                </div>
-                ${desc ? `<div style="color:#777; font-size:0.9rem; margin-top:4px;">${desc}</div>` : ''}
-            </div>
-        `;
-    }).join('');
-
-    listEl.innerHTML = items;
-}
-
 // 리포트 표시
 function displayReport(data, isPaid) {
     // 플레이스 정보
@@ -274,11 +191,8 @@ function displayReport(data, isPaid) {
     const gradeBadge = document.getElementById('totalGradeBadge');
     gradeBadge.className = `grade-badge grade-${data.totalGrade}`;
 
-    // 카테고리별 점수
-    displayCategoryScores(data.scores);
-
-    // ✅ 가격/메뉴 UI 표시
-    renderMenu(data);
+    // 카테고리별 점수 (여기서 가격/메뉴 총 메뉴 수도 같이 표기)
+    displayCategoryScores(data.scores, data);
 
     // 무료 버전 - 업그레이드 섹션 표시
     if (!isPaid) {
@@ -340,9 +254,14 @@ function displayLogs(logs) {
 }
 
 // 카테고리별 점수 표시
-function displayCategoryScores(scores) {
+function displayCategoryScores(scores, fullData) {
     const categoryScoresDiv = document.getElementById('categoryScores');
     categoryScoresDiv.innerHTML = '';
+
+    // ✅ 백엔드 응답 구조가 placeData.menuCount일 수도 있고, 최상위 menuCount일 수도 있어서 둘 다 커버
+    const menuCount =
+        (fullData?.placeData && fullData.placeData.menuCount !== undefined ? fullData.placeData.menuCount : undefined) ??
+        (fullData?.menuCount !== undefined ? fullData.menuCount : undefined);
 
     const categories = [
         { key: 'description', icon: '📝', title: '상세설명' },
@@ -350,7 +269,7 @@ function displayCategoryScores(scores) {
         { key: 'keywords', icon: '🔑', title: '대표키워드' },
         { key: 'reviews', icon: '⭐', title: '리뷰' },
         { key: 'photos', icon: '📸', title: '사진' },
-        { key: 'price', icon: '💰', title: '가격/메뉴' } // ✅ 추가
+        { key: 'price', icon: '💰', title: '가격/메뉴' } // ✅ 유지
     ];
 
     categories.forEach(cat => {
@@ -359,11 +278,22 @@ function displayCategoryScores(scores) {
         // 점수 로직이 아직 없을 수도 있으니 안전 처리
         const safeScore = score || { score: '-', grade: 'C', issues: ['점수 계산 로직 미적용(표시만 추가됨)'] };
 
+        // ✅ 가격/메뉴 카드일 때 총 메뉴 수 문구를 issues에 추가
+        let issues = Array.isArray(safeScore.issues) ? [...safeScore.issues] : [];
+
+        if (cat.key === 'price') {
+            if (menuCount === undefined) {
+                issues.unshift('총 메뉴 수: (데이터 없음)');
+            } else {
+                issues.unshift(`총 메뉴 수: ${menuCount}개`);
+            }
+        }
+
         const card = document.createElement('div');
         card.className = 'category-card';
 
-        const issuesList = safeScore.issues && safeScore.issues.length > 0
-            ? safeScore.issues.map(issue => `<li>${issue}</li>`).join('')
+        const issuesList = issues.length > 0
+            ? issues.map(issue => `<li>${issue}</li>`).join('')
             : '<li>문제가 발견되지 않았습니다 ✓</li>';
 
         card.innerHTML = `
