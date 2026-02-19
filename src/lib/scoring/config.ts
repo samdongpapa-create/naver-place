@@ -1,60 +1,57 @@
 import { Industry } from "./types";
 
-export type IndustryScoringConfig = {
+export type IndustryConfig = {
   weights: {
-    description: number; // 합이 100 되게 권장
+    description: number; // 합 100
     directions: number;
     keywords: number;
     reviews: number;
     photos: number;
-    menu: number;
+    price: number;
   };
 
-  // 상세설명
   description: {
-    minLen: number;          // 최소 권장 글자수
-    goodLen: number;         // 만점 기준 글자수
-    keywordBoost: number;    // 키워드 포함 가산(최대)
+    minLen: number;
+    goodLen: number;
+    // 대표키워드가 본문에 포함되면 가산(최대)
+    keywordBoostMax: number;
   };
 
-  // 오시는길
   directions: {
     minLen: number;
     goodLen: number;
-    requireSignals: string[]; // 포함되면 가산점 주는 신호 단어들
+    signals: string[]; // 포함되면 점수 가산
   };
 
-  // 대표키워드
   keywords: {
-    targetCount: number; // 보통 5
+    targetCount: number; // 5
     stopWords: string[]; // 너무 일반적인 단어 감점
   };
 
-  // 리뷰
   reviews: {
-    targetCount: number;      // 업종별 “강한 신뢰” 기준
-    recentWeight: number;     // 최근성 가중(0~1)
+    targetCount: number; // 업종별 목표치
+    // 최근성 반영 비율 (0~1)
+    recentWeight: number;
   };
 
-  // 사진
   photos: {
     targetCount: number;
   };
 
-  // 메뉴/가격
-  menu: {
-    allowInquiryRatio: number; // "문의/변동" 허용 비율 (0~1)
-    strictPriceLabel: boolean; // 식당은 true (정가표기 엄격)
+  price: {
+    allowInquiryRatio: number; // "문의/변동/협의" 허용 비율 (미용실 높음, 식당 낮음)
+    strictPriceLabel: boolean; // 식당 true (정가표기 엄격)
   };
 };
 
-export const SCORING_BY_INDUSTRY: Record<Industry, IndustryScoringConfig> = {
+export const CONFIG: Record<Industry, IndustryConfig> = {
   hairshop: {
-    weights: { description: 22, directions: 18, keywords: 15, reviews: 25, photos: 12, menu: 8 },
-    description: { minLen: 80, goodLen: 250, keywordBoost: 6 },
+    weights: { description: 22, directions: 18, keywords: 15, reviews: 25, photos: 12, price: 8 },
+    description: { minLen: 80, goodLen: 250, keywordBoostMax: 12 },
     directions: {
-      minLen: 60, goodLen: 180,
-      requireSignals: ["역", "출구", "도보", "분", "주차", "건물", "층", "엘리베이터", "정문", "후문"]
+      minLen: 60,
+      goodLen: 180,
+      signals: ["역", "출구", "도보", "분", "주차", "건물", "층", "엘리베이터", "정문", "후문"]
     },
     keywords: {
       targetCount: 5,
@@ -62,15 +59,17 @@ export const SCORING_BY_INDUSTRY: Record<Industry, IndustryScoringConfig> = {
     },
     reviews: { targetCount: 800, recentWeight: 0.45 },
     photos: { targetCount: 120 },
-    menu: { allowInquiryRatio: 0.6, strictPriceLabel: false }
+    // ✅ 미용실은 ‘문의’ 허용 높게
+    price: { allowInquiryRatio: 0.6, strictPriceLabel: false }
   },
 
   cafe: {
-    weights: { description: 20, directions: 18, keywords: 15, reviews: 27, photos: 12, menu: 8 },
-    description: { minLen: 70, goodLen: 220, keywordBoost: 6 },
+    weights: { description: 20, directions: 18, keywords: 15, reviews: 27, photos: 12, price: 8 },
+    description: { minLen: 70, goodLen: 220, keywordBoostMax: 10 },
     directions: {
-      minLen: 60, goodLen: 170,
-      requireSignals: ["역", "출구", "도보", "분", "주차", "골목", "코너", "건물", "층"]
+      minLen: 60,
+      goodLen: 170,
+      signals: ["역", "출구", "도보", "분", "주차", "골목", "코너", "건물", "층"]
     },
     keywords: {
       targetCount: 5,
@@ -78,15 +77,16 @@ export const SCORING_BY_INDUSTRY: Record<Industry, IndustryScoringConfig> = {
     },
     reviews: { targetCount: 600, recentWeight: 0.5 },
     photos: { targetCount: 150 },
-    menu: { allowInquiryRatio: 0.35, strictPriceLabel: true }
+    price: { allowInquiryRatio: 0.35, strictPriceLabel: true }
   },
 
   restaurant: {
-    weights: { description: 18, directions: 17, keywords: 14, reviews: 30, photos: 12, menu: 9 },
-    description: { minLen: 70, goodLen: 220, keywordBoost: 5 },
+    weights: { description: 18, directions: 17, keywords: 14, reviews: 30, photos: 12, price: 9 },
+    description: { minLen: 70, goodLen: 220, keywordBoostMax: 10 },
     directions: {
-      minLen: 60, goodLen: 170,
-      requireSignals: ["역", "출구", "도보", "분", "주차", "골목", "코너", "건물", "층"]
+      minLen: 60,
+      goodLen: 170,
+      signals: ["역", "출구", "도보", "분", "주차", "골목", "코너", "건물", "층"]
     },
     keywords: {
       targetCount: 5,
@@ -94,6 +94,7 @@ export const SCORING_BY_INDUSTRY: Record<Industry, IndustryScoringConfig> = {
     },
     reviews: { targetCount: 1200, recentWeight: 0.55 },
     photos: { targetCount: 200 },
-    menu: { allowInquiryRatio: 0.15, strictPriceLabel: true }
-  },
+    // ✅ 식당은 가격표기 엄격 + 문의비율 낮아야 함
+    price: { allowInquiryRatio: 0.15, strictPriceLabel: true }
+  }
 };
