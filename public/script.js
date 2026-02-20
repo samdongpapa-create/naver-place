@@ -17,48 +17,10 @@ function asArray(v) {
   return [];
 }
 
-function pick(obj, paths, defVal = null) {
-  // paths: ["a.b.c", "x.y"]
-  for (const p of paths) {
-    const parts = p.split(".");
-    let cur = obj;
-    let ok = true;
-    for (const k of parts) {
-      if (cur && typeof cur === "object" && k in cur) cur = cur[k];
-      else {
-        ok = false;
-        break;
-      }
-    }
-    if (ok && cur != null) return cur;
-  }
-  return defVal;
-}
-
 function toNumber(v, def = 0) {
   if (typeof v === "number" && Number.isFinite(v)) return v;
   const n = Number(String(v ?? "").replace(/[^\d]/g, ""));
   return Number.isFinite(n) ? n : def;
-}
-
-function renderChips(items) {
-  const arr = asArray(items).filter(Boolean);
-  if (!arr.length) return `<div class="muted">없음</div>`;
-  return `<div class="chips">${arr
-    .map((x) => `<span class="chip">${escapeHtml(x)}</span>`)
-    .join("")}</div>`;
-}
-
-function renderList(items) {
-  const arr = asArray(items).filter(Boolean);
-  if (!arr.length) return `<div class="muted">없음</div>`;
-  return `<ul>${arr.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>`;
-}
-
-function renderPre(text) {
-  const t = String(text ?? "").trim();
-  if (!t) return `<div class="muted">없음</div>`;
-  return `<pre>${escapeHtml(t)}</pre>`;
 }
 
 function setText(sel, text) {
@@ -73,6 +35,18 @@ function setHtml(sel, html) {
   el.innerHTML = html == null ? "" : String(html);
 }
 
+function renderChips(items) {
+  const arr = asArray(items).filter(Boolean);
+  if (!arr.length) return `<div class="muted">없음</div>`;
+  return `<div class="chips">${arr.map((x) => `<span class="chip">${escapeHtml(x)}</span>`).join("")}</div>`;
+}
+
+function renderPre(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return `<div class="muted">없음</div>`;
+  return `<pre>${escapeHtml(t)}</pre>`;
+}
+
 function buildCard(title, bodyHtml) {
   return `
     <section class="card">
@@ -82,249 +56,206 @@ function buildCard(title, bodyHtml) {
   `;
 }
 
-/**
- * Normalize server response across versions.
- * - New expected structure:
- *   data.place, data.extracted, data.recommendations, data.paid, data.competitors
- * - Older/legacy structure might have:
- *   data.data, data.result, data.improvements, data.gpt, etc.
- */
-function normalize(data) {
-  // place
-  const place = pick(data, ["place", "data.place", "result.place"], {}) || {};
-  const extracted = pick(data, ["extracted", "data.extracted", "result.extracted", "data"], {}) || {};
-  const diagnosis = pick(data, ["diagnosis", "data.diagnosis", "result.diagnosis"], null);
+function pick(obj, path, defVal = null) {
+  const parts = String(path).split(".");
+  let cur = obj;
+  for (const k of parts) {
+    if (cur && typeof cur === "object" && k in cur) cur = cur[k];
+    else return defVal;
+  }
+  return cur == null ? defVal : cur;
+}
 
-  // recommendations (대표키워드/개선문구)
-  const rec = pick(data, ["recommendations", "data.recommendations"], null);
-  const legacyImpr = pick(data, ["improvements", "data.improvements", "gpt", "data.gpt"], null);
+function normalizeResponse(serverJson) {
+  // 서버: { success, data, logs, message }
+  const ok = !!serverJson?.success;
+  const message = serverJson?.message || "";
+  const logs = Array.isArray(serverJson?.logs) ? serverJson.logs : [];
 
-  const recommendedKeywords5 =
-    pick(rec, ["recommendedKeywords5"], null) ??
-    pick(legacyImpr, ["recommendedKeywords5", "recommendedKeywords", "keywords5", "keywords"], null) ??
-    pick(data, ["recommendedKeywords5", "recommendedKeywords"], null) ??
-    [];
+  const data = serverJson?.data || {};
 
-  const improvedDescription =
-    pick(rec, ["improvedDescription"], null) ??
-    pick(legacyImpr, ["improvedDescription", "description", "optimizedDescription"], null) ??
-    pick(data, ["improvedDescription"], null) ??
-    "";
+  // place data
+  const placeData = data.placeData || {};
+  const name = placeData.name || "";
+  const address = placeData.address || "";
+  const keywords = asArray(placeData.keywords || []);
+  const description = placeData.description || "";
+  const directions = placeData.directions || "";
+  const reviewCount = toNumber(placeData.reviewCount ?? placeData.reviewsTotal, 0);
+  const photoCount = toNumber(placeData.photoCount, 0);
+  const recent30d = toNumber(placeData.recentReviewCount30d ?? placeData.recent30d, 0);
 
-  const improvedDirections =
-    pick(rec, ["improvedDirections"], null) ??
-    pick(legacyImpr, ["improvedDirections", "directions", "optimizedDirections"], null) ??
-    pick(data, ["improvedDirections"], null) ??
-    "";
+  // scores
+  const totalScore = toNumber(data.totalScore, 0);
+  const totalGrade = data.totalGrade || "";
+  const scores = data.scores || null;
 
-  // paid unified
-  const paid = pick(data, ["paid", "data.paid"], null);
-  const unifiedText =
-    pick(paid, ["unifiedText"], null) ??
-    pick(legacyImpr, ["unifiedText", "paidText"], null) ??
-    pick(data, ["unifiedText"], null) ??
-    "";
+  // paid extras
+  const recommendedKeywords = asArray(data.recommendedKeywords || []);
+  const competitors = Array.isArray(data.competitors) ? data.competitors : [];
+  const unifiedText = data.unifiedText || "";
 
-  // competitors
-  const competitors =
-    pick(data, ["competitors", "data.competitors", "result.competitors"], null) ?? [];
-
-  // extracted fields fallback
-  const keywords =
-    pick(extracted, ["keywords"], null) ??
-    pick(data, ["keywords"], null) ??
-    [];
-
-  const description =
-    pick(extracted, ["description"], null) ??
-    pick(data, ["description"], null) ??
-    "";
-
-  const directions =
-    pick(extracted, ["directions"], null) ??
-    pick(data, ["directions"], null) ??
-    "";
-
-  const reviewsTotal =
-    toNumber(pick(extracted, ["reviewsTotal", "reviewCount"], null) ?? pick(data, ["reviewsTotal", "reviewCount"], null), 0);
-
-  const recent30d =
-    toNumber(pick(extracted, ["recent30d", "recentReviewCount30d"], null) ?? pick(data, ["recent30d", "recentReviewCount30d"], null), 0);
-
-  const photoCount =
-    toNumber(pick(extracted, ["photoCount"], null) ?? pick(data, ["photoCount"], null), 0);
+  // improvements (paid)
+  const improvements = data.improvements || null;
 
   return {
-    place,
-    extracted: { keywords, description, directions, reviewsTotal, recent30d, photoCount },
-    diagnosis,
-    rec: { recommendedKeywords5, improvedDescription, improvedDirections },
-    unifiedText,
-    competitors,
+    ok,
+    message,
+    logs,
+    placeData: { name, address, keywords, description, directions, reviewCount, photoCount, recent30d },
+    scoring: { totalScore, totalGrade, scores },
+    paid: { recommendedKeywords, competitors, unifiedText, improvements }
   };
 }
 
-async function analyze() {
-  const inputUrlEl = $("#placeUrl");
-  const planEl = $("#plan");
+async function postJson(url, payload) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
 
-  const placeUrl = (inputUrlEl?.value || "").trim();
-  const plan = (planEl?.value || "free").trim();
+  let json = null;
+  try {
+    json = await res.json();
+  } catch {
+    json = null;
+  }
+
+  return { res, json };
+}
+
+function getValueByAnyId(ids) {
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el && typeof el.value === "string") return el.value.trim();
+  }
+  return "";
+}
+
+async function analyze() {
+  // ✅ 다양한 UI 버전 대응 (id가 조금 달라도 동작)
+  const placeUrl = getValueByAnyId(["placeUrl", "url", "place_url"]);
+  const plan = (getValueByAnyId(["plan", "mode"]) || "free").toLowerCase();
+  const industry = (getValueByAnyId(["industry"]) || "hairshop").toLowerCase();
+  const searchQuery = getValueByAnyId(["searchQuery", "query", "competitorQuery"]);
 
   if (!placeUrl) {
     alert("플레이스 주소를 입력해줘.");
     return;
   }
 
+  // ✅ paid면 searchQuery 필수
+  if (plan === "paid" && !searchQuery) {
+    alert("유료 진단은 경쟁사 분석용 '검색어'가 필요해. (예: 서대문역 미용실)");
+    return;
+  }
+
   setText("#status", "분석 중...");
   setHtml("#result", "");
 
-  let data = null;
+  const endpoint = plan === "paid" ? "/api/diagnose/paid" : "/api/diagnose/free";
+  const payload = plan === "paid"
+    ? { placeUrl, industry, searchQuery }
+    : { placeUrl, industry };
 
+  let res, json;
   try {
-    const res = await fetch("/api/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ placeUrl, plan }),
-    });
-
-    data = await res.json().catch(() => null);
-
-    if (!res.ok || !data) {
-      setText("#status", "실패");
-      setHtml("#result", `<pre>${escapeHtml(JSON.stringify(data || { ok: false }, null, 2))}</pre>`);
-      return;
-    }
-
-    if (!data.ok && data.success === false) {
-      // some legacy responses use success:false
-      setText("#status", "실패");
-      setHtml("#result", `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`);
-      return;
-    }
+    const r = await postJson(endpoint, payload);
+    res = r.res;
+    json = r.json;
   } catch (e) {
     setText("#status", "실패");
     setHtml("#result", `<pre>${escapeHtml(String(e?.message || e))}</pre>`);
     return;
   }
 
+  if (!res.ok || !json) {
+    setText("#status", "실패");
+    setHtml("#result", `<pre>${escapeHtml(JSON.stringify(json || { success: false, message: "응답 없음" }, null, 2))}</pre>`);
+    return;
+  }
+
+  const n = normalizeResponse(json);
+
+  if (!n.ok) {
+    setText("#status", "실패");
+    setHtml("#result", `
+      ${buildCard("오류", `<pre>${escapeHtml(n.message || "진단 실패")}</pre>`)}
+      ${buildCard("디버그 원본", `<pre>${escapeHtml(JSON.stringify(json, null, 2))}</pre>`)}
+    `);
+    return;
+  }
+
   setText("#status", "완료");
-
-  const n = normalize(data);
-
-  const place = n.place || {};
-  const extracted = n.extracted || {};
-  const diagnosis = n.diagnosis;
-  const rec = n.rec || {};
-  const competitors = Array.isArray(n.competitors) ? n.competitors : [];
-  const unifiedText = n.unifiedText || "";
 
   const html = [];
 
-  // 기본 정보
   html.push(
-    buildCard(
-      "기본 정보",
-      `
-      <div><b>상호</b>: ${escapeHtml(place.name || place.placeName || "")}</div>
-      <div><b>카테고리</b>: ${escapeHtml(place.category || "")}</div>
-      <div><b>주소</b>: ${escapeHtml(place.address || "")}</div>
-      <div><b>Place ID</b>: ${escapeHtml(place.placeId || "")}</div>
-      <div><b>URL</b>: <a href="${escapeHtml(placeUrl)}" target="_blank" rel="noreferrer">${escapeHtml(placeUrl)}</a></div>
-    `
-    )
+    buildCard("기본 정보", `
+      <div><b>상호</b>: ${escapeHtml(n.placeData.name)}</div>
+      <div><b>주소</b>: ${escapeHtml(n.placeData.address)}</div>
+      <div style="margin-top:8px;"><b>리뷰</b>: ${escapeHtml(n.placeData.reviewCount)} (최근30일 ${escapeHtml(n.placeData.recent30d)})</div>
+      <div><b>사진 수</b>: ${escapeHtml(n.placeData.photoCount)}</div>
+    `)
   );
 
-  // 추출 데이터
   html.push(
-    buildCard(
-      "추출 데이터",
-      `
-      <div class="grid2">
-        <div>
-          <b>대표키워드(추출)</b>
-          ${renderChips(extracted.keywords || [])}
-        </div>
-        <div>
-          <b>리뷰</b>
-          <div>총 ${escapeHtml(extracted.reviewsTotal || 0)} / 최근30일 ${escapeHtml(extracted.recent30d || 0)}</div>
-        </div>
-      </div>
-
-      <div style="margin-top:10px;"><b>사진 수</b>: ${escapeHtml(extracted.photoCount || 0)}</div>
-
-      <div style="margin-top:10px;"><b>상세설명</b>${renderPre(extracted.description || "")}</div>
-      <div style="margin-top:10px;"><b>오시는길</b>${renderPre(extracted.directions || "")}</div>
-    `
-    )
+    buildCard("추출 대표키워드", renderChips(n.placeData.keywords))
   );
 
-  // 진단(있으면)
-  if (diagnosis) {
-    html.push(
-      buildCard("진단 결과", `<pre>${escapeHtml(JSON.stringify(diagnosis, null, 2))}</pre>`)
-    );
-  }
+  html.push(
+    buildCard("상세설명", renderPre(n.placeData.description))
+  );
 
-  // ✅ 추천 대표키워드(5) + 개선안 (추가 추천 키워드/10개 섹션 없음)
-  const rec5 = asArray(rec.recommendedKeywords5).filter(Boolean);
-  const hasRecText =
-    (rec.improvedDescription && String(rec.improvedDescription).trim()) ||
-    (rec.improvedDirections && String(rec.improvedDirections).trim());
+  html.push(
+    buildCard("오시는길", renderPre(n.placeData.directions))
+  );
 
-  if (rec5.length || hasRecText) {
-    html.push(buildCard("추천 대표키워드 (5개)", renderChips(rec5)));
+  html.push(
+    buildCard("점수", `
+      <div><b>Total</b>: ${escapeHtml(n.scoring.totalScore)}점 / ${escapeHtml(n.scoring.totalGrade)}</div>
+      <details style="margin-top:10px;">
+        <summary>세부 점수 보기</summary>
+        <pre>${escapeHtml(JSON.stringify(n.scoring.scores, null, 2))}</pre>
+      </details>
+    `)
+  );
 
-    if (rec.improvedDescription) {
-      html.push(buildCard("상세설명 개선안", renderPre(rec.improvedDescription)));
-    } else {
-      html.push(buildCard("상세설명 개선안", `<div class="muted">불러오지 못했습니다.</div>`));
+  if (plan === "paid") {
+    // ✅ 추천 대표키워드 5개
+    html.push(buildCard("추천 대표키워드 (5개)", renderChips(n.paid.recommendedKeywords)));
+
+    // ✅ 유료 통합본
+    if (n.paid.unifiedText && String(n.paid.unifiedText).trim()) {
+      html.push(buildCard("유료 컨설팅 통합본", renderPre(n.paid.unifiedText)));
     }
 
-    if (rec.improvedDirections) {
-      html.push(buildCard("오시는길 개선안", renderPre(rec.improvedDirections)));
+    // 경쟁사
+    if (n.paid.competitors && n.paid.competitors.length) {
+      const list = n.paid.competitors.map((c) => {
+        const name = c?.name ? String(c.name) : "경쟁사";
+        const addr = c?.address ? String(c.address) : "";
+        const rc = toNumber(c?.reviewCount, 0);
+        const pc = toNumber(c?.photoCount, 0);
+        const kws = asArray(c?.keywords || []).slice(0, 5).join(", ");
+        return `• ${name}${addr ? " / " + addr : ""} (리뷰 ${rc}, 사진 ${pc})\n  - ${kws}`;
+      }).join("\n");
+
+      html.push(buildCard("경쟁사 (best effort)", `<pre>${escapeHtml(list)}</pre>`));
     } else {
-      html.push(buildCard("오시는길 개선안", `<div class="muted">불러오지 못했습니다.</div>`));
+      html.push(buildCard("경쟁사", `<div class="muted">경쟁사 데이터를 가져오지 못했습니다.</div>`));
     }
-  } else {
-    html.push(
-      buildCard(
-        "추천 결과",
-        `<div class="muted">추천 데이터를 불러오지 못했습니다. (OPENAI 키 미설정/응답 오류 가능)</div>`
-      )
-    );
   }
 
-  // 유료 통합본
-  if (unifiedText && String(unifiedText).trim()) {
-    html.push(buildCard("유료 컨설팅 통합본", renderPre(unifiedText)));
-  }
+  // 로그/원본 (문제 생기면 이거 복사해서 보내면 됨)
+  html.push(buildCard("크롤링 로그", `<pre>${escapeHtml((n.logs || []).join("\n"))}</pre>`));
 
-  // 경쟁사
-  if (competitors.length) {
-    const lines = competitors.map((c) => {
-      const name = c?.name ? String(c.name) : "";
-      const id = c?.placeId ? String(c.placeId) : "";
-      const url = c?.url ? String(c.url) : "";
-      const label = name && id ? `${name} (${id})` : name || id || "경쟁사";
-
-      if (url) {
-        return `${label} - ${url}`;
-      }
-      return label;
-    });
-
-    html.push(buildCard("경쟁사 (best effort)", renderList(lines)));
-  } else {
-    html.push(buildCard("경쟁사", `<div class="muted">경쟁사 데이터를 가져오지 못했습니다.</div>`));
-  }
-
-  // raw debug toggle (optional)
   html.push(`
     <section class="card">
       <details>
-        <summary>디버그 원본 JSON 보기</summary>
-        <pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>
+        <summary>서버 원본 JSON 보기</summary>
+        <pre>${escapeHtml(JSON.stringify(json, null, 2))}</pre>
       </details>
     </section>
   `);
@@ -332,7 +263,19 @@ async function analyze() {
   setHtml("#result", html.join("\n"));
 }
 
-window.addEventListener("DOMContentLoaded", () => {
-  const btn = $("#analyzeBtn");
+function bind() {
+  // ✅ 버튼 클릭
+  const btn = $("#analyzeBtn") || $("#diagnoseBtn") || document.querySelector('[data-action="analyze"]');
   if (btn) btn.addEventListener("click", analyze);
-});
+
+  // ✅ 폼 submit도 지원
+  const form = document.querySelector("form");
+  if (form) {
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      analyze();
+    });
+  }
+}
+
+window.addEventListener("DOMContentLoaded", bind);
