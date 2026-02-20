@@ -5,6 +5,8 @@ import { ModularCrawler } from "./services/modularCrawler";
 import { convertToMobileUrl, isValidPlaceUrl } from "./utils/urlHelper";
 import { DiagnosisService } from "./services/diagnosis";
 import type { Industry } from "./lib/scoring/types";
+import { scorePlace } from "./lib/scoring/engine";
+import { generatePaidConsultingByGPT } from "./services/gptConsulting";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -32,10 +34,12 @@ function normalizeIndustry(v: any): Industry {
 async function crawl(placeUrl: string) {
   const mobileUrl = convertToMobileUrl(placeUrl);
   const crawler = new ModularCrawler();
-  const crawl = await crawler.crawlPlace(mobileUrl);
-  return crawl;
+  return crawler.crawlPlace(mobileUrl);
 }
 
+/**
+ * ✅ FREE: 점수/등급/이슈만 (GPT 없음)
+ */
 app.post("/api/diagnose/free", async (req, res) => {
   try {
     const { placeUrl, industry } = req.body as { placeUrl: string; industry?: Industry };
@@ -59,6 +63,7 @@ app.post("/api/diagnose/free", async (req, res) => {
     }
 
     const diag = new DiagnosisService();
+    // ✅ free는 개선안 생성 X
     const report = diag.generateDiagnosis(crawled.data, false, normalizeIndustry(industry));
 
     return res.json({
@@ -76,12 +81,10 @@ app.post("/api/diagnose/free", async (req, res) => {
   }
 });
 
-import type { Industry } from "./lib/scoring/types";
-import { generatePaidConsultingByGPT } from "./services/gptConsulting";
-import { scorePlace } from "./lib/scoring/engine";
-
-// ... (기존 코드 유지)
-
+/**
+ * ✅ PAID: 점수/등급 + GPT로 “바로 붙여넣기 개선안” 생성
+ * - 유료만 GPT 호출 (수정방향 생성은 유료에서만)
+ */
 app.post("/api/diagnose/paid", async (req, res) => {
   try {
     const { placeUrl, industry } = req.body as { placeUrl: string; industry?: Industry };
@@ -94,38 +97,37 @@ app.post("/api/diagnose/paid", async (req, res) => {
       });
     }
 
-    const mobileUrl = convertToMobileUrl(placeUrl);
+    const crawled = await crawl(placeUrl);
 
-    const crawler = new ModularCrawler();
-    const crawl = await crawler.crawlPlace(mobileUrl);
-
-    if (!crawl.success || !crawl.data) {
+    if (!crawled.success || !crawled.data) {
       return res.status(500).json({
         success: false,
-        message: crawl.error || "크롤링 실패",
-        logs: crawl.logs || []
+        message: crawled.error || "크롤링 실패",
+        logs: crawled.logs || []
       });
     }
 
-    // ✅ 로컬 점수(업종별 로직)로 먼저 채점
+    const ind = normalizeIndustry(industry);
+
+    // ✅ 업종별 스코어링(새 로직)
     const scored = scorePlace({
-      industry: (industry || "hairshop") as any,
-      name: crawl.data.name,
-      address: crawl.data.address,
-      description: crawl.data.description,
-      directions: crawl.data.directions,
-      keywords: crawl.data.keywords,
-      reviewCount: crawl.data.reviewCount,
-      recentReviewCount30d: crawl.data.recentReviewCount30d,
-      photoCount: crawl.data.photoCount,
-      menuCount: crawl.data.menuCount,
-      menus: crawl.data.menus
+      industry: ind as any,
+      name: crawled.data.name,
+      address: crawled.data.address,
+      description: crawled.data.description,
+      directions: crawled.data.directions,
+      keywords: crawled.data.keywords,
+      reviewCount: crawled.data.reviewCount,
+      recentReviewCount30d: (crawled.data as any).recentReviewCount30d,
+      photoCount: crawled.data.photoCount,
+      menuCount: (crawled.data as any).menuCount,
+      menus: (crawled.data as any).menus
     });
 
-    // ✅ GPT로 유료 개선안 생성
+    // ✅ GPT로 유료 컨설팅 생성
     const gpt = await generatePaidConsultingByGPT({
-      industry: (industry || "hairshop") as any,
-      placeData: crawl.data,
+      industry: ind as any,
+      placeData: crawled.data,
       scores: scored.scores as any,
       totalScore: scored.totalScore,
       totalGrade: scored.totalGrade
@@ -134,7 +136,7 @@ app.post("/api/diagnose/paid", async (req, res) => {
     return res.json({
       success: true,
       data: {
-        placeData: crawl.data,
+        placeData: crawled.data,
         scores: scored.scores,
         totalScore: scored.totalScore,
         totalGrade: scored.totalGrade,
@@ -143,7 +145,7 @@ app.post("/api/diagnose/paid", async (req, res) => {
         recommendedKeywords: gpt.recommendedKeywords || null,
         competitors: null
       },
-      logs: crawl.logs || []
+      logs: crawled.logs || []
     });
   } catch (error: any) {
     console.error("paid diagnose 오류:", error);
@@ -154,6 +156,7 @@ app.post("/api/diagnose/paid", async (req, res) => {
     });
   }
 });
+
 // ✅ /api 제외한 나머지는 프론트로
 app.get("*", (req, res) => {
   if (req.path.startsWith("/api")) {
