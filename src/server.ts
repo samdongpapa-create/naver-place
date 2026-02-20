@@ -31,9 +31,26 @@ function normalizeIndustry(v: any): Industry {
 }
 
 function extractPlaceIdSafe(url: string): string {
-  // 어떤 형태든 숫자 placeId만 뽑기
   const m = String(url || "").match(/(\d{5,12})/);
   return m?.[1] || "";
+}
+
+function guessSearchQuery(industry: Industry, name: string, address: string): string {
+  const indWord = industry === "hairshop" ? "미용실" : industry === "cafe" ? "카페" : "맛집";
+  const nm = String(name || "");
+  const ad = String(address || "");
+
+  // 1) 상호명에서 “~역” 있으면 사용
+  const m1 = nm.match(/([가-힣]{2,10})역/);
+  if (m1?.[1]) return `${m1[1]}역 ${indWord}`;
+
+  // 2) 주소에서 “~역/~동/~구” 같은 토큰 추출
+  const parts = ad.split(/\s+/).map(s => s.trim()).filter(Boolean);
+  const cand = parts.find(p => /(역|동|구)$/.test(p) && p.length <= 10);
+  if (cand) return `${cand} ${indWord}`;
+
+  // 3) 최후 fallback
+  return industry === "hairshop" ? "서대문역 미용실" : industry === "cafe" ? "서대문역 카페" : "서대문역 맛집";
 }
 
 async function crawl(placeUrl: string) {
@@ -42,8 +59,7 @@ async function crawl(placeUrl: string) {
   return await crawler.crawlPlace(mobileUrl);
 }
 
-/** ✅ (fallback) 추천 키워드 5개 생성: 경쟁사 빈도 + 지역 결합 */
-function buildRecommendedKeywords(params: {
+function buildRecommendedKeywordsLocal(params: {
   industry: Industry;
   myName: string;
   myAddress: string;
@@ -73,9 +89,7 @@ function buildRecommendedKeywords(params: {
         if (/(역|구|동)$/.test(p) && p.length <= 10) toks.push(p);
       }
     }
-
-    const uniq = Array.from(new Set(toks));
-    return uniq[0] || "";
+    return Array.from(new Set(toks))[0] || "";
   })();
 
   const normalize = (k: string) => {
@@ -92,7 +106,6 @@ function buildRecommendedKeywords(params: {
 
   const seen = new Set<string>();
   const out: string[] = [];
-
   const push = (k: string) => {
     const nk = normalize(k);
     if (!nk) return;
@@ -113,7 +126,6 @@ function buildRecommendedKeywords(params: {
     }
   }
 
-  // 1) 지역+서비스 3개
   if (locality) {
     for (const t of serviceTokens.slice(0, 4)) {
       push(`${locality}${t}`);
@@ -121,7 +133,6 @@ function buildRecommendedKeywords(params: {
     }
   }
 
-  // 2) 경쟁사 빈도 상위로 보충
   const sorted = Array.from(freq.entries()).sort((a, b) => b[1] - a[1]);
   for (const [k] of sorted) {
     if (out.length >= 5) break;
@@ -129,14 +140,11 @@ function buildRecommendedKeywords(params: {
     else push(k);
   }
 
-  // 3) 내 키워드로 보충
   for (const k of myKeywords || []) {
     if (out.length >= 5) break;
-    if (locality) push(`${locality}${normalize(k).replace(locality, "")}`);
-    else push(k);
+    push(locality ? `${locality}${normalize(k).replace(locality, "")}` : k);
   }
 
-  // 4) 그래도 부족하면 서비스 토큰
   for (const t of serviceTokens) {
     if (out.length >= 5) break;
     push(locality ? `${locality}${t}` : t);
@@ -150,21 +158,12 @@ app.post("/api/diagnose/free", async (req, res) => {
     const { placeUrl, industry } = req.body as { placeUrl: string; industry?: Industry };
 
     if (!placeUrl || !isValidPlaceUrl(placeUrl)) {
-      return res.status(400).json({
-        success: false,
-        message: "유효한 네이버 플레이스 URL이 아닙니다.",
-        logs: []
-      });
+      return res.status(400).json({ success: false, message: "유효한 네이버 플레이스 URL이 아닙니다.", logs: [] });
     }
 
     const crawled = await crawl(placeUrl);
-
     if (!crawled.success || !crawled.data) {
-      return res.status(500).json({
-        success: false,
-        message: crawled.error || "크롤링 실패",
-        logs: crawled.logs || []
-      });
+      return res.status(500).json({ success: false, message: crawled.error || "크롤링 실패", logs: crawled.logs || [] });
     }
 
     const scored = scorePlace({
@@ -192,13 +191,9 @@ app.post("/api/diagnose/free", async (req, res) => {
       },
       logs: crawled.logs || []
     });
-  } catch (error: any) {
-    console.error("free diagnose 오류:", error);
-    return res.status(500).json({
-      success: false,
-      message: "진단 중 오류 발생",
-      logs: [String(error?.message || error)]
-    });
+  } catch (e: any) {
+    console.error("free diagnose 오류:", e);
+    return res.status(500).json({ success: false, message: "진단 중 오류 발생", logs: [String(e?.message || e)] });
   }
 });
 
@@ -206,45 +201,31 @@ app.post("/api/diagnose/paid", async (req, res) => {
   let compSvc: CompetitorService | null = null;
 
   try {
-    const { placeUrl, industry, searchQuery } = req.body as {
-      placeUrl: string;
-      industry?: Industry;
-      searchQuery?: string;
-    };
+    const { placeUrl, industry, searchQuery } = req.body as { placeUrl: string; industry?: Industry; searchQuery?: string };
 
     if (!placeUrl || !isValidPlaceUrl(placeUrl)) {
-      return res.status(400).json({
-        success: false,
-        message: "유효한 네이버 플레이스 URL이 아닙니다.",
-        logs: []
-      });
-    }
-
-    if (!searchQuery || !searchQuery.trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "경쟁사 분석을 위한 검색어를 입력해주세요.",
-        logs: []
-      });
+      return res.status(400).json({ success: false, message: "유효한 네이버 플레이스 URL이 아닙니다.", logs: [] });
     }
 
     const ind = normalizeIndustry(industry);
 
     const mobileUrl = convertToMobileUrl(placeUrl);
-    const placeId = UrlConverter.extractPlaceId(mobileUrl) || extractPlaceIdSafe(mobileUrl) || extractPlaceIdSafe(placeUrl);
+    const placeId =
+      UrlConverter.extractPlaceId(mobileUrl) ||
+      extractPlaceIdSafe(mobileUrl) ||
+      extractPlaceIdSafe(placeUrl);
 
     const crawler = new ModularCrawler();
     const crawlResult = await crawler.crawlPlace(mobileUrl);
 
     if (!crawlResult.success || !crawlResult.data) {
-      return res.status(500).json({
-        success: false,
-        message: crawlResult.error || "크롤링 실패",
-        logs: crawlResult.logs || []
-      });
+      return res.status(500).json({ success: false, message: crawlResult.error || "크롤링 실패", logs: crawlResult.logs || [] });
     }
 
-    // 1) 현재 상태 점수
+    // ✅ searchQuery 없으면 서버가 자동 생성
+    const finalQuery = (searchQuery || "").trim() || guessSearchQuery(ind, crawlResult.data.name, crawlResult.data.address);
+    console.log("[PAID] searchQuery:", finalQuery);
+
     const scored = scorePlace({
       industry: ind,
       name: crawlResult.data.name,
@@ -259,16 +240,16 @@ app.post("/api/diagnose/paid", async (req, res) => {
       menus: crawlResult.data.menus
     });
 
-    // 2) 경쟁사 Top5
+    // 경쟁사 Top5
     compSvc = new CompetitorService();
-    const compIds = await compSvc.findTopPlaceIds(searchQuery.trim(), placeId, 5);
+    const compIds = await compSvc.findTopPlaceIds(finalQuery, placeId, 5);
     console.log("[PAID] compIds:", compIds.length, compIds);
 
     const competitors = await compSvc.crawlCompetitorsByIds(compIds, ind, 5);
     console.log("[PAID] competitors:", competitors.length);
 
-    // 3) (fallback) 추천 대표키워드 5개
-    const recommendedKeywordsLocal = buildRecommendedKeywords({
+    // fallback keywords
+    const localKw = buildRecommendedKeywordsLocal({
       industry: ind,
       myName: crawlResult.data.name,
       myAddress: crawlResult.data.address,
@@ -276,72 +257,51 @@ app.post("/api/diagnose/paid", async (req, res) => {
       competitorKeywords: competitors.map(c => c.keywords || [])
     });
 
-    // 4) GPT 유료 컨설팅
+    // GPT 컨설팅
     const gpt = await generatePaidConsultingGuaranteed({
       industry: ind,
       placeData: crawlResult.data,
-      scoredNow: {
-        totalScore: scored.totalScore,
-        totalGrade: scored.totalGrade,
-        scores: scored.scores
-      },
+      scoredNow: { totalScore: scored.totalScore, totalGrade: scored.totalGrade, scores: scored.scores },
       competitorTopKeywords: competitors.flatMap(c => c.keywords || []),
       targetScore: 90
     });
 
-    // ✅ 핵심: 대표키워드 불일치 방지
-    // - 최우선: gpt.improvements.keywords (통합본도 이걸 기준으로 만들어짐)
-    // - 다음: gpt.recommendedKeywords
-    // - 마지막: local
-    const gptKw = Array.isArray(gpt?.improvements?.keywords) ? gpt.improvements.keywords.slice(0, 5) : [];
-    const recommendedKeywords =
-      gptKw.length === 5
-        ? gptKw
-        : (Array.isArray(gpt?.recommendedKeywords) ? gpt.recommendedKeywords.slice(0, 5) : []).length === 5
-        ? gpt.recommendedKeywords.slice(0, 5)
-        : recommendedKeywordsLocal;
+    // ✅ 불일치 방지: “대표키워드 5개”를 서버에서 확정
+    const gptKw = Array.isArray((gpt as any)?.improvements?.keywords) ? (gpt as any).improvements.keywords.slice(0, 5) : [];
+    const gptRec = Array.isArray((gpt as any)?.recommendedKeywords) ? (gpt as any).recommendedKeywords.slice(0, 5) : [];
 
-    // ✅ improvements 안의 keywords도 서버에서 한번 더 강제(프론트가 improvements.keywords를 보더라도 동일)
-    if (gpt?.improvements) {
-      (gpt.improvements as any).keywords = recommendedKeywords;
-    }
+    const recommendedKeywords = (gptKw.length ? gptKw : gptRec.length ? gptRec : localKw).slice(0, 5);
+
+    // improvements.keywords도 강제로 동일하게
+    if ((gpt as any)?.improvements) (gpt as any).improvements.keywords = recommendedKeywords;
 
     return res.json({
       success: true,
       data: {
         placeData: crawlResult.data,
-
         scores: scored.scores,
         totalScore: scored.totalScore,
         totalGrade: scored.totalGrade,
         isPaid: true,
 
-        improvements: gpt.improvements,
-
-        // ✅ 항상 5개로 통일
+        improvements: (gpt as any).improvements,
         recommendedKeywords,
-
         competitors,
 
-        predictedAfter: gpt.predicted,
-        attempts: gpt.attempts,
+        predictedAfter: (gpt as any).predicted,
+        attempts: (gpt as any).attempts,
+        unifiedText: (gpt as any).unifiedText,
 
-        // ✅ 통합본(내부도 recommendedKeywords 기준으로 통일됨)
-        unifiedText: gpt.unifiedText
+        // 디버깅용(프론트에서 안 써도 됨)
+        searchQueryUsed: finalQuery
       },
       logs: crawlResult.logs || []
     });
-  } catch (error: any) {
-    console.error("paid diagnose 오류:", error);
-    return res.status(500).json({
-      success: false,
-      message: "유료 진단 중 오류 발생",
-      logs: [String(error?.message || error)]
-    });
+  } catch (e: any) {
+    console.error("paid diagnose 오류:", e);
+    return res.status(500).json({ success: false, message: "유료 진단 중 오류 발생", logs: [String(e?.message || e)] });
   } finally {
-    try {
-      await compSvc?.close();
-    } catch {}
+    try { await compSvc?.close(); } catch {}
   }
 });
 
