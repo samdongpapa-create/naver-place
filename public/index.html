@@ -169,7 +169,21 @@
         <div class="modal-body">
           <p style="margin:0 0 10px 0;">결제 후, 경쟁사 Top 5 분석 + 추천키워드 + 개선안을 제공합니다.</p>
           <p class="modal-price">₩19,900</p>
-          <p style="font-size:12px; opacity:.7; margin-top:8px;">
+
+          <!-- ✅ 추가: 경쟁사 검색어 입력 -->
+          <div style="margin-top:14px;">
+            <label style="display:block; font-size:13px; opacity:.8; margin-bottom:6px;">경쟁사 분석 검색어</label>
+            <input
+              id="paidSearchQuery"
+              class="modal-input"
+              placeholder="예) 서대문역 미용실 / 교대역 미용실 / 강남역 카페"
+            />
+            <p style="font-size:12px; opacity:.7; margin-top:6px; line-height:1.4;">
+              * 검색어가 정확할수록 경쟁사 키워드/데이터가 잘 나옵니다.
+            </p>
+          </div>
+
+          <p style="font-size:12px; opacity:.7; margin-top:10px;">
             * 현재는 결제 연동 전이므로 버튼 클릭 시 바로 유료 진단 API를 호출합니다.
           </p>
         </div>
@@ -181,6 +195,7 @@
     </div>
   </div>
 
-  <script src="script.js"></script>
+  <!-- ✅ 캐시 이슈 방지: 버전 쿼리 -->
+  <script src="script.js?v=20260220"></script>
 </body>
 </html>
