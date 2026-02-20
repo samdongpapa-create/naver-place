@@ -1,222 +1,326 @@
-import { Page, Frame } from "playwright";
+import { Page } from "playwright";
 
-export class ReviewPhotoExtractor {
-  static async extract(
-    page: Page,
-    _frame: Frame | null,
-    placeId: string
-  ): Promise<{ reviewCount: number; photoCount: number; recentReviewCount30d: number; logs: string[] }> {
-    const logs: string[] = [];
-    logs.push("[리뷰&사진] 추출 시작");
+/**
+ * Review/Photo extractor (robust)
+ * - reviews: total visitor review count (best effort)
+ * - recent30d: visitor reviews in last 30 days (best effort)
+ * - photoCount: robust fallback (network/HTML/DOM/img-count)
+ *
+ * IMPORTANT:
+ * Naver Place frequently changes structure.
+ * We prefer:
+ * 1) Network / embedded JSON keys
+ * 2) HTML regex patterns
+ * 3) DOM text scanning
+ * 4) img thumbnail counting (minimum estimate)
+ */
 
-    let reviewCount = 0;
-    let photoCount = 0;
-    let recentReviewCount30d = 0;
+type ReviewPhotoResult = {
+  reviewsTotal: number;
+  recent30d: number;
+  photoCount: number;
+};
 
-    try {
-      // ✅ slug 자동 보정: /place/{id}/home 로 들어가면 hairshop/cafe/...로 리다이렉트됨
-      const homeUrl = `https://m.place.naver.com/place/${placeId}/home`;
-      logs.push(`[리뷰&사진] 홈 이동(리뷰 기준): ${homeUrl}`);
+function safeInt(v: any, def = 0) {
+  const n = Number(String(v).replace(/[^\d]/g, ""));
+  return Number.isFinite(n) ? n : def;
+}
 
-      await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await page.waitForTimeout(1800);
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
 
-      const finalUrl = page.url();
-      const slug = this.extractCategorySlug(finalUrl);
-      if (slug) logs.push(`[리뷰&사진] redirect slug 보정: ${slug}`);
+function isWithinLastDays(date: Date, days: number) {
+  const now = new Date();
+  const diff = now.getTime() - date.getTime();
+  return diff >= 0 && diff <= days * 24 * 60 * 60 * 1000;
+}
 
-      const homeHtml = await page.content();
+function parseKoreanReviewDate(text: string): Date | null {
+  // common patterns:
+  // 2026.02.10
+  // 2026-02-10
+  // 2.10. (year omitted) -> assume current year
+  const t = text.trim();
 
-      reviewCount = this.extractMaxNumber(homeHtml, [
-        /"visitorReviewCount"[\s":]+([0-9,]+)/gi,
-        /"reviewCount"[\s":]+([0-9,]+)/gi,
-        /방문자리뷰\s*([0-9,]+)/gi,
-        /리뷰\s*([0-9,]+)/gi
-      ]);
-
-      logs.push(`[리뷰&사진] 리뷰 최댓값: ${reviewCount}`);
-      logs.push(`[리뷰&사진] 홈 기준 - 리뷰:${reviewCount}`);
-
-      // ✅ 최근 30일 리뷰 수 (visitor review 페이지에서 날짜 파싱)
-      try {
-        const reviewUrl = `https://m.place.naver.com/place/${placeId}/review/visitor`;
-        logs.push(`[리뷰&사진] 최근리뷰(30일) 계산 시도: ${reviewUrl}`);
-
-        await page.goto(reviewUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await page.waitForTimeout(1600);
-
-        const innerText = await page.evaluate(() => {
-          const d = (globalThis as any).document as any;
-          const raw = d?.body?.innerText ? String(d.body.innerText) : "";
-          return raw;
-        });
-
-        const parsed = this.countRecentDaysFromText(innerText, 30);
-        recentReviewCount30d = parsed.count;
-        logs.push(`[리뷰&사진] 날짜 파싱 개수: ${parsed.totalDates}, 최근30일 카운트: ${recentReviewCount30d}`);
-        logs.push(`[리뷰&사진] 최근 30일 리뷰 수 확정: ${recentReviewCount30d}`);
-      } catch (e: any) {
-        logs.push(`[리뷰&사진] 최근리뷰(30일) 계산 실패: ${e?.message || String(e)}`);
-      }
-
-      // ✅ 사진 수 추출: photo 탭 이동 후 안정적으로 key 기반 파싱
-      try {
-        const photoUrl = slug
-          ? `https://m.place.naver.com/${slug}/${placeId}/photo`
-          : `https://m.place.naver.com/place/${placeId}/photo`;
-
-        logs.push(`[리뷰&사진] 사진탭 이동: ${photoUrl}`);
-        await page.goto(photoUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await page.waitForTimeout(1600);
-
-        const photoHtml = await page.content();
-
-        // ✅ “진짜 photoCount 키”만 엄격하게 (리뷰 수/totalCount 오탐 방지)
-        // 네이버가 쓰는 키가 여러번 바뀌어서 후보 여러개를 두되, photo 관련 키만 허용
-        photoCount = this.extractMaxNumber(photoHtml, [
-          /"photoCount"[\s":]+([0-9,]+)/gi,
-          /"businessPhotoCount"[\s":]+([0-9,]+)/gi,
-          /"storePhotoCount"[\s":]+([0-9,]+)/gi,
-          /"totalPhotoCount"[\s":]+([0-9,]+)/gi
-        ]);
-
-        logs.push(`[리뷰&사진] 네트워크 photoCount(best, strict keys only): ${photoCount}`);
-
-        // ✅ DOM 텍스트 보조 파싱 (탭/칩이 있을 때만)
-        if (!photoCount || photoCount <= 0) {
-          const domLine = await page.evaluate(() => {
-            const d = (globalThis as any).document as any;
-            const raw = d?.body?.innerText ? String(d.body.innerText) : "";
-            const lines = raw
-              .split(/\r?\n|•|·/g)
-              .map((s: string) => (s || "").replace(/\s+/g, " ").trim())
-              .filter((s: string) => s.length > 0);
-
-            const hit =
-              lines.find((s: string) => /업체\s*사진|업체사진/.test(s) && s.length <= 120) ||
-              lines.find((s: string) => /사진/.test(s) && /\([0-9,]+\)/.test(s) && s.length <= 80) ||
-              "";
-
-            return hit || "";
-          });
-
-          const parsed = this.parseCountFromText(domLine);
-          if (parsed > 0) {
-            photoCount = parsed;
-            logs.push(`[리뷰&사진] DOM 라인에서 photoCount 파싱: ${photoCount} (line="${domLine}")`);
-          } else {
-            logs.push("[리뷰&사진] 업체사진 필터/칩을 찾지 못함 → DOM 카운트 스킵");
-          }
-        }
-
-        // ✅ 오탐 컷(너 케이스처럼 2장인데 8000 이런 값 방지)
-        // - 지나치게 큰 값(2000 초과)은 거의 100% 오탐(전체 이미지/리뷰/게시물 등)
-        // - 매우 작은 값(1~4)은 실제일 수 있으니 유지
-        if (photoCount > 2000) {
-          logs.push(`[리뷰&사진] photoCount=${photoCount} 과대(>2000) → 오탐으로 0 처리`);
-          photoCount = 0;
-        }
-      } catch (e: any) {
-        logs.push(`[리뷰&사진] 사진 추출 실패: ${e?.message || String(e)}`);
-      }
-
-      logs.push(`[리뷰&사진] 최종 결과 - 리뷰: ${reviewCount}, 업체사진: ${photoCount}, 최근30일: ${recentReviewCount30d}`);
-      return { reviewCount, photoCount, recentReviewCount30d, logs };
-    } catch (e: any) {
-      logs.push(`[리뷰&사진] 오류: ${e?.message || String(e)}`);
-      return { reviewCount: reviewCount || 0, photoCount: photoCount || 0, recentReviewCount30d: recentReviewCount30d || 0, logs };
-    }
+  // YYYY.MM.DD
+  let m = t.match(/(20\d{2})\.(\d{1,2})\.(\d{1,2})/);
+  if (m) {
+    const y = Number(m[1]);
+    const mo = Number(m[2]) - 1;
+    const d = Number(m[3]);
+    const dt = new Date(y, mo, d);
+    return isNaN(dt.getTime()) ? null : dt;
   }
 
-  private static extractCategorySlug(url: string): string {
-    try {
-      const u = new URL(url);
-      const parts = u.pathname.split("/").filter(Boolean);
-      // /hairshop/{id}/home 형태
-      if (parts.length >= 2 && parts[1] && /^\d+$/.test(parts[1])) {
-        return parts[0]; // hairshop/cafe/restaurant 등
-      }
-      return "";
-    } catch {
-      return "";
-    }
+  // YYYY-MM-DD
+  m = t.match(/(20\d{2})-(\d{1,2})-(\d{1,2})/);
+  if (m) {
+    const y = Number(m[1]);
+    const mo = Number(m[2]) - 1;
+    const d = Number(m[3]);
+    const dt = new Date(y, mo, d);
+    return isNaN(dt.getTime()) ? null : dt;
   }
 
-  private static parseCountFromText(text?: string | null): number {
+  // M.D. (year omitted)
+  m = t.match(/(^|\s)(\d{1,2})\.(\d{1,2})\.(\s|$)/);
+  if (m) {
+    const y = new Date().getFullYear();
+    const mo = Number(m[2]) - 1;
+    const d = Number(m[3]);
+    const dt = new Date(y, mo, d);
+    return isNaN(dt.getTime()) ? null : dt;
+  }
+
+  return null;
+}
+
+function extractAllNumbersNearKeywords(html: string, keywords: string[]) {
+  // returns array of numbers near any of the keywords (broad heuristic)
+  const nums: number[] = [];
+  for (const kw of keywords) {
+    const re = new RegExp(`${kw}[^\\d]{0,40}(\\d{1,7})`, "gi");
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html))) {
+      nums.push(safeInt(m[1], 0));
+    }
+  }
+  return nums;
+}
+
+function bestCandidate(nums: number[], min = 0, max = 10_000_000) {
+  const filtered = nums.filter((n) => Number.isFinite(n) && n >= min && n <= max);
+  if (!filtered.length) return 0;
+  // choose the maximum as best estimate
+  return filtered.sort((a, b) => b - a)[0];
+}
+
+async function getPageHTML(page: Page) {
+  try {
+    return await page.content();
+  } catch {
+    return "";
+  }
+}
+
+async function scanDOMTextForPhotoCount(page: Page): Promise<number> {
+  try {
+    const text = await page.evaluate(() => document.body?.innerText || "");
     if (!text) return 0;
-    const t = String(text);
 
-    const m =
-      t.match(/업체\s*사진[^0-9]{0,10}([0-9][0-9,]{0,})/) ||
-      t.match(/업체사진[^0-9]{0,10}([0-9][0-9,]{0,})/) ||
-      t.match(/사진[^0-9]{0,10}\(([0-9][0-9,]{0,})\)/) ||
-      t.match(/\(([0-9][0-9,]{0,})\)/);
+    // patterns:
+    // 사진 1,234
+    // 사진(123)
+    // 업체사진 123
+    // 포토 123
+    // 이미지 123
+    const patterns = [
+      /업체\s*사진\s*[\(\[]?\s*([0-9,]{1,10})\s*[\)\]]?/g,
+      /사진\s*[\(\[]?\s*([0-9,]{1,10})\s*[\)\]]?/g,
+      /포토\s*[\(\[]?\s*([0-9,]{1,10})\s*[\)\]]?/g,
+      /이미지\s*[\(\[]?\s*([0-9,]{1,10})\s*[\)\]]?/g,
+    ];
 
-    if (!m?.[1]) return 0;
-    const n = parseInt(m[1].replace(/,/g, ""), 10);
-    return Number.isNaN(n) ? 0 : n;
-  }
-
-  private static extractMaxNumber(html: string, regexList: RegExp[]): number {
-    const nums: number[] = [];
-
-    for (const r of regexList) {
-      const matches = html.matchAll(r);
-      for (const m of matches) {
-        const raw = m?.[1];
-        if (!raw) continue;
-        const n = parseInt(String(raw).replace(/,/g, ""), 10);
-        if (!Number.isNaN(n) && n > 0 && n < 5000000) nums.push(n);
+    const found: number[] = [];
+    for (const re of patterns) {
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text))) {
+        const n = safeInt(m[1], 0);
+        if (n > 0) found.push(n);
       }
     }
-
-    if (!nums.length) return 0;
-    return Math.max(...nums);
+    return bestCandidate(found);
+  } catch {
+    return 0;
   }
+}
 
-  private static countRecentDaysFromText(text: string, days: number) {
-    const now = new Date();
-    const limit = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+async function countPhotoThumbnailsAsMinimum(page: Page): Promise<number> {
+  // fallback: count images likely used in photo grid (minimum estimate)
+  try {
+    const n = await page.evaluate(() => {
+      const imgs = Array.from(document.querySelectorAll("img"));
+      // try to filter out logos/icons by size/alt/src patterns
+      const candidates = imgs.filter((img) => {
+        const src = (img.getAttribute("src") || "").toLowerCase();
+        if (!src) return false;
+        if (src.includes("data:image")) return false;
+        if (src.includes("logo")) return false;
+        if (src.includes("icon")) return false;
+        // Naver CDN / thumbnails often contain "type=" or "w=" etc, but keep broad
+        return true;
+      });
+      return candidates.length;
+    });
 
-    // 텍스트에서 날짜 패턴 최대한 많이 수집
-    // 예) 2026.02.13 / 2026-02-13 / 02.13 / 2.13 / 2026년 2월 13일
-    const patterns = [
-      /\b(20\d{2})[.\-\/](\d{1,2})[.\-\/](\d{1,2})\b/g,         // 2026.02.13
-      /\b(\d{1,2})[.\-\/](\d{1,2})\b/g,                         // 02.13
-      /\b(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일\b/g    // 2026년 2월 13일
+    // photo page includes many images; we clamp to realistic lower bounds.
+    // If only a few images, treat as 0 (not reliable).
+    if (!n || n < 6) return 0;
+    return n;
+  } catch {
+    return 0;
+  }
+}
+
+async function robustPhotoCount(page: Page): Promise<number> {
+  const html = await getPageHTML(page);
+  if (!html) return 0;
+
+  // 1) Strict-ish known keys (but broader than before)
+  // We scan for multiple candidate keys frequently used in embedded JSON.
+  const keyCandidates = [
+    "photoCount",
+    "photoTotalCount",
+    "totalPhotoCount",
+    "totalCount",
+    "imageCount",
+    "imagesCount",
+    "photoCnt",
+    "photo_cnt",
+    "photo",
+    "photos",
+    "photoTotal",
+    "totalPhotos",
+    "totalImages",
+    "mediaCount",
+    "mediaTotalCount",
+    "contentCount",
+  ];
+
+  const keyNums: number[] = [];
+  for (const key of keyCandidates) {
+    // "photoCount":1234 or "photoCount": "1234"
+    const re = new RegExp(`"${key}"\\s*:\\s*"?([0-9,]{1,10})"?`, "gi");
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html))) {
+      const n = safeInt(m[1], 0);
+      if (n > 0) keyNums.push(n);
+    }
+  }
+  const keyBest = bestCandidate(keyNums);
+  if (keyBest > 0) return keyBest;
+
+  // 2) HTML regex near Korean words
+  const nearNums = extractAllNumbersNearKeywords(html, ["업체사진", "사진", "포토", "이미지"]);
+  const nearBest = bestCandidate(nearNums);
+  if (nearBest > 0) return nearBest;
+
+  // 3) DOM text scan (innerText)
+  const domBest = await scanDOMTextForPhotoCount(page);
+  if (domBest > 0) return domBest;
+
+  // 4) Thumbnail count (minimum estimate)
+  const thumb = await countPhotoThumbnailsAsMinimum(page);
+  if (thumb > 0) return thumb;
+
+  return 0;
+}
+
+async function extractReviewTotalFromHTML(html: string): Promise<number> {
+  // patterns:
+  // 방문자리뷰 1,927 · 블로그리뷰 393
+  // 방문자 리뷰 1,927
+  const patterns = [
+    /방문\s*자?\s*리뷰\s*([0-9,]{1,10})/g,
+    /방문자리뷰\s*([0-9,]{1,10})/g,
+    /방문자\s*리뷰\s*([0-9,]{1,10})/g,
+  ];
+  const found: number[] = [];
+  for (const re of patterns) {
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html))) {
+      const n = safeInt(m[1], 0);
+      if (n > 0) found.push(n);
+    }
+  }
+  return bestCandidate(found);
+}
+
+async function extractRecent30dReviews(page: Page, reviewUrl: string): Promise<number> {
+  try {
+    await page.goto(reviewUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForTimeout(800);
+
+    const html = await getPageHTML(page);
+    if (!html) return 0;
+
+    // Try to parse date strings that appear in review list
+    // We'll grab likely date patterns, parse, then count within 30 days.
+    const datePatterns = [
+      /\b20\d{2}\.\d{1,2}\.\d{1,2}\b/g,
+      /\b20\d{2}-\d{1,2}-\d{1,2}\b/g,
+      /\b\d{1,2}\.\d{1,2}\.\b/g,
     ];
 
     const dates: Date[] = [];
-
-    // 1) 연도 포함 패턴
-    for (const p of [patterns[0], patterns[2]]) {
-      let m;
-      while ((m = p.exec(text)) !== null) {
-        const y = parseInt(m[1], 10);
-        const mo = parseInt(m[2], 10);
-        const d = parseInt(m[3], 10);
-        if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
-          const dt = new Date(y, mo - 1, d);
-          if (!Number.isNaN(dt.getTime())) dates.push(dt);
-        }
+    for (const re of datePatterns) {
+      const matches = html.match(re) || [];
+      for (const s of matches) {
+        const dt = parseKoreanReviewDate(s);
+        if (dt) dates.push(dt);
       }
     }
 
-    // 2) 월/일만 있는 패턴은 “올해”로 가정 (오탐 방지 위해 올해만)
-    {
-      const p = patterns[1];
-      let m;
-      while ((m = p.exec(text)) !== null) {
-        const mo = parseInt(m[1], 10);
-        const d = parseInt(m[2], 10);
-        if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
-          const dt = new Date(now.getFullYear(), mo - 1, d);
-          if (!Number.isNaN(dt.getTime())) dates.push(dt);
-        }
-      }
+    // De-dup dates (stringify by y-m-d)
+    const uniq = new Map<string, Date>();
+    for (const d of dates) {
+      const key = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+      if (!uniq.has(key)) uniq.set(key, d);
     }
 
-    const recent = dates.filter(d => d >= limit && d <= now).length;
-    return { totalDates: dates.length, count: recent };
+    const list = Array.from(uniq.values());
+    const count = list.filter((d) => isWithinLastDays(d, 30)).length;
+
+    // Heuristic: This undercounts when multiple reviews share date.
+    // But it gives a stable minimum; better than 0.
+    return clamp(count, 0, 99999);
+  } catch {
+    return 0;
   }
+}
+
+export async function extractReviewAndPhoto(
+  page: Page,
+  homeUrl: string,
+  photoUrl: string,
+  reviewListUrl: string
+): Promise<ReviewPhotoResult> {
+  let reviewsTotal = 0;
+  let recent30d = 0;
+  let photoCount = 0;
+
+  // 1) Go home and parse review total from HTML (best-effort)
+  try {
+    await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForTimeout(800);
+    const homeHtml = await getPageHTML(page);
+    if (homeHtml) {
+      reviewsTotal = await extractReviewTotalFromHTML(homeHtml);
+    }
+  } catch {
+    // ignore
+  }
+
+  // 2) recent 30 days review count (best-effort)
+  if (reviewListUrl) {
+    recent30d = await extractRecent30dReviews(page, reviewListUrl);
+  }
+
+  // 3) photo count (robust)
+  if (photoUrl) {
+    try {
+      await page.goto(photoUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+      await page.waitForTimeout(900);
+      photoCount = await robustPhotoCount(page);
+    } catch {
+      photoCount = 0;
+    }
+  }
+
+  return {
+    reviewsTotal: safeInt(reviewsTotal, 0),
+    recent30d: safeInt(recent30d, 0),
+    photoCount: safeInt(photoCount, 0),
+  };
 }
