@@ -68,7 +68,9 @@ export class ModularCrawler {
         userAgent:
           "Mozilla/5.0 (Linux; Android 13; SM-G991N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
         viewport: { width: 390, height: 844 },
-        extraHTTPHeaders: { "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7" }
+        extraHTTPHeaders: {
+          "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
+        }
       });
 
       const page = await context.newPage();
@@ -81,11 +83,6 @@ export class ModularCrawler {
 
       logs.push("페이지 로드 완료");
       logs.push(`최종 URL: ${page.url()}`);
-
-      // ✅ 핵심: redirect된 최종 URL(page.url()) 기준으로 slug 재감지
-      // 원본이 /place/{id} 여도 최종은 /hairshop/{id}/home 같은 형태임
-      const categorySlug = this.detectCategorySlug(page.url());
-      logs.push(`categorySlug: ${categorySlug || "(unknown)"}`);
 
       // iframe 탐색
       logs.push("\n=== iframe 접근 ===");
@@ -191,17 +188,17 @@ export class ModularCrawler {
       menuCount = p.menuCount;
       menus = p.menus;
 
-      // 리뷰/사진 (+ 최근30일)
+      // 리뷰/사진 + 최근30일
       logs.push("\n=== 6단계: 리뷰/사진 ===");
       let reviewCount = nextFallback.reviewCount ?? 0;
       let photoCount = nextFallback.photoCount ?? 0;
+      let recentReviewCount30d: number | undefined = undefined;
 
-      // ✅ slug 전달 (이제 /hairshop/.../photo 로 들어가서 사진탭 파싱 성공 확률↑)
-      const r = await ReviewPhotoExtractor.extract(page, frame, placeId, categorySlug);
+      const r = await ReviewPhotoExtractor.extract(page, frame, placeId);
       logs.push(...r.logs);
       reviewCount = r.reviewCount || reviewCount;
       photoCount = r.photoCount || photoCount;
-      const recentReviewCount30d = r.recentReviewCount30d;
+      recentReviewCount30d = r.recentReviewCount30d ?? undefined;
 
       await context.close();
       logs.push("\n=== 크롤링 완료 ===");
@@ -233,11 +230,15 @@ export class ModularCrawler {
 
   private async tryGetEntryFrame(page: Page): Promise<Frame | null> {
     try {
-      const el = await page.waitForSelector("iframe#entryIframe", { timeout: 8000, state: "attached" }).catch(() => null);
+      const el = await page
+        .waitForSelector("iframe#entryIframe", { timeout: 8000, state: "attached" })
+        .catch(() => null);
+
       if (el) {
         const fr = await el.contentFrame();
         if (fr) return fr;
       }
+
       const frames = page.frames();
       const found = frames.find(f => (f.url() || "").includes("entry"));
       return found || null;
@@ -252,21 +253,6 @@ export class ModularCrawler {
       return u.pathname.replace(/\/+$/, "") === `/place/${placeId}`;
     } catch {
       return false;
-    }
-  }
-
-  private detectCategorySlug(url: string): string | undefined {
-    try {
-      const u = new URL(url);
-      const parts = u.pathname.split("/").filter(Boolean);
-      // 예: /hairshop/1443688242/home -> ["hairshop","144...","home"]
-      const first = parts[0];
-      if (!first) return undefined;
-      if (first === "place") return undefined;
-      if (!/^[a-z0-9_]+$/i.test(first)) return undefined;
-      return first;
-    } catch {
-      return undefined;
     }
   }
 
@@ -307,8 +293,80 @@ export class ModularCrawler {
     ];
     for (const p of patterns) {
       const m = html.match(p);
-      if (m?.[1]) return m[1].replace(/\\n/g, " ").replace(/\\"/g, '"').trim();
+      if (m?.[1]) {
+        return m[1].replace(/\\n/g, " ").replace(/\\"/g, '"').trim();
+      }
     }
     return null;
+  }
+
+  // ✅ 유료 전용: 경쟁사 상위 키워드만 가볍게 수집
+  async searchCompetitorsLite(
+    query: string,
+    count: number = 5
+  ): Promise<Array<{ name: string; keywords: string[]; placeUrl: string }>> {
+    if (!this.browser) await this.initialize();
+
+    const results: Array<{ name: string; keywords: string[]; placeUrl: string }> = [];
+
+    const context = await this.browser!.newContext({
+      userAgent:
+        "Mozilla/5.0 (Linux; Android 13; SM-G991N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+      viewport: { width: 390, height: 844 },
+      extraHTTPHeaders: { "accept-language": "ko-KR,ko;q=0.9" }
+    });
+
+    const page = await context.newPage();
+
+    try {
+      const searchUrl = `https://m.place.naver.com/search?query=${encodeURIComponent(query)}`;
+      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await page.waitForTimeout(2000);
+
+      const links = await page.$$(
+        `a[href*="/place/"], a[href*="/hairshop/"], a[href*="/restaurant/"], a[href*="/cafe/"]`
+      );
+
+      const seen = new Set<string>();
+
+      for (const a of links) {
+        if (results.length >= count) break;
+
+        const href = await a.getAttribute("href");
+        if (!href) continue;
+
+        const full = href.startsWith("http") ? href : `https://m.place.naver.com${href}`;
+        const normalized = full.replace(/\?.*$/, "");
+        if (seen.has(normalized)) continue;
+        seen.add(normalized);
+
+        try {
+          const crawled = await this.crawlPlace(normalized);
+          if (crawled.success && crawled.data) {
+            results.push({
+              name: crawled.data.name,
+              keywords: crawled.data.keywords || [],
+              placeUrl: normalized
+            });
+          }
+        } catch {}
+      }
+
+      try {
+        await page.close();
+      } catch {}
+      try {
+        await context.close();
+      } catch {}
+      return results;
+    } catch {
+      try {
+        await page.close();
+      } catch {}
+      try {
+        await context.close();
+      } catch {}
+      return results;
+    }
   }
 }
