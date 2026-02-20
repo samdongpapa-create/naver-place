@@ -1,192 +1,186 @@
 <!DOCTYPE html>
 <html lang="ko">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>네이버 플레이스 최적화 진단</title>
-    <link rel="stylesheet" href="styles.css">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>네이버 플레이스 최적화 진단</title>
+  <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-    <div class="container">
-        <!-- Header -->
-        <header class="header">
-            <div class="logo">
-                <svg width="50" height="50" viewBox="0 0 50 50" fill="none">
-                    <rect width="50" height="50" rx="10" fill="#03C75A"/>
-                    <path d="M15 35V15H22L28 28V15H35V35H28L22 22V35H15Z" fill="white"/>
-                </svg>
-                <div class="logo-text">
-                    <h1>플레이스 최적화 진단</h1>
-                    <p>네이버 플레이스 점수를 확인하세요</p>
-                </div>
-            </div>
-        </header>
-
-        <!-- Input Section -->
-        <section class="input-section" id="inputSection">
-            <div class="input-card">
-                <div class="input-title">
-                    <h2>플레이스 진단하기</h2>
-                    <p>네이버 플레이스 URL을 입력하면 무료로 진단해드립니다</p>
-                </div>
-                
-                <div class="search-box">
-                    <input 
-                        type="text" 
-                        id="placeUrl" 
-                        placeholder="네이버 플레이스 URL을 입력하세요"
-                        class="search-input"
-                    >
-                    <button onclick="diagnoseFree()" class="search-button">
-                        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-                            <path d="M19 19L13 13M15 8C15 11.866 11.866 15 8 15C4.13401 15 1 11.866 1 8C1 4.13401 4.13401 1 8 1C11.866 1 15 4.13401 15 8Z" stroke="white" stroke-width="2" stroke-linecap="round"/>
-                        </svg>
-                        진단하기
-                    </button>
-                </div>
-
-                <div class="url-examples">
-                    <span class="example-label">URL 예시:</span>
-                    <span class="example-url">https://m.place.naver.com/restaurant/1234567890</span>
-                </div>
-            </div>
-        </section>
-
-        <!-- Loading Section -->
-        <section class="loading-section" id="loadingSection" style="display: none;">
-            <div class="loading-spinner"></div>
-            <p class="loading-text">플레이스 정보를 분석하고 있습니다...</p>
-        </section>
-
-        <!-- Report Section -->
-        <section class="report-section" id="reportSection" style="display: none;">
-            <!-- Place Info Header -->
-            <div class="report-header">
-                <div class="place-info">
-                    <h2 id="placeName" class="place-name">-</h2>
-                    <p id="placeAddress" class="place-address">-</p>
-                </div>
-            </div>
-
-            <!-- Total Score -->
-            <div class="score-summary">
-                <div class="total-score">
-                    <div class="score-badge">
-                        <span class="score-number" id="totalScore">-</span>
-                        <span class="score-label">점</span>
-                    </div>
-                    <div class="grade-badge" id="totalGradeBadge">
-                        <span id="totalGrade">-</span>
-                    </div>
-                </div>
-                <p class="score-description">종합 점수</p>
-            </div>
-
-            <!-- Category Scores -->
-            <div class="scores-container">
-                <h3 class="section-title">항목별 점수</h3>
-                <div class="category-grid" id="categoryScores">
-                    <!-- JavaScript로 동적 생성 -->
-                </div>
-            </div>
-
-            <!-- Upgrade Section (무료 진단 후 표시) -->
-            <div class="upgrade-section" id="upgradeSection" style="display: none;">
-                <div class="upgrade-card">
-                    <div class="upgrade-header">
-                        <h3>🎯 전문가 컨설팅이 필요하신가요?</h3>
-                        <p>상세한 개선안과 경쟁사 분석을 확인하세요</p>
-                    </div>
-                    <div class="upgrade-benefits">
-                        <div class="benefit-item">
-                            <svg width="20" height="20" viewBox="0 0 20 20" fill="#03C75A">
-                                <path d="M7 10L9 12L13 8M19 10C19 14.9706 14.9706 19 10 19C5.02944 19 1 14.9706 1 10C1 5.02944 5.02944 1 10 1C14.9706 1 19 5.02944 19 10Z"/>
-                            </svg>
-                            <span>복사-붙여넣기 가능한 상세설명/오시는길 개선안</span>
-                        </div>
-                        <div class="benefit-item">
-                            <svg width="20" height="20" viewBox="0 0 20 20" fill="#03C75A">
-                                <path d="M7 10L9 12L13 8M19 10C19 14.9706 14.9706 19 10 19C5.02944 19 1 14.9706 1 10C1 5.02944 5.02944 1 10 1C14.9706 1 19 5.02944 19 10Z"/>
-                            </svg>
-                            <span>경쟁업체 Top 5 분석 및 키워드 비교</span>
-                        </div>
-                        <div class="benefit-item">
-                            <svg width="20" height="20" viewBox="0 0 20 20" fill="#03C75A">
-                                <path d="M7 10L9 12L13 8M19 10C19 14.9706 14.9706 19 10 19C5.02944 19 1 14.9706 1 10C1 5.02944 5.02944 1 10 1C14.9706 1 19 5.02944 19 10Z"/>
-                            </svg>
-                            <span>리뷰/사진 최적화 가이드</span>
-                        </div>
-                    </div>
-                    <button onclick="showPaidModal()" class="upgrade-button">
-                        유료 컨설팅 받기
-                        <span class="price">₩19,900</span>
-                    </button>
-                </div>
-            </div>
-
-            <!-- Improvements Section (유료 진단 후) -->
-            <div class="improvements-section" id="improvementsSection" style="display: none;">
-                <!-- JavaScript로 동적 생성 -->
-            </div>
-
-            <!-- Competitors Section (유료 진단 후) -->
-            <div class="competitors-section" id="competitorsSection" style="display: none;">
-                <!-- JavaScript로 동적 생성 -->
-            </div>
-
-            <!-- Action Buttons -->
-            <div class="action-buttons">
-                <button onclick="resetDiagnosis()" class="btn-reset">
-                    새 진단 시작
-                </button>
-            </div>
-
-            <!-- Debug Logs -->
-            <div class="debug-section" id="debugSection" style="display: none;">
-                <h3 class="debug-title">🔍 크롤링 로그</h3>
-                <div class="debug-logs" id="debugLogs">
-                    <!-- JavaScript로 동적 생성 -->
-                </div>
-            </div>
-        </section>
-
-        <!-- Error Section -->
-        <section class="error-section" id="errorSection" style="display: none;">
-            <div class="error-card">
-                <div class="error-icon">⚠️</div>
-                <h3>진단 중 오류가 발생했습니다</h3>
-                <p id="errorMessage" class="error-message">-</p>
-                <button onclick="resetDiagnosis()" class="btn-retry">
-                    다시 시도
-                </button>
-            </div>
-        </section>
-
-        <!-- Paid Modal -->
-        <div class="modal" id="paidModal" style="display: none;">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h3>유료 컨설팅</h3>
-                    <button onclick="closePaidModal()" class="modal-close">×</button>
-                </div>
-                <div class="modal-body">
-                    <p>경쟁사 분석을 위한 검색어를 입력하세요</p>
-                    <input 
-                        type="text" 
-                        id="searchQuery" 
-                        placeholder="예: 강남 카페, 이태원 맛집"
-                        class="modal-input"
-                    >
-                    <p class="modal-price">₩19,900</p>
-                </div>
-                <div class="modal-footer">
-                    <button onclick="closePaidModal()" class="btn-cancel">취소</button>
-                    <button onclick="diagnosePaid()" class="btn-confirm">결제하고 진단받기</button>
-                </div>
-            </div>
+  <div class="container">
+    <!-- Header -->
+    <header class="header">
+      <div class="logo">
+        <svg width="50" height="50" viewBox="0 0 50 50" fill="none">
+          <rect width="50" height="50" rx="10" fill="#03C75A"/>
+          <path d="M15 35V15H22L28 28V15H35V35H28L22 22V35H15Z" fill="white"/>
+        </svg>
+        <div class="logo-text">
+          <h1>플레이스 최적화 진단</h1>
+          <p>네이버 플레이스 점수를 확인하세요</p>
         </div>
-    </div>
+      </div>
+    </header>
 
-    <script src="script.js"></script>
+    <!-- Input Section -->
+    <section class="input-section" id="inputSection">
+      <div class="input-card">
+        <div class="input-title">
+          <h2>플레이스 진단하기</h2>
+          <p>네이버 플레이스 URL을 입력하면 무료로 진단해드립니다</p>
+        </div>
+
+        <div style="display:flex; gap:10px; align-items:center; margin-bottom:12px;">
+          <label style="font-size:14px; opacity:.8;">업종</label>
+          <select id="industrySelect" class="modal-input" style="max-width:220px;">
+            <option value="hairshop" selected>미용실</option>
+            <option value="cafe">카페</option>
+            <option value="restaurant">식당</option>
+          </select>
+        </div>
+
+        <div class="search-box">
+          <input
+            type="text"
+            id="placeUrl"
+            placeholder="네이버 플레이스 URL을 입력하세요"
+            class="search-input"
+          />
+          <button onclick="diagnoseFree()" class="search-button">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+              <path d="M19 19L13 13M15 8C15 11.866 11.866 15 8 15C4.13401 15 1 11.866 1 8C1 4.13401 4.13401 1 8 1C11.866 1 15 4.13401 15 8Z" stroke="white" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+            진단하기
+          </button>
+        </div>
+
+        <div class="url-examples">
+          <span class="example-label">URL 예시:</span>
+          <span class="example-url">https://m.place.naver.com/hairshop/1443688242/home</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Loading Section -->
+    <section class="loading-section" id="loadingSection" style="display:none;">
+      <div class="loading-spinner"></div>
+      <p class="loading-text">플레이스 정보를 분석하고 있습니다...</p>
+    </section>
+
+    <!-- Report Section -->
+    <section class="report-section" id="reportSection" style="display:none;">
+      <!-- Place Info Header -->
+      <div class="report-header">
+        <div class="place-info">
+          <h2 id="placeName" class="place-name">-</h2>
+          <p id="placeAddress" class="place-address">-</p>
+        </div>
+      </div>
+
+      <!-- Total Score -->
+      <div class="score-summary">
+        <div class="total-score">
+          <div class="score-badge">
+            <span class="score-number" id="totalScore">-</span>
+            <span class="score-label">점</span>
+          </div>
+          <div class="grade-badge" id="totalGradeBadge">
+            <span id="totalGrade">-</span>
+          </div>
+        </div>
+        <p class="score-description">종합 점수</p>
+      </div>
+
+      <!-- Category Scores -->
+      <div class="scores-container">
+        <h3 class="section-title">항목별 점수</h3>
+        <div class="category-grid" id="categoryScores"></div>
+      </div>
+
+      <!-- Upgrade Section (무료 진단 후 표시) -->
+      <div class="upgrade-section" id="upgradeSection" style="display:none;">
+        <div class="upgrade-card">
+          <div class="upgrade-header">
+            <h3>🎯 전문가 컨설팅이 필요하신가요?</h3>
+            <p>상세한 개선안과 경쟁사 분석을 확인하세요</p>
+          </div>
+          <div class="upgrade-benefits">
+            <div class="benefit-item">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="#03C75A">
+                <path d="M7 10L9 12L13 8M19 10C19 14.9706 14.9706 19 10 19C5.02944 19 1 14.9706 1 10C1 5.02944 5.02944 1 10 1C14.9706 1 19 5.02944 19 10Z"/>
+              </svg>
+              <span>복사-붙여넣기 가능한 상세 개선안(설명/오시는길/키워드/리뷰/사진/가격)</span>
+            </div>
+            <div class="benefit-item">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="#03C75A">
+                <path d="M7 10L9 12L13 8M19 10C19 14.9706 14.9706 19 10 19C5.02944 5.02944 1 10C1 5.02944 5.02944 1 10 1C14.9706 1 19 5.02944 19 10Z"/>
+              </svg>
+              <span>경쟁업체 Top 5 키워드 비교 + 추천 대표키워드 5개</span>
+            </div>
+            <div class="benefit-item">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="#03C75A">
+                <path d="M7 10L9 12L13 8M19 10C19 14.9706 14.9706 19 10 19C5.02944 19 1 14.9706 1 10C1 5.02944 5.02944 1 10 1C14.9706 1 19 5.02944 19 10Z"/>
+              </svg>
+              <span>컨설팅 후 재진단 시 90점 이상을 목표로 설계</span>
+            </div>
+          </div>
+          <button onclick="showPaidModal()" class="upgrade-button">
+            유료 컨설팅 받기
+            <span class="price">₩19,900</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Improvements Section (유료 진단 후) -->
+      <div class="improvements-section" id="improvementsSection" style="display:none;"></div>
+
+      <!-- Competitors Section (유료 진단 후) -->
+      <div class="competitors-section" id="competitorsSection" style="display:none;"></div>
+
+      <!-- Action Buttons -->
+      <div class="action-buttons">
+        <button onclick="resetDiagnosis()" class="btn-reset">새 진단 시작</button>
+      </div>
+
+      <!-- Debug Logs -->
+      <div class="debug-section" id="debugSection" style="display:none;">
+        <h3 class="debug-title">🔍 크롤링 로그</h3>
+        <div class="debug-logs" id="debugLogs"></div>
+      </div>
+    </section>
+
+    <!-- Error Section -->
+    <section class="error-section" id="errorSection" style="display:none;">
+      <div class="error-card">
+        <div class="error-icon">⚠️</div>
+        <h3>진단 중 오류가 발생했습니다</h3>
+        <p id="errorMessage" class="error-message">-</p>
+        <button onclick="resetDiagnosis()" class="btn-retry">다시 시도</button>
+      </div>
+    </section>
+
+    <!-- Paid Modal -->
+    <div class="modal" id="paidModal" style="display:none;">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>유료 컨설팅</h3>
+          <button onclick="closePaidModal()" class="modal-close">×</button>
+        </div>
+        <div class="modal-body">
+          <p style="margin:0 0 10px 0;">결제 후, 경쟁사 Top 5 분석 + 추천키워드 + 개선안을 제공합니다.</p>
+          <p class="modal-price">₩19,900</p>
+          <p style="font-size:12px; opacity:.7; margin-top:8px;">
+            * 현재는 결제 연동 전이므로 버튼 클릭 시 바로 유료 진단 API를 호출합니다.
+          </p>
+        </div>
+        <div class="modal-footer">
+          <button onclick="closePaidModal()" class="btn-cancel">취소</button>
+          <button onclick="diagnosePaid()" class="btn-confirm">진단받기</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="script.js"></script>
 </body>
 </html>
