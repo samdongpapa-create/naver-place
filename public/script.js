@@ -43,22 +43,8 @@ function setHtml(id, html) {
   el.innerHTML = html == null ? "" : String(html);
 }
 
-function renderTags(tags) {
-  const arr = asArray(tags).filter(Boolean);
-  if (!arr.length) return `<div class="muted">없음</div>`;
-  return `<div class="keyword-tags">${arr
-    .map((t) => `<span class="keyword-tag">${escapeHtml(t)}</span>`)
-    .join("")}</div>`;
-}
-
-function renderPre(text) {
-  const t = String(text ?? "").trim();
-  if (!t) return `<div class="muted">없음</div>`;
-  return `<pre style="white-space:pre-wrap; margin:0;">${escapeHtml(t)}</pre>`;
-}
-
 function normalizeServerResponse(serverJson) {
-  // expected: { success, data, logs, message }
+  // server: { success, data, logs, message }
   const ok = !!serverJson?.success;
   const message = serverJson?.message || "";
   const logs = Array.isArray(serverJson?.logs) ? serverJson.logs : [];
@@ -69,11 +55,12 @@ function normalizeServerResponse(serverJson) {
     name: placeData.name || "",
     address: placeData.address || "",
     keywords: asArray(placeData.keywords || []),
-    description: placeData.description || "",
-    directions: placeData.directions || "",
+    description: String(placeData.description || ""),
+    directions: String(placeData.directions || ""),
     reviewCount: toNumber(placeData.reviewCount ?? placeData.reviewsTotal, 0),
     photoCount: toNumber(placeData.photoCount, 0),
-    recent30d: toNumber(placeData.recentReviewCount30d ?? placeData.recent30d, 0)
+    recent30d: toNumber(placeData.recentReviewCount30d ?? placeData.recent30d, 0),
+    menuCount: toNumber(placeData.menuCount, 0)
   };
 
   const scoring = {
@@ -83,7 +70,7 @@ function normalizeServerResponse(serverJson) {
   };
 
   const paid = {
-    recommendedKeywords: asArray(data.recommendedKeywords || []),
+    recommendedKeywords: asArray(data.recommendedKeywords || []).slice(0, 5),
     competitors: Array.isArray(data.competitors) ? data.competitors : [],
     unifiedText: String(data.unifiedText || ""),
     improvements: data.improvements || null,
@@ -91,7 +78,7 @@ function normalizeServerResponse(serverJson) {
     attempts: toNumber(data.attempts, 0)
   };
 
-  return { ok, message, logs, place, scoring, paid };
+  return { ok, message, logs, place, scoring, paid, raw: serverJson };
 }
 
 async function postJson(url, payload) {
@@ -136,7 +123,6 @@ function clearReportSections() {
   setHtml("improvementsSection", "");
   setHtml("competitorsSection", "");
   setHtml("debugLogs", "");
-
   setDisplay("upgradeSection", false);
   setDisplay("improvementsSection", false);
   setDisplay("competitorsSection", false);
@@ -144,7 +130,8 @@ function clearReportSections() {
 }
 
 function gradeBadgeClass(grade) {
-  // CSS가 따로 있다면 여기를 맞춰도 됨. 없으면 기본
+  // styles.css가 이 클래스들을 안 갖고 있어도 UI가 깨지진 않게 하되,
+  // 있으면 적용되도록만.
   const g = String(grade || "").toUpperCase();
   if (g === "S") return "grade-s";
   if (g === "A") return "grade-a";
@@ -153,37 +140,71 @@ function gradeBadgeClass(grade) {
   return "grade-d";
 }
 
+/** ✅ styles.css 몰라도 카드/칩 형태가 유지되도록 inline 스타일로 보장 */
+function card(title, bodyHtml) {
+  return `
+    <div style="background:#fff; border:1px solid rgba(0,0,0,.06); border-radius:14px; padding:14px; margin:12px 0; box-shadow:0 4px 12px rgba(0,0,0,.04);">
+      <div style="font-weight:800; font-size:15px; margin-bottom:10px;">${escapeHtml(title)}</div>
+      <div>${bodyHtml}</div>
+    </div>
+  `;
+}
+
+function chips(items) {
+  const arr = asArray(items).filter(Boolean);
+  if (!arr.length) return `<div style="opacity:.7;">없음</div>`;
+  return `
+    <div style="display:flex; flex-wrap:wrap; gap:8px;">
+      ${arr
+        .map(
+          (t) => `
+        <span style="display:inline-flex; align-items:center; padding:6px 10px; border-radius:999px; background:rgba(3,199,90,.12); color:#048b40; font-weight:700; font-size:13px;">
+          ${escapeHtml(t)}
+        </span>
+      `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function pre(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return `<div style="opacity:.7;">없음</div>`;
+  return `<pre style="white-space:pre-wrap; margin:0; font-size:13px; line-height:1.55; background:rgba(0,0,0,.03); padding:12px; border-radius:12px;">${escapeHtml(
+    t
+  )}</pre>`;
+}
+
 function renderCategoryScores(scoresObj) {
   const scores = scoresObj && typeof scoresObj === "object" ? scoresObj : {};
   const entries = Object.entries(scores);
 
   if (!entries.length) {
-    return `<div class="muted">세부 점수 데이터가 없습니다.</div>`;
+    return `<div style="opacity:.7;">세부 점수 데이터가 없습니다.</div>`;
   }
 
-  // 점수 객체 구조가 어떻든 "label/value/priority"처럼 최대한 보여주기
+  // 기존 category-grid 안에 들어가므로, grid 레이아웃은 styles.css가 처리
+  // 만약 styles.css가 그리드를 안 잡아도 카드 형태는 inline으로 보장
   return entries
     .map(([key, val]) => {
       let score = 0;
-      let grade = "";
-      let comment = "";
+      let msg = "";
 
       if (typeof val === "number") {
         score = val;
       } else if (val && typeof val === "object") {
         score = toNumber(val.score ?? val.value ?? val.points ?? 0, 0);
-        grade = String(val.grade ?? "");
-        comment = String(val.message ?? val.comment ?? "");
+        msg = String(val.message ?? val.comment ?? "");
       }
 
       return `
-        <div class="category-card">
-          <div class="category-top">
-            <div class="category-name">${escapeHtml(key)}</div>
-            <div class="category-score">${escapeHtml(score)}</div>
+        <div style="background:#fff; border:1px solid rgba(0,0,0,.06); border-radius:14px; padding:12px; box-shadow:0 4px 12px rgba(0,0,0,.04);">
+          <div style="display:flex; justify-content:space-between; gap:10px; align-items:baseline;">
+            <div style="font-weight:800;">${escapeHtml(key)}</div>
+            <div style="font-weight:900; font-size:18px;">${escapeHtml(score)}</div>
           </div>
-          ${grade ? `<div class="category-grade">${escapeHtml(grade)}</div>` : ""}
-          ${comment ? `<div class="category-comment">${escapeHtml(comment)}</div>` : ""}
+          ${msg ? `<div style="margin-top:6px; font-size:12px; opacity:.75;">${escapeHtml(msg)}</div>` : ""}
         </div>
       `;
     })
@@ -192,124 +213,18 @@ function renderCategoryScores(scoresObj) {
 
 function renderDebugLogs(logs) {
   const arr = asArray(logs);
-  if (!arr.length) return `<div class="muted">로그 없음</div>`;
-  return arr.map((l) => `<div class="log-line">${escapeHtml(l)}</div>`).join("");
-}
-
-function renderPaidImprovementsUI(paid) {
-  const rec5 = asArray(paid.recommendedKeywords).slice(0, 5);
-
-  // ✅ 추가추천키워드/10개 섹션은 "아예" 없음 (요구사항 반영)
-  const parts = [];
-
-  parts.push(`
-    <div class="improvement-card">
-      <h3>✅ 추천 대표키워드 (5개)</h3>
-      ${renderTags(rec5)}
-    </div>
-  `);
-
-  if (paid.unifiedText && paid.unifiedText.trim()) {
-    parts.push(`
-      <div class="improvement-card">
-        <h3>📌 유료 컨설팅 통합본 (복사-붙여넣기)</h3>
-        <div class="copy-block">${renderPre(paid.unifiedText)}</div>
-      </div>
-    `);
-  }
-
-  // improvements 구조가 있으면 보여주기 (description/directions/keywords 등)
-  const imp = paid.improvements || null;
-  if (imp && typeof imp === "object") {
-    if (imp.description) {
-      parts.push(`
-        <div class="improvement-card">
-          <h3>상세설명 개선안</h3>
-          ${renderPre(imp.description)}
-        </div>
-      `);
-    }
-    if (imp.directions) {
-      parts.push(`
-        <div class="improvement-card">
-          <h3>오시는길 개선안</h3>
-          ${renderPre(imp.directions)}
-        </div>
-      `);
-    }
-    if (Array.isArray(imp.keywords) && imp.keywords.length) {
-      parts.push(`
-        <div class="improvement-card">
-          <h3>키워드(유료 결과)</h3>
-          ${renderTags(imp.keywords.slice(0, 5))}
-        </div>
-      `);
-    }
-    if (imp.competitorKeywordInsights) {
-      parts.push(`
-        <div class="improvement-card">
-          <h3>경쟁사 키워드 인사이트</h3>
-          ${renderPre(imp.competitorKeywordInsights)}
-        </div>
-      `);
-    }
-    if (imp.priceGuidance) {
-      parts.push(`
-        <div class="improvement-card">
-          <h3>가격/메뉴 가이드</h3>
-          ${renderPre(imp.priceGuidance)}
-        </div>
-      `);
-    }
-  }
-
-  return parts.join("\n");
-}
-
-function renderCompetitorsUI(competitors) {
-  const list = Array.isArray(competitors) ? competitors : [];
-  if (!list.length) {
-    return `
-      <div class="improvement-card">
-        <h3>경쟁사 Top 5</h3>
-        <div class="muted">경쟁사 데이터를 가져오지 못했습니다.</div>
-      </div>
-    `;
-  }
-
+  if (!arr.length) return `<div style="opacity:.7;">로그 없음</div>`;
   return `
-    <div class="improvement-card">
-      <h3>🏁 경쟁사 Top ${list.length}</h3>
-      <div class="competitor-list">
-        ${list
-          .map((c) => {
-            const name = c?.name ? String(c.name) : "경쟁사";
-            const address = c?.address ? String(c.address) : "";
-            const reviewCount = toNumber(c?.reviewCount, 0);
-            const photoCount = toNumber(c?.photoCount, 0);
-            const keywords = asArray(c?.keywords || []).slice(0, 5);
-
-            return `
-              <div class="competitor-card">
-                <div class="competitor-name">${escapeHtml(name)}</div>
-                ${address ? `<div class="competitor-address">${escapeHtml(address)}</div>` : ""}
-                <div class="competitor-meta">리뷰 ${escapeHtml(reviewCount)} · 사진 ${escapeHtml(photoCount)}</div>
-                <div class="competitor-keywords">${renderTags(keywords)}</div>
-              </div>
-            `;
-          })
-          .join("")}
-      </div>
+    <div style="font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:12px; line-height:1.6;">
+      ${arr.map((l) => `<div>${escapeHtml(l)}</div>`).join("")}
     </div>
   `;
 }
 
 function fillCommonReport(n) {
-  // place header
   setText("placeName", n.place.name || "-");
   setText("placeAddress", n.place.address || "-");
 
-  // total score
   setText("totalScore", n.scoring.totalScore || 0);
   setText("totalGrade", n.scoring.totalGrade || "-");
 
@@ -318,12 +233,62 @@ function fillCommonReport(n) {
     badge.className = "grade-badge " + gradeBadgeClass(n.scoring.totalGrade);
   }
 
-  // category scores
   setHtml("categoryScores", renderCategoryScores(n.scoring.scores));
 
-  // debug logs
   setHtml("debugLogs", renderDebugLogs(n.logs));
   setDisplay("debugSection", true);
+}
+
+function renderPaidSections(n) {
+  // ✅ improvementsSection에 "추천 대표키워드 5개 + 통합본 + 개선안 일부"만 넣음
+  const imp = n.paid.improvements || {};
+  const rec5 = n.paid.recommendedKeywords || [];
+  const blocks = [];
+
+  blocks.push(card("✅ 추천 대표키워드 (5개)", chips(rec5)));
+
+  // 개선안(있으면)
+  if (imp.description) blocks.push(card("상세설명 개선안", pre(imp.description)));
+  if (imp.directions) blocks.push(card("오시는길 개선안", pre(imp.directions)));
+
+  // 통합본(있으면)
+  if (n.paid.unifiedText && n.paid.unifiedText.trim()) {
+    blocks.push(card("📌 유료 컨설팅 통합본 (복사-붙여넣기)", pre(n.paid.unifiedText)));
+  }
+
+  setHtml("improvementsSection", blocks.join("\n"));
+  setDisplay("improvementsSection", true);
+
+  // ✅ competitorsSection
+  const comps = Array.isArray(n.paid.competitors) ? n.paid.competitors : [];
+  if (!comps.length) {
+    setHtml("competitorsSection", card("🏁 경쟁사 Top 5", `<div style="opacity:.7;">경쟁사 데이터를 가져오지 못했습니다.</div>`));
+    setDisplay("competitorsSection", true);
+    return;
+  }
+
+  const compHtml = comps
+    .slice(0, 5)
+    .map((c, idx) => {
+      const name = c?.name ? String(c.name) : `경쟁사 ${idx + 1}`;
+      const address = c?.address ? String(c.address) : "";
+      const reviewCount = toNumber(c?.reviewCount, 0);
+      const photoCount = toNumber(c?.photoCount, 0);
+      const kws = asArray(c?.keywords || []).slice(0, 5);
+
+      return card(
+        `경쟁사 ${idx + 1}: ${name}`,
+        `
+        ${address ? `<div style="opacity:.8; margin-bottom:8px;">${escapeHtml(address)}</div>` : ""}
+        <div style="opacity:.85; margin-bottom:10px;">리뷰 ${escapeHtml(reviewCount)} · 사진 ${escapeHtml(photoCount)}</div>
+        <div>${chips(kws)}</div>
+      `
+      );
+    })
+    .join("\n");
+
+  setHtml("competitorsSection", compHtml);
+  setDisplay("competitorsSection", true);
 }
 
 async function diagnose(mode) {
@@ -340,22 +305,11 @@ async function diagnose(mode) {
 
   try {
     if (mode === "paid") {
-      // ✅ 유료는 searchQuery가 필요
-      // UI에 입력칸이 없으니: 기본값으로 "역/지역 + 업종" 조합을 자동 생성
-      const placeText = placeUrl;
+      // ✅ UI에 검색어 입력칸이 없으니 기본값 자동 적용(필요시 나중에 입력칸 추가 가능)
       const defaultQuery =
-        industry === "hairshop"
-          ? "서대문역 미용실"
-          : industry === "cafe"
-          ? "서대문역 카페"
-          : "서대문역 맛집";
+        industry === "hairshop" ? "서대문역 미용실" : industry === "cafe" ? "서대문역 카페" : "서대문역 맛집";
 
-      const payload = {
-        placeUrl: placeText,
-        industry,
-        searchQuery: defaultQuery
-      };
-
+      const payload = { placeUrl, industry, searchQuery: defaultQuery };
       const { res, json } = await postJson("/api/diagnose/paid", payload);
 
       if (!res.ok || !json) {
@@ -364,11 +318,9 @@ async function diagnose(mode) {
       }
 
       const n = normalizeServerResponse(json);
-
       if (!n.ok) {
         showError(n.message || "유료 진단 실패");
-        // debug
-        setHtml("debugLogs", `<pre>${escapeHtml(JSON.stringify(json, null, 2))}</pre>`);
+        setHtml("debugLogs", pre(JSON.stringify(json, null, 2)));
         setDisplay("debugSection", true);
         return;
       }
@@ -376,14 +328,9 @@ async function diagnose(mode) {
       showReport();
       fillCommonReport(n);
 
-      // paid sections
-      setHtml("improvementsSection", renderPaidImprovementsUI(n.paid));
-      setDisplay("improvementsSection", true);
-
-      setHtml("competitorsSection", renderCompetitorsUI(n.paid.competitors));
-      setDisplay("competitorsSection", true);
-
+      // 유료 섹션 표시
       setDisplay("upgradeSection", false);
+      renderPaidSections(n);
 
       return;
     }
@@ -398,10 +345,9 @@ async function diagnose(mode) {
     }
 
     const n = normalizeServerResponse(json);
-
     if (!n.ok) {
       showError(n.message || "무료 진단 실패");
-      setHtml("debugLogs", `<pre>${escapeHtml(JSON.stringify(json, null, 2))}</pre>`);
+      setHtml("debugLogs", pre(JSON.stringify(json, null, 2)));
       setDisplay("debugSection", true);
       return;
     }
@@ -409,7 +355,7 @@ async function diagnose(mode) {
     showReport();
     fillCommonReport(n);
 
-    // ✅ 무료 진단 후 업셀 섹션 표시
+    // 무료 진단 후 업셀 섹션 표시
     setDisplay("upgradeSection", true);
     setDisplay("improvementsSection", false);
     setDisplay("competitorsSection", false);
@@ -420,26 +366,24 @@ async function diagnose(mode) {
   }
 }
 
-/* ====== index.html에서 직접 호출하는 함수들 ====== */
+/* ====== index.html onclick 함수들 ====== */
 window.diagnoseFree = function diagnoseFree() {
   return diagnose("free");
 };
 
 window.diagnosePaid = function diagnosePaid() {
-  // 모달 닫고 실행
   window.closePaidModal();
   return diagnose("paid");
 };
 
 window.resetDiagnosis = function resetDiagnosis() {
-  // 입력 화면으로 복귀
   setDisplay("reportSection", false);
   setDisplay("loadingSection", false);
   setDisplay("errorSection", false);
   setDisplay("inputSection", true);
 
-  // 결과 초기화
   clearReportSections();
+
   setText("placeName", "-");
   setText("placeAddress", "-");
   setText("totalScore", "-");
