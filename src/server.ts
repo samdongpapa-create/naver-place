@@ -6,7 +6,6 @@ import { convertToMobileUrl, isValidPlaceUrl } from "./utils/urlHelper";
 import { DiagnosisService } from "./services/diagnosis";
 import type { Industry } from "./lib/scoring/types";
 import { scorePlace } from "./lib/scoring/engine";
-import { generatePaidConsultingByGPT } from "./services/gptConsulting";
 import { generatePaidConsultingGuaranteed } from "./services/gptConsulting";
 
 const app = express();
