@@ -1,29 +1,13 @@
 export type Industry = "hairshop" | "cafe" | "restaurant";
-
 export type Grade = "S" | "A" | "B" | "C" | "D" | "F";
 
-export type ScoreResult100 = {
-  score: number; // 0~100
-  grade: Grade;
-  issues: string[];
-};
-
-export type CategoryScores100 = {
-  description: ScoreResult100;
-  directions: ScoreResult100;
-  keywords: ScoreResult100;
-  reviews: ScoreResult100;
-  photos: ScoreResult100;
-  price: ScoreResult100;
-};
-
-export type MenuItemLike = {
+export interface MenuItem {
   name: string;
-  price: string; // "24,000원" / "문의" / "별도" / "변동" 등
+  price: string; // "24,000원" / "문의" / "변동" 등
   desc?: string;
-};
+}
 
-export type PlaceScoringInput = {
+export interface PlaceScoringInput {
   industry: Industry;
 
   name?: string;
@@ -34,17 +18,40 @@ export type PlaceScoringInput = {
   keywords?: string[];
 
   reviewCount?: number;
-  recentReviewCount30d?: number; // 있으면 반영(없으면 중립)
-  blogReviewCount?: number;
+  recentReviewCount30d?: number;
 
   photoCount?: number;
 
   menuCount?: number;
-  menus?: MenuItemLike[];
-};
+  menus?: MenuItem[];
+}
 
-export type ScoringOutput = {
-  scores: CategoryScores100;
-  totalScore: number; // 0~100
+export interface ScoreResult100 {
+  score: number;
+  grade: Grade;
+  issues: string[];
+
+  /**
+   * ✅ 프론트에서 "개수 외 점수요소"를 보여주기 위한 세부점수
+   * 예: { count: 48, dedupe: 10, intent: 12, locality: 8, industryFit: 14, stopwordPenalty: -6 }
+   */
+  breakdown?: Record<string, number>;
+
+  /**
+   * (옵션) 디버깅/표시용 메타
+   */
+  meta?: Record<string, any>;
+}
+
+export interface ScoringOutput {
+  scores: {
+    description: ScoreResult100;
+    directions: ScoreResult100;
+    keywords: ScoreResult100;
+    reviews: ScoreResult100;
+    photos: ScoreResult100;
+    price: ScoreResult100;
+  };
+  totalScore: number;
   totalGrade: Grade;
-};
+}
