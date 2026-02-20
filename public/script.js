@@ -307,39 +307,51 @@ function displayCategoryScores(scores, fullData) {
     // ✅ (2) 대표키워드: "개수 외 점수요소"를 표시
     // - 서버가 breakdown/meta를 내려주면 그걸 그대로 보여주고,
     // - 없으면 프론트에서 "참고지표"로라도 보여준다.
-    if (cat.key === 'keywords') {
-      const kws = Array.isArray(fullData?.placeData?.keywords) ? fullData.placeData.keywords : [];
-      const unique = Array.from(new Set(kws.map(k => String(k).trim()).filter(Boolean)));
 
-      const countLine = `키워드 개수: ${kws.length}/5`;
-      const uniqueLine = `중복 제거 기준: ${unique.length}/5 (중복 키워드 ${kws.length - unique.length}개)`;
+     if (cat.key === 'keywords') {
+  const kws = Array.isArray(fullData?.placeData?.keywords) ? fullData.placeData.keywords : [];
+  const unique = Array.from(new Set(kws.map(k => String(k).trim()).filter(Boolean)));
 
-      // 서버가 세부 점수 breakdown을 내려주는 경우(미래 대비)
-      const breakdown = safeScore.breakdown || safeScore.meta || null;
+  const countLine = `키워드 개수: ${kws.length}/5`;
+  const uniqueLine = `중복 제거 기준: ${unique.length}/5 (중복 ${kws.length - unique.length}개)`;
 
-      // 이미 같은 문구가 있으면 중복 방지
-      if (!issues.some(x => String(x).includes('키워드 개수:'))) issues.unshift(countLine);
-      if (!issues.some(x => String(x).includes('중복 제거 기준:'))) issues.unshift(uniqueLine);
+  const placeName = fullData?.placeData?.name || '';
+  const address = fullData?.placeData?.address || '';
 
-      // "개수 외 점수요소" 안내 (서버 breakdown이 없을 때)
-      if (!breakdown) {
-        const extra = [
-          '점수 반영 요소(추가):',
-          '- 중복/유사 키워드 여부',
-          '- 업종/지역 적합도(예: 서대문역 미용실, 광화문 미용실 등)',
-          '- 고객 검색 의도 포함 여부(추천/후기/가격/예약 등)',
-          '- 경쟁사 상위 노출 키워드 커버 여부'
-        ].join('\n');
+  // 🔹 지역 추출
+  const regionMatch = placeName.match(/([가-힣]{2,8})역/);
+  const region = regionMatch ? `${regionMatch[1]}역` : '';
 
-        // 카드 issue는 한 줄 리스트라서, 줄바꿈 대신 bullet 느낌으로 쪼개서 넣자
-        if (!issues.some(x => String(x).includes('점수 반영 요소(추가)'))) {
-          issues.push('점수 반영 요소(추가): 중복/유사, 업종/지역 적합도, 검색의도, 경쟁사 커버');
-        }
-      } else {
-        // breakdown이 객체면 보기 좋게 펼침
-        issues.push(`[세부 점수] ${formatBreakdown(breakdown)}`);
-      }
-    }
+  const industryToken =
+    currentIndustry === 'hairshop' ? '미용실' :
+    currentIndustry === 'cafe' ? '카페' :
+    '맛집';
+
+  let regionIncluded = 0;
+  let industryIncluded = 0;
+  let comboIncluded = 0;
+
+  unique.forEach(k => {
+    if (region && k.includes(region)) regionIncluded++;
+    if (k.includes(industryToken)) industryIncluded++;
+    if (region && k.includes(region) && k.includes(industryToken)) comboIncluded++;
+  });
+
+  const regionLine = `지역 포함 키워드: ${regionIncluded}개`;
+  const industryLine = `업종 포함 키워드: ${industryIncluded}개`;
+  const comboLine = `지역+업종 조합 키워드: ${comboIncluded}개`;
+
+  if (!issues.some(x => x.includes('키워드 개수'))) issues.unshift(countLine);
+  if (!issues.some(x => x.includes('중복 제거 기준'))) issues.unshift(uniqueLine);
+
+  issues.push(regionLine);
+  issues.push(industryLine);
+  issues.push(comboLine);
+
+  if (comboIncluded === 0) {
+    issues.push('⚠️ "지역+업종" 조합 키워드가 없습니다. (예: 서대문역미용실)');
+  }
+}
 
     // ✅ (3) 리뷰: "목표 800" 같은 문구는 여기서 절대 추가하지 않음
     // (현재 프론트는 목표 문구를 만들고 있지 않으니, 서버 issues에만 있으면 서버에서 제거 필요)
