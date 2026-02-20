@@ -20,23 +20,32 @@ function extractPlaceIdsFromHtml(html: string): string[] {
 
   // "placeId":"1234567"
   {
-    const re = /"placeId"\s*:\s*"(\d{5,12})"/g;
+    const re = /"placeId"\s*:\s*"(?<id>\d{5,12})"/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(html))) ids.push(m[1]);
+    while ((m = re.exec(html))) {
+      const id = (m.groups as any)?.id || m[1];
+      if (id) ids.push(String(id));
+    }
   }
 
   // /place/1234567
   {
-    const re = /\/place\/(\d{5,12})/g;
+    const re = /\/place\/(?<id>\d{5,12})/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(html))) ids.push(m[1]);
+    while ((m = re.exec(html))) {
+      const id = (m.groups as any)?.id || m[1];
+      if (id) ids.push(String(id));
+    }
   }
 
   // /hairshop/1234567/home etc
   {
-    const re = /\/(restaurant|cafe|hairshop)\/(\d{5,12})\//g;
+    const re = /\/(restaurant|cafe|hairshop)\/(?<id>\d{5,12})\//g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(html))) ids.push(m[2]);
+    while ((m = re.exec(html))) {
+      const id = (m.groups as any)?.id || m[2];
+      if (id) ids.push(String(id));
+    }
   }
 
   return uniq(ids);
@@ -68,7 +77,6 @@ export class CompetitorService {
   }
 
   private async fetchHtml(url: string): Promise<string> {
-    // node18+ 에서는 fetch 기본 제공
     const res = await fetch(url, {
       headers: {
         "user-agent":
@@ -83,10 +91,15 @@ export class CompetitorService {
    * 네이버 플레이스 검색 결과에서 상위 placeId들을 뽑는다.
    * - 중복 제거
    * - 내 placeId 제외
-   * ✅ 개선: Playwright 실패(브라우저 미설치/권한) 시 fetch 기반 HTML regex fallback
+   *
+   * ✅ 개선:
+   * - Playwright가 실패하거나 DOM에서 ids가 0개면 fetch+regex fallback
+   * - 디버그 로그 출력(원인 즉시 파악)
    */
   async findTopPlaceIds(searchQuery: string, excludePlaceId: string, limit = 5): Promise<string[]> {
-    // 1) 우선 Playwright 시도
+    console.log("[COMP] searchQuery:", searchQuery);
+
+    // 1) Playwright 우선 시도
     try {
       await this.ensureBrowser();
       const page = await this.browser!.newPage();
@@ -133,22 +146,28 @@ export class CompetitorService {
           if (ids.length >= limit) break;
         }
 
-        return ids.slice(0, limit);
+        console.log("[COMP] extracted placeIds(playwright):", ids.length, ids.slice(0, 10));
+
+        if (ids.length) return ids.slice(0, limit);
       } finally {
         await page.close().catch(() => {});
       }
-    } catch {
-      // ignore and fallback below
+    } catch (e: any) {
+      console.log("[COMP] playwright failed -> fallback fetch. reason=", e?.message || String(e));
     }
 
     // 2) fallback: fetch + regex
     try {
       const url = `https://m.place.naver.com/search?query=${encodeURIComponent(searchQuery)}`;
       const html = await this.fetchHtml(url);
+      console.log("[COMP] fallback fetch html len:", html.length);
+
       const all = extractPlaceIdsFromHtml(html);
-      const filtered = all.filter((id) => id !== excludePlaceId).slice(0, limit);
-      return filtered;
-    } catch {
+      console.log("[COMP] fallback extracted ids:", all.length, all.slice(0, 10));
+
+      return all.filter((id) => id !== excludePlaceId).slice(0, limit);
+    } catch (e: any) {
+      console.log("[COMP] fallback fetch failed:", e?.message || String(e));
       return [];
     }
   }
@@ -158,6 +177,8 @@ export class CompetitorService {
    */
   async crawlCompetitorsByIds(placeIds: string[], industry: Industry, limit = 5): Promise<CompetitorSummary[]> {
     const out: CompetitorSummary[] = [];
+
+    console.log("[COMP] crawlCompetitorsByIds count:", placeIds.length);
 
     for (const id of placeIds.slice(0, limit)) {
       try {
