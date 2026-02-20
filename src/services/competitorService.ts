@@ -1,203 +1,209 @@
-import { chromium, Browser } from "playwright";
-import { UrlConverter } from "./modules/urlConverter";
 import { ModularCrawler } from "./modularCrawler";
 import type { Industry } from "../lib/scoring/types";
 
-export type CompetitorSummary = {
-  name: string;
-  address: string;
-  keywords: string[];
-  reviewCount: number;
-  photoCount: number;
+type Competitor = {
+  placeId: string;
+  name?: string;
+  address?: string;
+  keywords?: string[];
+  reviewCount?: number;
+  photoCount?: number;
+  url?: string;
 };
 
-function uniq(arr: string[]) {
+function uniq<T>(arr: T[]) {
   return Array.from(new Set(arr));
 }
 
-function extractPlaceIdsFromHtml(html: string): string[] {
+function pickPlaceIdsFromText(text: string): string[] {
   const ids: string[] = [];
+  if (!text) return ids;
 
-  // "placeId":"1234567"
-  {
-    const re = /"placeId"\s*:\s*"(?<id>\d{5,12})"/g;
+  // 다양한 패턴을 최대한 포괄
+  const patterns = [
+    /\/place\/(\d{5,12})/g,
+    /"placeId"\s*:\s*"(\d{5,12})"/g,
+    /"id"\s*:\s*"(\d{5,12})"/g,
+    /\bplaceId=(\d{5,12})\b/g
+  ];
+
+  for (const re of patterns) {
     let m: RegExpExecArray | null;
-    while ((m = re.exec(html))) {
-      const id = (m.groups as any)?.id || m[1];
-      if (id) ids.push(String(id));
+    while ((m = re.exec(text)) !== null) {
+      if (m[1]) ids.push(m[1]);
     }
   }
+  return ids;
+}
 
-  // /place/1234567
-  {
-    const re = /\/place\/(?<id>\d{5,12})/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(html))) {
-      const id = (m.groups as any)?.id || m[1];
-      if (id) ids.push(String(id));
+async function fetchText(url: string, extraHeaders?: Record<string, string>) {
+  const res = await fetch(url, {
+    method: "GET",
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+      "accept-language": "ko-KR,ko;q=0.9,en;q=0.7",
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      ...extraHeaders
     }
-  }
+  });
 
-  // /hairshop/1234567/home etc
-  {
-    const re = /\/(restaurant|cafe|hairshop)\/(?<id>\d{5,12})\//g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(html))) {
-      const id = (m.groups as any)?.id || m[2];
-      if (id) ids.push(String(id));
+  const text = await res.text();
+  return { ok: res.ok, status: res.status, text, finalUrl: res.url };
+}
+
+async function fetchJson(url: string, extraHeaders?: Record<string, string>) {
+  const res = await fetch(url, {
+    method: "GET",
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+      "accept-language": "ko-KR,ko;q=0.9,en;q=0.7",
+      accept: "application/json,text/plain,*/*",
+      ...extraHeaders
     }
-  }
+  });
 
-  return uniq(ids);
+  const text = await res.text();
+  let json: any = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = null;
+  }
+  return { ok: res.ok, status: res.status, json, text, finalUrl: res.url };
+}
+
+function buildCompetitorUrl(industry: Industry, placeId: string) {
+  // slug 없어도 /place/{id}/home로 들어가면 리다이렉트 됨
+  // 하지만 crawler가 slug 있는 URL도 잘 처리하니 place/home로 통일
+  return `https://m.place.naver.com/place/${placeId}/home`;
 }
 
 export class CompetitorService {
-  private browser: Browser | null = null;
+  private crawler: ModularCrawler;
 
-  private async ensureBrowser() {
-    if (this.browser) return;
-    this.browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--no-zygote",
-        "--single-process"
-      ]
-    });
+  constructor() {
+    this.crawler = new ModularCrawler();
   }
 
   async close() {
+    // ModularCrawler가 내부 브라우저를 들고 있을 수 있으니 close가 있으면 호출
     try {
-      await this.browser?.close();
+      const anyCrawler = this.crawler as any;
+      if (typeof anyCrawler.close === "function") await anyCrawler.close();
     } catch {}
-    this.browser = null;
-  }
-
-  private async fetchHtml(url: string): Promise<string> {
-    const res = await fetch(url, {
-      headers: {
-        "user-agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "accept-language": "ko-KR,ko;q=0.9,en;q=0.8"
-      }
-    });
-    return await res.text();
   }
 
   /**
-   * 네이버 플레이스 검색 결과에서 상위 placeId들을 뽑는다.
-   * - 중복 제거
-   * - 내 placeId 제외
-   *
-   * ✅ 개선:
-   * - Playwright가 실패하거나 DOM에서 ids가 0개면 fetch+regex fallback
-   * - 디버그 로그 출력(원인 즉시 파악)
+   * 검색어로 경쟁사 placeId TopN 뽑기
+   * - excludePlaceId: 내 플레이스 제외
    */
-  async findTopPlaceIds(searchQuery: string, excludePlaceId: string, limit = 5): Promise<string[]> {
-    console.log("[COMP] searchQuery:", searchQuery);
+  async findTopPlaceIds(query: string, excludePlaceId: string, limit = 5): Promise<string[]> {
+    const q = (query || "").trim();
+    if (!q) return [];
 
-    // 1) Playwright 우선 시도
+    const encoded = encodeURIComponent(q);
+
+    // 1) m.map.naver.com 검색 HTML (상대적으로 placeId 링크가 잘 나옴)
+    const url1 = `https://m.map.naver.com/search2/search.naver?query=${encoded}`;
+    console.log("[COMP][findTopPlaceIds] try #1:", url1);
+
     try {
-      await this.ensureBrowser();
-      const page = await this.browser!.newPage();
+      const r1 = await fetchText(url1);
+      console.log("[COMP][#1] status:", r1.status, "final:", r1.finalUrl, "len:", r1.text?.length || 0);
 
+      let ids = pickPlaceIdsFromText(r1.text);
+      ids = uniq(ids).filter((id) => id !== excludePlaceId);
+      if (ids.length) {
+        console.log("[COMP][#1] ids:", ids.slice(0, limit));
+        return ids.slice(0, limit);
+      }
+    } catch (e: any) {
+      console.log("[COMP][#1] error:", e?.message || String(e));
+    }
+
+    // 2) m.place.naver.com 검색 HTML
+    const url2 = `https://m.place.naver.com/search?query=${encoded}`;
+    console.log("[COMP][findTopPlaceIds] try #2:", url2);
+
+    try {
+      const r2 = await fetchText(url2);
+      console.log("[COMP][#2] status:", r2.status, "final:", r2.finalUrl, "len:", r2.text?.length || 0);
+
+      let ids = pickPlaceIdsFromText(r2.text);
+      ids = uniq(ids).filter((id) => id !== excludePlaceId);
+      if (ids.length) {
+        console.log("[COMP][#2] ids:", ids.slice(0, limit));
+        return ids.slice(0, limit);
+      }
+    } catch (e: any) {
+      console.log("[COMP][#2] error:", e?.message || String(e));
+    }
+
+    // 3) map.naver.com p/api 검색 JSON (최후 fallback)
+    // - 구조가 바뀔 수 있어서 best-effort로만 시도
+    const url3 = `https://map.naver.com/p/api/search/allSearch?query=${encoded}&type=all&searchCoord=&boundary=&displayCount=${Math.max(
+      limit * 2,
+      10
+    )}`;
+    console.log("[COMP][findTopPlaceIds] try #3 (json):", url3);
+
+    try {
+      const r3 = await fetchJson(url3, {
+        referer: "https://map.naver.com/",
+        "x-requested-with": "XMLHttpRequest"
+      });
+      console.log("[COMP][#3] status:", r3.status, "final:", r3.finalUrl);
+
+      // json에서 placeId(혹은 id)를 최대한 파싱
+      const rawText = r3.json ? JSON.stringify(r3.json) : r3.text;
+      let ids = pickPlaceIdsFromText(rawText || "");
+      ids = uniq(ids).filter((id) => id !== excludePlaceId);
+      if (ids.length) {
+        console.log("[COMP][#3] ids:", ids.slice(0, limit));
+        return ids.slice(0, limit);
+      }
+    } catch (e: any) {
+      console.log("[COMP][#3] error:", e?.message || String(e));
+    }
+
+    console.log("[COMP][findTopPlaceIds] no ids found for query:", q);
+    return [];
+  }
+
+  /**
+   * placeId 배열로 경쟁사 데이터 크롤링
+   */
+  async crawlCompetitorsByIds(placeIds: string[], industry: Industry, limit = 5): Promise<Competitor[]> {
+    const ids = (placeIds || []).filter(Boolean).slice(0, limit);
+    if (!ids.length) return [];
+
+    const out: Competitor[] = [];
+    for (const id of ids) {
       try {
-        const url = `https://m.place.naver.com/search?query=${encodeURIComponent(searchQuery)}`;
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await page.waitForTimeout(2000);
+        const url = buildCompetitorUrl(industry, id);
+        console.log("[COMP][crawl] start:", id, url);
 
-        const hrefs: string[] = await page.$$eval("a[href]", (els: any[]) => {
-          return els
-            .map((el: any) => {
-              try {
-                const v = typeof el?.getAttribute === "function" ? el.getAttribute("href") : "";
-                if (v) return String(v);
-              } catch {}
-              const href = el?.href;
-              return href ? String(href) : "";
-            })
-            .filter(Boolean);
-        });
-
-        const ids: string[] = [];
-        const seen = new Set<string>();
-
-        for (const h of hrefs) {
-          let m = h.match(/\/place\/(\d+)/);
-
-          if (!m) {
-            m = h.match(/\/(restaurant|cafe|hairshop)\/(\d+)\//);
-            const id = m?.[2];
-            if (id && id !== excludePlaceId && !seen.has(id)) {
-              seen.add(id);
-              ids.push(id);
-            }
-          } else {
-            const id = m?.[1];
-            if (id && id !== excludePlaceId && !seen.has(id)) {
-              seen.add(id);
-              ids.push(id);
-            }
-          }
-
-          if (ids.length >= limit) break;
+        const r = await this.crawler.crawlPlace(url);
+        if (!r?.success || !r?.data) {
+          console.log("[COMP][crawl] fail:", id, r?.error || "no data");
+          continue;
         }
 
-        console.log("[COMP] extracted placeIds(playwright):", ids.length, ids.slice(0, 10));
-
-        if (ids.length) return ids.slice(0, limit);
-      } finally {
-        await page.close().catch(() => {});
-      }
-    } catch (e: any) {
-      console.log("[COMP] playwright failed -> fallback fetch. reason=", e?.message || String(e));
-    }
-
-    // 2) fallback: fetch + regex
-    try {
-      const url = `https://m.place.naver.com/search?query=${encodeURIComponent(searchQuery)}`;
-      const html = await this.fetchHtml(url);
-      console.log("[COMP] fallback fetch html len:", html.length);
-
-      const all = extractPlaceIdsFromHtml(html);
-      console.log("[COMP] fallback extracted ids:", all.length, all.slice(0, 10));
-
-      return all.filter((id) => id !== excludePlaceId).slice(0, limit);
-    } catch (e: any) {
-      console.log("[COMP] fallback fetch failed:", e?.message || String(e));
-      return [];
-    }
-  }
-
-  /**
-   * placeId 리스트를 실제 크롤링해서 competitors 데이터로 만든다.
-   */
-  async crawlCompetitorsByIds(placeIds: string[], industry: Industry, limit = 5): Promise<CompetitorSummary[]> {
-    const out: CompetitorSummary[] = [];
-
-    console.log("[COMP] crawlCompetitorsByIds count:", placeIds.length);
-
-    for (const id of placeIds.slice(0, limit)) {
-      try {
-        const url = `https://m.place.naver.com/place/${id}`;
-        void industry;
-
-        const crawler = new ModularCrawler();
-        const r = await crawler.crawlPlace(UrlConverter.convertToMobileUrl(url));
-        if (!r.success || !r.data) continue;
-
         out.push({
-          name: r.data.name || "업체명 없음",
-          address: r.data.address || "",
-          keywords: Array.isArray(r.data.keywords) ? r.data.keywords.slice(0, 5) : [],
-          reviewCount: r.data.reviewCount || 0,
-          photoCount: r.data.photoCount || 0
+          placeId: id,
+          url,
+          name: r.data.name,
+          address: r.data.address,
+          keywords: Array.isArray(r.data.keywords) ? r.data.keywords : [],
+          reviewCount: Number(r.data.reviewCount || 0),
+          photoCount: Number(r.data.photoCount || 0)
         });
-      } catch {
-        continue;
+
+        console.log("[COMP][crawl] ok:", id, r.data?.name || "");
+      } catch (e: any) {
+        console.log("[COMP][crawl] error:", id, e?.message || String(e));
       }
     }
 
