@@ -774,3 +774,16 @@ body {
     font-weight: 600;
 }
 
+.modal { z-index: 9998 !important; }
+.modal .modal-content { z-index: 9999 !important; position: relative; }
+
+.modal .modal-input,
+#searchQuery {
+  display: block !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  height: auto !important;
+  pointer-events: auto !important;
+  width: 100%;
+  box-sizing: border-box;
+}
