@@ -126,7 +126,7 @@ function safeStr(v: any) {
 
 function buildUnifiedText(
   name: string,
-  out: UnifiedPaidImprovements,
+  out: any,
   recommendedKeywords: string[],
   predictedScore: number,
   predictedGrade: string
@@ -134,40 +134,63 @@ function buildUnifiedText(
   const lines: string[] = [];
   lines.push(`✅ 유료 컨설팅 결과 (예상 점수: ${predictedScore}점 / ${predictedGrade})`);
   lines.push("");
+
+  // 1) 상세설명
   lines.push("1) 상세설명 (복사해서 붙여넣기)");
-  lines.push(out.description);
+  lines.push(out.description || "(생성 실패)");
   lines.push("");
+
+  // 2) 오시는길
   lines.push("2) 오시는길 (복사해서 붙여넣기)");
-  lines.push(out.directions);
+  lines.push(out.directions || "(생성 실패)");
   lines.push("");
+
+  // 3) 대표키워드 5개
   lines.push("3) 대표키워드 5개");
-  lines.push(out.keywords.map(k => `- ${k}`).join("\n"));
+  const kws = Array.isArray(out.keywords) ? out.keywords : [];
+  lines.push(kws.length ? kws.map((k: string) => `- ${k}`).join("\n") : "- (생성 실패)");
   lines.push("");
+
+  // 4) 리뷰 요청 문구(고객용)
   lines.push("4) 리뷰 요청 문구 (고객용 3종)");
-  lines.push(`- 짧게: ${out.reviewRequestScripts.short}`);
-  lines.push(`- 친근: ${out.reviewRequestScripts.friendly}`);
-  lines.push(`- 정중: ${out.reviewRequestScripts.polite}`);
+  const rr = out.reviewRequestScripts || {};
+  lines.push(`- 짧게: ${rr.short || "(없음)"}`);
+  lines.push(`- 친근: ${rr.friendly || "(없음)"}`);
+  lines.push(`- 정중: ${rr.polite || "(없음)"}`);
   lines.push("");
+
+  // 5) 리뷰 답글 템플릿(매장용)
   lines.push("5) 리뷰 답글 템플릿 (매장용 5종)");
-  lines.push(`- 만족: ${out.ownerReplyTemplates.satisfied}`);
-  lines.push(`- 사진 유도: ${out.ownerReplyTemplates.photoEncourage}`);
-  lines.push(`- 재방문/단골: ${out.ownerReplyTemplates.repeatCustomer}`);
-  lines.push(`- 불만/클레임: ${out.ownerReplyTemplates.complaint}`);
-  lines.push(`- 지각/노쇼: ${out.ownerReplyTemplates.noShowOrDelay}`);
+  const rt = out.ownerReplyTemplates || {};
+  lines.push(`- 만족: ${rt.satisfied || "(없음)"}`);
+  lines.push(`- 사진 유도: ${rt.photoEncourage || "(없음)"}`);
+  lines.push(`- 재방문/단골: ${rt.repeatCustomer || "(없음)"}`);
+  lines.push(`- 불만/클레임: ${rt.complaint || "(없음)"}`);
+  lines.push(`- 지각/노쇼: ${rt.noShowOrDelay || "(없음)"}`);
   lines.push("");
+
+  // 6) 사진 체크리스트 + 가격/메뉴
   lines.push("6) 사진 업로드 체크리스트");
-  lines.push(out.photoChecklist.map(x => `- ${x}`).join("\n"));
+  const pc = Array.isArray(out.photoChecklist) ? out.photoChecklist : [];
+  lines.push(pc.length ? pc.map((x: string) => `- ${x}`).join("\n") : "- (없음)");
   lines.push("");
-  lines.push("7) 경쟁사 키워드 인사이트");
-  lines.push(out.competitorKeywordInsights);
+
+  lines.push("7) 가격/메뉴 개선 가이드");
+  lines.push(out.priceGuidance || "(없음)");
   lines.push("");
-  lines.push("8) 추천 키워드 (추가로 블로그/소식/설명에 활용)");
-  lines.push(ensureCount(recommendedKeywords, 10).map(k => `- ${k}`).join("\n"));
+
+  lines.push("8) 경쟁사 키워드 인사이트");
+  lines.push(out.competitorKeywordInsights || "(없음)");
   lines.push("");
+
+  lines.push("9) 추천 키워드 10개 (추가 활용)");
+  const rec10 = Array.isArray(recommendedKeywords) ? recommendedKeywords.slice(0, 10) : [];
+  lines.push(rec10.length ? rec10.map(k => `- ${k}`).join("\n") : "- (없음)");
+  lines.push("");
+
   lines.push(`(매장명: ${name})`);
   return lines.join("\n");
 }
-
 async function callGptJSON(prompt: string): Promise<any> {
   const res = await client.chat.completions.create({
     model: "gpt-4.1-mini",
