@@ -50,10 +50,23 @@ export class CompetitorService {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
       await page.waitForTimeout(2000);
 
-      // href에서 placeId 추출
-      const hrefs = await page.$$eval("a[href]", as =>
-        as.map(a => (a as HTMLAnchorElement).getAttribute("href") || "").filter(Boolean)
-      );
+      // ✅ DOM 타입(HTMLAnchorElement) 사용 금지: Node TS에서 lib dom 없어서 빌드 에러남
+      // ✅ 대신 any로 안전하게 href 읽기
+      const hrefs: string[] = await page.$$eval("a[href]", (els: any[]) => {
+        return els
+          .map((el: any) => {
+            // getAttribute가 있으면 그걸 우선
+            try {
+              const v = typeof el?.getAttribute === "function" ? el.getAttribute("href") : "";
+              if (v) return String(v);
+            } catch {}
+
+            // fallback: 속성 접근
+            const href = el?.href;
+            return href ? String(href) : "";
+          })
+          .filter(Boolean);
+      });
 
       const ids: string[] = [];
       const seen = new Set<string>();
@@ -61,19 +74,18 @@ export class CompetitorService {
       for (const h of hrefs) {
         // /place/1234567
         let m = h.match(/\/place\/(\d+)/);
+
         if (!m) {
           // /hairshop/1234567/home 같은 패턴
           m = h.match(/\/(restaurant|cafe|hairshop)\/(\d+)\//);
-          if (m?.[2]) {
-            const id = m[2];
-            if (id !== excludePlaceId && !seen.has(id)) {
-              seen.add(id);
-              ids.push(id);
-            }
+          const id = m?.[2];
+          if (id && id !== excludePlaceId && !seen.has(id)) {
+            seen.add(id);
+            ids.push(id);
           }
-        } else if (m?.[1]) {
-          const id = m[1];
-          if (id !== excludePlaceId && !seen.has(id)) {
+        } else {
+          const id = m?.[1];
+          if (id && id !== excludePlaceId && !seen.has(id)) {
             seen.add(id);
             ids.push(id);
           }
@@ -93,10 +105,15 @@ export class CompetitorService {
    */
   async crawlCompetitorsByIds(placeIds: string[], industry: Industry, limit = 5): Promise<CompetitorSummary[]> {
     const out: CompetitorSummary[] = [];
+
     for (const id of placeIds.slice(0, limit)) {
       try {
         // 모바일 표준 URL로
         const url = `https://m.place.naver.com/place/${id}`;
+
+        // ✅ industry를 당장 쓰지 않더라도 시그니처 유지(추후 업종별 로직 확장 대비)
+        void industry;
+
         const crawler = new ModularCrawler();
         const r = await crawler.crawlPlace(UrlConverter.convertToMobileUrl(url));
         if (!r.success || !r.data) continue;
@@ -112,6 +129,7 @@ export class CompetitorService {
         continue;
       }
     }
+
     return out;
   }
 }
