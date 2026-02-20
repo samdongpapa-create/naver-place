@@ -13,7 +13,6 @@ let currentIndustry = 'hairshop';
 function convertToMobileUrl(url) {
   try {
     if (!url) return '';
-
     const urlObj = new URL(url);
 
     // 이미 모바일 URL인 경우
@@ -123,7 +122,6 @@ async function diagnoseFree() {
     }
 
     displayReport(result.data, false);
-
     if (result.logs) displayLogs(result.logs);
   } catch (error) {
     console.error('Error:', error);
@@ -132,13 +130,13 @@ async function diagnoseFree() {
 }
 
 /* ---------------------------
-   유료 모달
+   유료 모달 (입력창 강제 표시 + 필수)
 ---------------------------- */
 function showPaidModal() {
   const modal = document.getElementById('paidModal');
   modal.style.display = 'flex';
 
-  // ✅ 입력창이 안 보이는 문제를 JS로 강제 보정
+  // ✅ 입력창이 안 보이는 문제를 JS로 강제 보정 + 반드시 표시
   const input = document.getElementById('searchQuery');
   if (input) {
     input.style.display = 'block';
@@ -146,8 +144,12 @@ function showPaidModal() {
     input.style.opacity = '1';
     input.style.height = 'auto';
     input.style.pointerEvents = 'auto';
+    input.removeAttribute('disabled');
+    input.removeAttribute('readonly');
 
-    // UX: 바로 입력 가능하게 포커스
+    // placeholder도 강제 세팅(혹시 html에서 빠졌을 경우)
+    if (!input.placeholder) input.placeholder = '예: 서대문역 미용실, 광화문 미용실';
+
     setTimeout(() => input.focus(), 50);
   }
 }
@@ -157,7 +159,7 @@ function closePaidModal() {
 }
 
 /* ---------------------------
-   유료 진단
+   유료 진단 (searchQuery 필수)
 ---------------------------- */
 async function diagnosePaid() {
   const searchQueryEl = document.getElementById('searchQuery');
@@ -173,8 +175,13 @@ async function diagnosePaid() {
   const industrySel = document.getElementById('industrySelect');
   currentIndustry = industrySel ? industrySel.value : (currentIndustry || 'hairshop');
 
-  // ✅ 검색어는 "선택"으로 변경 (없어도 진행)
-  // 경쟁사 분석을 서버에서 searchQuery로만 한다면, 그때만 다시 필수로 바꾸면 됨.
+  // ✅ 유료는 경쟁사 검색어 필수
+  if (!searchQuery) {
+    alert('경쟁사 분석을 위한 검색어를 입력해주세요.\n예: 서대문역 미용실, 광화문 미용실');
+    if (searchQueryEl) searchQueryEl.focus();
+    return;
+  }
+
   closePaidModal();
   showSection('loadingSection');
 
@@ -185,7 +192,7 @@ async function diagnosePaid() {
       body: JSON.stringify({
         placeUrl: currentPlaceUrl,
         industry: currentIndustry,
-        searchQuery: searchQuery || '' // ✅ 빈 값 허용
+        searchQuery
       })
     });
 
@@ -264,10 +271,9 @@ function displayLogs(logs) {
 }
 
 /* ---------------------------
-   ✅ 카테고리별 점수 표시 (개선)
-   - 대표키워드: "개수 외 점수요소" 표시
+   ✅ 카테고리별 점수 표시
+   - 대표키워드: 너무 많은 issues → 3줄 핵심만 출력
    - 가격/메뉴: 총 메뉴 수 중복 제거
-   - 리뷰 목표(800 고정) 같은 문구는 아예 만들지 않음
 ---------------------------- */
 function displayCategoryScores(scores, fullData) {
   const categoryScoresDiv = document.getElementById('categoryScores');
@@ -288,73 +294,23 @@ function displayCategoryScores(scores, fullData) {
 
   categories.forEach(cat => {
     const score = scores?.[cat.key];
-    const safeScore = score || { score: '-', grade: 'C', issues: ['점수 계산 로직 미적용(표시만 추가됨)'] };
-
+    const safeScore = score || { score: '-', grade: 'C', issues: ['점수 계산 로직 미적용'] };
     let issues = Array.isArray(safeScore.issues) ? [...safeScore.issues] : [];
 
-    // ✅ (1) 가격/메뉴: 총 메뉴 수 중복 제거
+    // ✅ 가격/메뉴: "총 메뉴 수" 중복 제거
     if (cat.key === 'price') {
-      // 서버 issues에 이미 "총 메뉴 수:"가 들어오면 프론트에서 추가하지 않음
       const hasMenuCountLine = issues.some(x => String(x).trim().startsWith('총 메뉴 수:'));
       if (!hasMenuCountLine) {
         if (menuCount === undefined) issues.unshift('총 메뉴 수: (데이터 없음)');
         else issues.unshift(`총 메뉴 수: ${menuCount}개`);
       }
-      // 혹시 중복이 있으면 1개만 남김
       issues = dedupeByPrefix(issues, '총 메뉴 수:');
     }
 
-    // ✅ (2) 대표키워드: "개수 외 점수요소"를 표시
-    // - 서버가 breakdown/meta를 내려주면 그걸 그대로 보여주고,
-    // - 없으면 프론트에서 "참고지표"로라도 보여준다.
-
-     if (cat.key === 'keywords') {
-  const kws = Array.isArray(fullData?.placeData?.keywords) ? fullData.placeData.keywords : [];
-  const unique = Array.from(new Set(kws.map(k => String(k).trim()).filter(Boolean)));
-
-  const countLine = `키워드 개수: ${kws.length}/5`;
-  const uniqueLine = `중복 제거 기준: ${unique.length}/5 (중복 ${kws.length - unique.length}개)`;
-
-  const placeName = fullData?.placeData?.name || '';
-  const address = fullData?.placeData?.address || '';
-
-  // 🔹 지역 추출
-  const regionMatch = placeName.match(/([가-힣]{2,8})역/);
-  const region = regionMatch ? `${regionMatch[1]}역` : '';
-
-  const industryToken =
-    currentIndustry === 'hairshop' ? '미용실' :
-    currentIndustry === 'cafe' ? '카페' :
-    '맛집';
-
-  let regionIncluded = 0;
-  let industryIncluded = 0;
-  let comboIncluded = 0;
-
-  unique.forEach(k => {
-    if (region && k.includes(region)) regionIncluded++;
-    if (k.includes(industryToken)) industryIncluded++;
-    if (region && k.includes(region) && k.includes(industryToken)) comboIncluded++;
-  });
-
-  const regionLine = `지역 포함 키워드: ${regionIncluded}개`;
-  const industryLine = `업종 포함 키워드: ${industryIncluded}개`;
-  const comboLine = `지역+업종 조합 키워드: ${comboIncluded}개`;
-
-  if (!issues.some(x => x.includes('키워드 개수'))) issues.unshift(countLine);
-  if (!issues.some(x => x.includes('중복 제거 기준'))) issues.unshift(uniqueLine);
-
-  issues.push(regionLine);
-  issues.push(industryLine);
-  issues.push(comboLine);
-
-  if (comboIncluded === 0) {
-    issues.push('⚠️ "지역+업종" 조합 키워드가 없습니다. (예: 서대문역미용실)');
-  }
-}
-
-    // ✅ (3) 리뷰: "목표 800" 같은 문구는 여기서 절대 추가하지 않음
-    // (현재 프론트는 목표 문구를 만들고 있지 않으니, 서버 issues에만 있으면 서버에서 제거 필요)
+    // ✅ 대표키워드: 3줄 핵심으로 축약
+    if (cat.key === 'keywords') {
+      issues = summarizeKeywordIssues(fullData, safeScore);
+    }
 
     const card = document.createElement('div');
     card.className = 'category-card';
@@ -378,6 +334,47 @@ function displayCategoryScores(scores, fullData) {
 
     categoryScoresDiv.appendChild(card);
   });
+}
+
+/* ---------------------------
+   ✅ 대표키워드 issues를 3줄로 요약
+   (서버가 breakdown/meta를 내려주면 그걸 우선 활용)
+---------------------------- */
+function summarizeKeywordIssues(fullData, safeScore) {
+  const kws = Array.isArray(fullData?.placeData?.keywords) ? fullData.placeData.keywords : [];
+  const uniqKws = Array.from(new Set(kws.map(k => String(k).trim()).filter(Boolean)));
+  const dup = Math.max(0, kws.length - uniqKws.length);
+
+  const breakdown = safeScore.breakdown || safeScore.meta || null;
+
+  // 기본 1줄: 개수/중복
+  const line1 = `키워드: ${kws.length}/5 · 중복 ${dup}개`;
+
+  // 2줄: 지역+업종 조합 여부 (네가 원한 핵심)
+  // 서버 issues에 경고문이 있으면 그걸 살리고, 없으면 간단 판별
+  const localityWarn =
+    (Array.isArray(safeScore.issues) && safeScore.issues.find(x => String(x).includes('지역+업종'))) ||
+    (kws.some(k => /(역|구|동|로|길)/.test(String(k))) ? '' : '⚠️ "지역+업종" 조합 키워드가 부족합니다 (예: 서대문역미용실)');
+
+  const line2 = localityWarn ? String(localityWarn) : '지역+업종 조합 키워드 OK';
+
+  // 3줄: 점수에 영향을 주는 “핵심 요소”를 한 줄로
+  // breakdown이 있으면 점수 요약, 없으면 고정 문구
+  let line3 = '반영요소: 중복/일반단어 감점 · 지역커버 · 검색의도 · 업종적합도';
+  if (breakdown && typeof breakdown === 'object') {
+    const b = breakdown;
+    const parts = [];
+    if (b.count !== undefined) parts.push(`개수 ${b.count}`);
+    if (b.dedupe !== undefined) parts.push(`중복 ${b.dedupe}`);
+    if (b.locality !== undefined) parts.push(`지역 ${b.locality}`);
+    if (b.intent !== undefined) parts.push(`의도 ${b.intent}`);
+    if (b.industryFit !== undefined) parts.push(`업종 ${b.industryFit}`);
+    if (b.stopwordPenalty !== undefined && b.stopwordPenalty !== 0) parts.push(`일반단어 ${b.stopwordPenalty}`);
+    if (parts.length) line3 = `세부: ${parts.join(' · ')}`;
+  }
+
+  // 결과는 3줄 고정
+  return [line1, line2, line3].filter(Boolean).slice(0, 3);
 }
 
 /* ---------------------------
@@ -459,10 +456,7 @@ function displayImprovementsPaid(fullData) {
     }
   }
 
-  const hasAnything =
-    !!fullData.unifiedText ||
-    (rec5 && rec5.length) ||
-    !!improvements;
+  const hasAnything = !!fullData.unifiedText || (rec5 && rec5.length) || !!improvements;
 
   if (!hasAnything) {
     const card = document.createElement('div');
@@ -471,7 +465,7 @@ function displayImprovementsPaid(fullData) {
       <h3>💡 맞춤 개선안</h3>
       <div class="improvement-content" style="white-space:pre-wrap;">
 서버에서 개선안 데이터가 내려오지 않았습니다.
-- /api/diagnose/paid 응답 JSON의 data.improvements / data.unifiedText / data.recommendedKeywords5 를 확인해주세요.
+- /api/diagnose/paid 응답 JSON의 data.improvements / data.unifiedText / data.recommendedKeywords 를 확인해주세요.
       </div>
     `;
     improvementsSection.appendChild(card);
@@ -526,24 +520,6 @@ function displayCompetitorsPaid(fullData) {
       </div>
     `;
     competitorsSection.appendChild(info);
-  }
-
-  if (Array.isArray(fullData.recommendedKeywords) && fullData.recommendedKeywords.length > 0) {
-    const recommendCard = document.createElement('div');
-    recommendCard.className = 'improvement-card';
-    recommendCard.style.marginTop = '20px';
-
-    const keywordTags = fullData.recommendedKeywords
-      .map(kw => `<span class="keyword-tag">${escapeHtml(kw)}</span>`)
-      .join('');
-
-    recommendCard.innerHTML = `
-      <h3>💡 추천 키워드(추가)</h3>
-      <p style="margin-bottom: 15px; color: #666;">경쟁사 분석을 바탕으로 한 추천 키워드입니다</p>
-      <div class="competitor-keywords">${keywordTags}</div>
-    `;
-
-    competitorsSection.appendChild(recommendCard);
   }
 }
 
@@ -601,21 +577,6 @@ function dedupeByPrefix(lines, prefix) {
     out.push(l);
   }
   return out;
-}
-
-function formatBreakdown(b) {
-  try {
-    if (typeof b === 'string') return b;
-    if (typeof b !== 'object' || !b) return String(b);
-
-    const parts = [];
-    for (const k of Object.keys(b)) {
-      parts.push(`${k}:${b[k]}`);
-    }
-    return parts.join(' | ');
-  } catch {
-    return '';
-  }
 }
 
 /* ---------------------------
