@@ -30,6 +30,74 @@ function normalizeIndustry(v: any): Industry {
   return "hairshop";
 }
 
+function regionHintFromAddress(address: string) {
+  const a = (address || "").replace(/\s+/g, " ").trim();
+  if (!a) return "";
+  // 예: "서울 종로구" 정도까지만
+  return a.split(" ").slice(0, 2).join(" ");
+}
+
+// ✅ 업종별 “서비스/시술” 핵심 토큰(추천키워드 조합용)
+function serviceTokens(industry: Industry) {
+  if (industry === "hairshop")
+    return ["미용실", "헤어", "커트", "컷", "펌", "염색", "클리닉", "매직", "볼륨매직", "다운펌", "레이어드컷", "단발"];
+  if (industry === "restaurant")
+    return ["맛집", "식당", "점심", "저녁", "혼밥", "회식", "데이트", "포장", "배달", "예약"];
+  return ["카페", "디저트", "브런치", "테이크아웃", "조용한", "작업", "콘센트", "좌석", "커피", "라떼"];
+}
+
+function uniq(arr: string[]) {
+  return Array.from(new Set(arr.map(s => (s || "").trim()).filter(Boolean)));
+}
+
+function pickRecommendedKeywords5(args: {
+  industry: Industry;
+  placeName: string;
+  address: string;
+  currentKeywords: string[];
+  competitorTopKeywords: string[];
+}) {
+  const industry = args.industry;
+  const regionHint = regionHintFromAddress(args.address);
+  const tokens = serviceTokens(industry);
+
+  // 1) 경쟁사 상위 키워드 중 “우리 업종 토큰”이 포함된 것 우선
+  const fromCompetitors = uniq(args.competitorTopKeywords)
+    .filter(k => !args.currentKeywords.includes(k))
+    .filter(k => tokens.some(t => k.includes(t) || t.includes(k)))
+    .slice(0, 3);
+
+  // 2) 네이버 로직 느낌: "지역/역명 + 업종 + 서비스" 조합 2개 만들기
+  // (역명은 주소 기반으로 확정 못 하니까, 플레이스명에 "서대문역" 같은게 있으면 그걸 활용)
+  const name = args.placeName || "";
+  const stationGuess =
+    (name.match(/[가-힣]{2,6}역/)?.[0] as string) ||
+    (args.currentKeywords.find(k => k.endsWith("역")) as string) ||
+    "";
+
+  const regionOrStation = stationGuess || regionHint || "근처";
+
+  const base1 = `${regionOrStation}${industry === "hairshop" ? "미용실" : industry === "restaurant" ? "맛집" : "카페"}`;
+  const base2 = `${regionOrStation}${industry === "hairshop" ? "커트" : industry === "restaurant" ? "점심" : "디저트"}`;
+
+  // 3) 부족하면 경쟁사 상위에서 아무거나 채움
+  const filler = uniq(args.competitorTopKeywords).filter(k => !args.currentKeywords.includes(k));
+
+  const out = uniq([
+    ...fromCompetitors,
+    base1,
+    base2,
+    ...filler
+  ])
+    .filter(Boolean)
+    .slice(0, 5);
+
+  // 최종 5개 보장
+  while (out.length < 5) out.push(`${regionOrStation}${tokens[out.length] || "추천"}`);
+
+  return out.slice(0, 5);
+}
+
 async function crawl(placeUrl: string) {
   const mobileUrl = convertToMobileUrl(placeUrl);
   const crawler = new ModularCrawler();
@@ -38,7 +106,7 @@ async function crawl(placeUrl: string) {
 }
 
 async function fetchTopCompetitorKeywords(industry: Industry, address: string) {
-  const regionHint = (address || "").split(" ").slice(0, 2).join(" ");
+  const regionHint = regionHintFromAddress(address);
   const query =
     industry === "hairshop" ? `${regionHint} 미용실` :
     industry === "restaurant" ? `${regionHint} 맛집` :
@@ -59,9 +127,15 @@ async function fetchTopCompetitorKeywords(industry: Industry, address: string) {
   const competitorTopKeywords = Array.from(freq.entries())
     .sort((a, b) => b[1] - a[1])
     .map(x => x[0])
-    .slice(0, 15);
+    .slice(0, 30);
 
-  return { competitors, competitorTopKeywords };
+  // ✅ 화면에 그대로 보여줄 "1~5 업체명 : 대표키워드"
+  const competitorSummaryLines = competitors.slice(0, 5).map((c, idx) => {
+    const kws = (c.keywords || []).slice(0, 5).join(", ");
+    return `${idx + 1}. ${c.name} : ${kws || "(키워드 없음)"}`;
+  });
+
+  return { competitors, competitorTopKeywords, competitorSummaryLines };
 }
 
 // ✅ 무료 진단
@@ -124,7 +198,7 @@ app.post("/api/diagnose/free", async (req, res) => {
   }
 });
 
-// ✅ 유료 진단(경쟁사 TOP5 키워드 + GPT 컨설팅 + 90점 목표)
+// ✅ 유료 진단(경쟁사 TOP5 보여주기 + 추천키워드 5개 + GPT 컨설팅 + 90점 목표)
 app.post("/api/diagnose/paid", async (req, res) => {
   try {
     const { placeUrl, industry } = req.body as { placeUrl: string; industry?: Industry };
@@ -149,7 +223,7 @@ app.post("/api/diagnose/paid", async (req, res) => {
 
     const ind = normalizeIndustry(industry);
 
-    // 현재 점수(원본)
+    // 1) 현재 점수(원본)
     const scoredNow = scorePlace({
       industry: ind as any,
       name: crawled.data.name,
@@ -164,10 +238,20 @@ app.post("/api/diagnose/paid", async (req, res) => {
       menus: (crawled.data as any).menus
     });
 
-    // 경쟁사 TOP5 키워드
-    const { competitors, competitorTopKeywords } = await fetchTopCompetitorKeywords(ind, crawled.data.address);
+    // 2) 경쟁사 TOP5 키워드 수집 + “그대로 보여줄” 라인 생성
+    const { competitors, competitorTopKeywords, competitorSummaryLines } =
+      await fetchTopCompetitorKeywords(ind, crawled.data.address);
 
-    // GPT 컨설팅(90점 목표)
+    // 3) 경쟁사 + 네이버 로직 기반 "추천 대표키워드 5개"
+    const recommendedKeywords5 = pickRecommendedKeywords5({
+      industry: ind,
+      placeName: crawled.data.name,
+      address: crawled.data.address,
+      currentKeywords: crawled.data.keywords || [],
+      competitorTopKeywords
+    });
+
+    // 4) GPT 컨설팅(90점 목표) — 경쟁사 키워드 참고 포함
     const consulting = await generatePaidConsultingGuaranteed({
       industry: ind,
       placeData: crawled.data,
@@ -189,17 +273,21 @@ app.post("/api/diagnose/paid", async (req, res) => {
         totalGrade: scoredNow.totalGrade,
         isPaid: true,
 
-        // 유료 결과(포맷 통일)
+        // ✅ 1~5 "업체명 : 대표키워드" 그대로 출력용
+        competitorSummaryLines, // ["1. ...", "2. ...", ...]
+        competitors, // [{name, keywords, placeUrl}, ...]
+
+        // ✅ 추천 대표키워드 5개(서버 생성)
+        recommendedKeywords5,
+
+        // ✅ GPT 유료 결과(포맷 통일)
         improvements: consulting.improvements,
         recommendedKeywords: consulting.recommendedKeywords,
         unifiedText: consulting.unifiedText,
 
-        // 적용하면 예상 점수
+        // ✅ 적용하면 예상 점수
         predictedAfterApply: consulting.predicted,
-        attempts: consulting.attempts,
-
-        // 경쟁사 표시용
-        competitors
+        attempts: consulting.attempts
       },
       logs: crawled.logs || []
     });
