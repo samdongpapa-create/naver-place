@@ -132,26 +132,54 @@ async function diagnoseFree() {
 /* ---------------------------
    유료 모달 (입력창 강제 표시 + 필수)
 ---------------------------- */
+
 function showPaidModal() {
   const modal = document.getElementById('paidModal');
   modal.style.display = 'flex';
 
-  // ✅ 입력창이 안 보이는 문제를 JS로 강제 보정 + 반드시 표시
-  const input = document.getElementById('searchQuery');
-  if (input) {
-    input.style.display = 'block';
-    input.style.visibility = 'visible';
-    input.style.opacity = '1';
-    input.style.height = 'auto';
-    input.style.pointerEvents = 'auto';
-    input.removeAttribute('disabled');
-    input.removeAttribute('readonly');
+  // 1) searchQuery가 없으면 모달 안에 직접 생성해서 넣어버림 (✅ 무조건 입력칸 생김)
+  let input = document.getElementById('searchQuery');
+  if (!input) {
+    const modalBody = modal.querySelector('.modal-body') || modal;
 
-    // placeholder도 강제 세팅(혹시 html에서 빠졌을 경우)
-    if (!input.placeholder) input.placeholder = '예: 서대문역 미용실, 광화문 미용실';
+    input = document.createElement('input');
+    input.id = 'searchQuery';
+    input.type = 'text';
+    input.className = 'modal-input';
+    input.placeholder = '예: 서대문역 미용실, 광화문 미용실';
 
-    setTimeout(() => input.focus(), 50);
+    // 가격 표시 위에 넣고 싶으면 적당히 위치 잡아 삽입
+    const priceEl = modal.querySelector('.modal-price');
+    if (priceEl && priceEl.parentNode) {
+      priceEl.parentNode.insertBefore(input, priceEl);
+    } else {
+      modalBody.appendChild(input);
+    }
+
+    // Enter로 바로 유료진단
+    input.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') diagnosePaid();
+    });
   }
+
+  // 2) CSS로 숨겨져도 강제 표시
+  input.style.display = 'block';
+  input.style.visibility = 'visible';
+  input.style.opacity = '1';
+  input.style.height = 'auto';
+  input.style.pointerEvents = 'auto';
+  input.style.position = 'relative';
+  input.style.zIndex = '9999';
+
+  // 3) 모달 콘텐츠도 혹시 z-index에 밀리면 강제 보정
+  const content = modal.querySelector('.modal-content');
+  if (content) {
+    content.style.position = 'relative';
+    content.style.zIndex = '9999';
+  }
+  modal.style.zIndex = '9998';
+
+  setTimeout(() => input.focus(), 50);
 }
 
 function closePaidModal() {
