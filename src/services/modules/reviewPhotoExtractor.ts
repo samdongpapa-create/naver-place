@@ -1,176 +1,233 @@
-/* global document, window, fetch */
+import { Page, Frame } from "playwright";
 
-const $ = (sel) => document.querySelector(sel);
+export class ReviewPhotoExtractor {
+  static async extract(
+    page: Page,
+    _frame: Frame | null,
+    placeId: string
+  ): Promise<{ reviewCount: number; photoCount: number; recentReviewCount30d: number; logs: string[] }> {
+    const logs: string[] = [];
+    logs.push("[리뷰&사진] 추출 시작");
 
-function escapeHtml(str) {
-  return String(str || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
+    let reviewCount = 0;
+    let photoCount = 0;
+    let recentReviewCount30d = 0;
 
-function renderList(items) {
-  if (!items || !items.length) return `<div class="muted">없음</div>`;
-  return `<ul>${items.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>`;
-}
+    try {
+      // ✅ slug 자동 보정: /place/{id}/home 로 들어가면 hairshop/cafe/...로 리다이렉트됨
+      const homeUrl = `https://m.place.naver.com/place/${placeId}/home`;
+      logs.push(`[리뷰&사진] 홈 이동(리뷰 기준): ${homeUrl}`);
 
-function renderChips(items) {
-  if (!items || !items.length) return `<div class="muted">없음</div>`;
-  return `<div class="chips">${items
-    .map((x) => `<span class="chip">${escapeHtml(x)}</span>`)
-    .join("")}</div>`;
-}
+      await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await page.waitForTimeout(1800);
 
-function setText(id, text) {
-  const el = $(id);
-  if (!el) return;
-  el.textContent = text == null ? "" : String(text);
-}
+      const finalUrl = page.url();
+      const slug = this.extractCategorySlug(finalUrl);
+      if (slug) logs.push(`[리뷰&사진] redirect slug 보정: ${slug}`);
 
-function setHtml(id, html) {
-  const el = $(id);
-  if (!el) return;
-  el.innerHTML = html == null ? "" : String(html);
-}
+      const homeHtml = await page.content();
 
-async function analyze() {
-  const url = ($("#placeUrl")?.value || "").trim();
-  const plan = ($("#plan")?.value || "free").trim();
+      reviewCount = this.extractMaxNumber(homeHtml, [
+        /"visitorReviewCount"[\s":]+([0-9,]+)/gi,
+        /"reviewCount"[\s":]+([0-9,]+)/gi,
+        /방문자리뷰\s*([0-9,]+)/gi,
+        /리뷰\s*([0-9,]+)/gi
+      ]);
 
-  if (!url) {
-    alert("플레이스 주소를 입력해줘.");
-    return;
+      logs.push(`[리뷰&사진] 리뷰 최댓값: ${reviewCount}`);
+      logs.push(`[리뷰&사진] 홈 기준 - 리뷰:${reviewCount}`);
+
+      // ✅ 최근 30일 리뷰 수 (visitor review 페이지에서 날짜 파싱)
+      try {
+        const reviewUrl = `https://m.place.naver.com/place/${placeId}/review/visitor`;
+        logs.push(`[리뷰&사진] 최근리뷰(30일) 계산 시도: ${reviewUrl}`);
+
+        await page.goto(reviewUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await page.waitForTimeout(1600);
+
+        const innerText = await page.evaluate(() => {
+          const d = (globalThis as any).document as any;
+          const raw = d?.body?.innerText ? String(d.body.innerText) : "";
+          return raw;
+        });
+
+        const parsed = this.countRecentDaysFromText(innerText, 30);
+        recentReviewCount30d = parsed.count;
+        logs.push(`[리뷰&사진] 날짜 파싱 개수: ${parsed.totalDates}, 최근30일 카운트: ${recentReviewCount30d}`);
+        logs.push(`[리뷰&사진] 최근 30일 리뷰 수 확정: ${recentReviewCount30d}`);
+      } catch (e: any) {
+        logs.push(`[리뷰&사진] 최근리뷰(30일) 계산 실패: ${e?.message || String(e)}`);
+      }
+
+      // ✅ 사진 수 추출: photo 탭 이동
+      try {
+        const photoUrl = slug
+          ? `https://m.place.naver.com/${slug}/${placeId}/photo`
+          : `https://m.place.naver.com/place/${placeId}/photo`;
+
+        logs.push(`[리뷰&사진] 사진탭 이동: ${photoUrl}`);
+        await page.goto(photoUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await page.waitForTimeout(1600);
+
+        const photoHtml = await page.content();
+
+        // 1) key 기반 파싱(후보 확장: 구조 변경 대응)
+        const keyBased = this.extractMaxNumber(photoHtml, [
+          /"photoCount"[\s":]+([0-9,]+)/gi,
+          /"businessPhotoCount"[\s":]+([0-9,]+)/gi,
+          /"storePhotoCount"[\s":]+([0-9,]+)/gi,
+          /"totalPhotoCount"[\s":]+([0-9,]+)/gi,
+          /"photoTotalCount"[\s":]+([0-9,]+)/gi,
+          /"totalImages"[\s":]+([0-9,]+)/gi,
+          /"imageCount"[\s":]+([0-9,]+)/gi,
+          /"mediaTotalCount"[\s":]+([0-9,]+)/gi,
+          /"mediaCount"[\s":]+([0-9,]+)/gi
+        ]);
+
+        logs.push(`[PHOTO] key-based count: ${keyBased}`);
+
+        // 2) DOM 텍스트 기반 파싱(업체사진/사진(123) 등)
+        let domParsed = 0;
+        try {
+          const domText = await page.evaluate(() => {
+            const d = (globalThis as any).document as any;
+            return d?.body?.innerText ? String(d.body.innerText) : "";
+          });
+
+          domParsed = this.parseCountFromText(domText);
+          logs.push(`[PHOTO] dom-text parsed count: ${domParsed}`);
+        } catch (e: any) {
+          logs.push(`[PHOTO] dom-text parse error: ${e?.message || String(e)}`);
+        }
+
+        // 3) 마지막 보루: img 썸네일 개수(최소 추정치)
+        let imgEstimate = 0;
+        try {
+          imgEstimate = await page.evaluate(() => {
+            const imgs = Array.from(document.querySelectorAll("img"));
+            const candidates = imgs.filter((img: any) => {
+              const src = String(img?.getAttribute?.("src") || img?.src || "").toLowerCase();
+              if (!src) return false;
+              if (src.startsWith("data:")) return false;
+              if (src.includes("logo") || src.includes("icon")) return false;
+              return true;
+            });
+            return candidates.length;
+          });
+          if (imgEstimate < 6) imgEstimate = 0;
+          logs.push(`[PHOTO] img-thumb estimate: ${imgEstimate}`);
+        } catch (e: any) {
+          logs.push(`[PHOTO] img-thumb estimate error: ${e?.message || String(e)}`);
+        }
+
+        // 최종 결정(우선순위: key > dom > imgEstimate)
+        photoCount = keyBased || domParsed || imgEstimate;
+
+        // ✅ 오탐 컷
+        if (photoCount > 2000) {
+          logs.push(`[리뷰&사진] photoCount=${photoCount} 과대(>2000) → 오탐으로 0 처리`);
+          photoCount = 0;
+        }
+      } catch (e: any) {
+        logs.push(`[리뷰&사진] 사진 추출 실패: ${e?.message || String(e)}`);
+      }
+
+      logs.push(`[리뷰&사진] 최종 결과 - 리뷰: ${reviewCount}, 업체사진: ${photoCount}, 최근30일: ${recentReviewCount30d}`);
+      return { reviewCount, photoCount, recentReviewCount30d, logs };
+    } catch (e: any) {
+      logs.push(`[리뷰&사진] 오류: ${e?.message || String(e)}`);
+      return { reviewCount: reviewCount || 0, photoCount: photoCount || 0, recentReviewCount30d: recentReviewCount30d || 0, logs };
+    }
   }
 
-  setText("#status", "분석 중...");
-  setHtml("#result", "");
-
-  const res = await fetch("/api/analyze", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ placeUrl: url, plan }),
-  });
-
-  const data = await res.json().catch(() => null);
-  if (!data || !data.ok) {
-    setText("#status", "실패");
-    setHtml("#result", `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`);
-    return;
+  private static extractCategorySlug(url: string): string {
+    try {
+      const u = new URL(url);
+      const parts = u.pathname.split("/").filter(Boolean);
+      // /hairshop/{id}/home 형태
+      if (parts.length >= 2 && parts[1] && /^\d+$/.test(parts[1])) {
+        return parts[0]; // hairshop/cafe/restaurant 등
+      }
+      return "";
+    } catch {
+      return "";
+    }
   }
 
-  setText("#status", "완료");
+  private static parseCountFromText(text?: string | null): number {
+    if (!text) return 0;
+    const t = String(text);
 
-  const place = data.place || {};
-  const extracted = data.extracted || {};
-  const diag = data.diagnosis || {};
-  const rec = data.recommendations || null;
-  const paid = data.paid || null;
+    const m =
+      t.match(/업체\s*사진[^0-9]{0,10}([0-9][0-9,]{0,})/) ||
+      t.match(/업체사진[^0-9]{0,10}([0-9][0-9,]{0,})/) ||
+      t.match(/사진[^0-9]{0,10}\(([0-9][0-9,]{0,})\)/) ||
+      t.match(/사진[^0-9]{0,10}([0-9][0-9,]{0,})/) ||
+      t.match(/\(([0-9][0-9,]{0,})\)/);
 
-  const html = [];
-
-  html.push(`
-    <section class="card">
-      <h2>기본 정보</h2>
-      <div><b>상호</b>: ${escapeHtml(place.name || "")}</div>
-      <div><b>카테고리</b>: ${escapeHtml(place.category || "")}</div>
-      <div><b>주소</b>: ${escapeHtml(place.address || "")}</div>
-      <div><b>Place ID</b>: ${escapeHtml(place.placeId || "")}</div>
-      <div><b>URL</b>: <a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a></div>
-    </section>
-  `);
-
-  html.push(`
-    <section class="card">
-      <h2>추출 데이터</h2>
-      <div class="grid2">
-        <div><b>대표키워드(추출)</b>${renderChips(extracted.keywords || [])}</div>
-        <div><b>리뷰</b><div>총 ${escapeHtml(extracted.reviewsTotal || 0)} / 최근30일 ${escapeHtml(extracted.recent30d || 0)}</div></div>
-      </div>
-      <div><b>사진 수</b>: ${escapeHtml(extracted.photoCount || 0)}</div>
-      <div><b>상세설명</b><pre>${escapeHtml(extracted.description || "")}</pre></div>
-      <div><b>오시는길</b><pre>${escapeHtml(extracted.directions || "")}</pre></div>
-    </section>
-  `);
-
-  if (diag && diag.summary) {
-    html.push(`
-      <section class="card">
-        <h2>진단 요약</h2>
-        <pre>${escapeHtml(JSON.stringify(diag, null, 2))}</pre>
-      </section>
-    `);
+    if (!m?.[1]) return 0;
+    const n = parseInt(m[1].replace(/,/g, ""), 10);
+    return Number.isNaN(n) ? 0 : n;
   }
 
-  // ✅ 추천 대표키워드(5개) - 단일 필드만 사용
-  if (rec) {
-    html.push(`
-      <section class="card">
-        <h2>추천 대표키워드 (5개)</h2>
-        ${renderChips(rec.recommendedKeywords5 || [])}
-      </section>
-    `);
+  private static extractMaxNumber(html: string, regexList: RegExp[]): number {
+    const nums: number[] = [];
 
-    html.push(`
-      <section class="card">
-        <h2>상세설명 개선안</h2>
-        <pre>${escapeHtml(rec.improvedDescription || "")}</pre>
-      </section>
-    `);
+    for (const r of regexList) {
+      const matches = html.matchAll(r);
+      for (const m of matches) {
+        const raw = m?.[1];
+        if (!raw) continue;
+        const n = parseInt(String(raw).replace(/,/g, ""), 10);
+        if (!Number.isNaN(n) && n > 0 && n < 5000000) nums.push(n);
+      }
+    }
 
-    html.push(`
-      <section class="card">
-        <h2>오시는길 개선안</h2>
-        <pre>${escapeHtml(rec.improvedDirections || "")}</pre>
-      </section>
-    `);
-  } else {
-    html.push(`
-      <section class="card">
-        <h2>추천 결과</h2>
-        <div class="muted">GPT 추천을 불러오지 못했습니다(키 없음/오류).</div>
-      </section>
-    `);
+    if (!nums.length) return 0;
+    return Math.max(...nums);
   }
 
-  // ✅ 유료 통합본: unifiedText만 노출
-  if (paid && paid.unifiedText) {
-    html.push(`
-      <section class="card">
-        <h2>유료 컨설팅 통합본</h2>
-        <pre>${escapeHtml(paid.unifiedText)}</pre>
-      </section>
-    `);
-  }
+  private static countRecentDaysFromText(text: string, days: number) {
+    const now = new Date();
+    const limit = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
 
-  // ✅ 경쟁사
-  if (data.competitors && data.competitors.length) {
-    html.push(`
-      <section class="card">
-        <h2>경쟁사 (best effort)</h2>
-        ${renderList(
-          data.competitors.map((c) => {
-            const u = c.url || "";
-            const label = c.name ? `${c.name} (${c.placeId})` : `${c.placeId}`;
-            return u ? `${label} - ${u}` : label;
-          })
-        )}
-      </section>
-    `);
-  } else {
-    html.push(`
-      <section class="card">
-        <h2>경쟁사</h2>
-        <div class="muted">경쟁사 데이터를 가져오지 못했습니다.</div>
-      </section>
-    `);
-  }
+    const patterns = [
+      /\b(20\d{2})[.\-\/](\d{1,2})[.\-\/](\d{1,2})\b/g,         // 2026.02.13
+      /\b(\d{1,2})[.\-\/](\d{1,2})\b/g,                         // 02.13
+      /\b(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일\b/g    // 2026년 2월 13일
+    ];
 
-  setHtml("#result", html.join("\n"));
+    const dates: Date[] = [];
+
+    // 1) 연도 포함
+    for (const p of [patterns[0], patterns[2]]) {
+      let m;
+      while ((m = p.exec(text)) !== null) {
+        const y = parseInt(m[1], 10);
+        const mo = parseInt(m[2], 10);
+        const d = parseInt(m[3], 10);
+        if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+          const dt = new Date(y, mo - 1, d);
+          if (!Number.isNaN(dt.getTime())) dates.push(dt);
+        }
+      }
+    }
+
+    // 2) 월/일만 → 올해로 가정
+    {
+      const p = patterns[1];
+      let m;
+      while ((m = p.exec(text)) !== null) {
+        const mo = parseInt(m[1], 10);
+        const d = parseInt(m[2], 10);
+        if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+          const dt = new Date(now.getFullYear(), mo - 1, d);
+          if (!Number.isNaN(dt.getTime())) dates.push(dt);
+        }
+      }
+    }
+
+    const recent = dates.filter(d => d >= limit && d <= now).length;
+    return { totalDates: dates.length, count: recent };
+  }
 }
-
-window.addEventListener("DOMContentLoaded", () => {
-  const btn = $("#analyzeBtn");
-  if (btn) btn.addEventListener("click", analyze);
-});
