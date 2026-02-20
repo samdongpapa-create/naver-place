@@ -11,7 +11,6 @@ import { scorePlace } from "./lib/scoring/engine";
 import { CompetitorService } from "./services/competitorService";
 import { UrlConverter } from "./services/modules/urlConverter";
 
-// ✅ gptConsulting.ts에서 export되는 함수명으로 import
 import { generatePaidConsultingGuaranteed } from "./services/gptConsulting";
 
 const app = express();
@@ -31,13 +30,19 @@ function normalizeIndustry(v: any): Industry {
   return "hairshop";
 }
 
+function extractPlaceIdSafe(url: string): string {
+  // 어떤 형태든 숫자 placeId만 뽑기
+  const m = String(url || "").match(/(\d{5,12})/);
+  return m?.[1] || "";
+}
+
 async function crawl(placeUrl: string) {
   const mobileUrl = convertToMobileUrl(placeUrl);
   const crawler = new ModularCrawler();
   return await crawler.crawlPlace(mobileUrl);
 }
 
-/** ✅ 추천 키워드 5개 생성 (경쟁사 빈도 + 지역 결합) */
+/** ✅ (fallback) 추천 키워드 5개 생성: 경쟁사 빈도 + 지역 결합 */
 function buildRecommendedKeywords(params: {
   industry: Industry;
   myName: string;
@@ -65,7 +70,7 @@ function buildRecommendedKeywords(params: {
     if (ad) {
       const parts = ad.split(/\s+/).map(s => s.trim()).filter(Boolean);
       for (const p of parts) {
-        if (/(역|구|동|로|길)$/.test(p) && p.length <= 10) toks.push(p);
+        if (/(역|구|동)$/.test(p) && p.length <= 10) toks.push(p);
       }
     }
 
@@ -110,7 +115,7 @@ function buildRecommendedKeywords(params: {
 
   // 1) 지역+서비스 3개
   if (locality) {
-    for (const t of serviceTokens) {
+    for (const t of serviceTokens.slice(0, 4)) {
       push(`${locality}${t}`);
       if (out.length >= 3) break;
     }
@@ -223,8 +228,10 @@ app.post("/api/diagnose/paid", async (req, res) => {
       });
     }
 
+    const ind = normalizeIndustry(industry);
+
     const mobileUrl = convertToMobileUrl(placeUrl);
-    const placeId = UrlConverter.extractPlaceId(mobileUrl) || "";
+    const placeId = UrlConverter.extractPlaceId(mobileUrl) || extractPlaceIdSafe(mobileUrl) || extractPlaceIdSafe(placeUrl);
 
     const crawler = new ModularCrawler();
     const crawlResult = await crawler.crawlPlace(mobileUrl);
@@ -236,8 +243,6 @@ app.post("/api/diagnose/paid", async (req, res) => {
         logs: crawlResult.logs || []
       });
     }
-
-    const ind = normalizeIndustry(industry);
 
     // 1) 현재 상태 점수
     const scored = scorePlace({
@@ -257,9 +262,12 @@ app.post("/api/diagnose/paid", async (req, res) => {
     // 2) 경쟁사 Top5
     compSvc = new CompetitorService();
     const compIds = await compSvc.findTopPlaceIds(searchQuery.trim(), placeId, 5);
-    const competitors = await compSvc.crawlCompetitorsByIds(compIds, ind, 5);
+    console.log("[PAID] compIds:", compIds.length, compIds);
 
-    // 3) 추천 대표키워드 5개(로컬)
+    const competitors = await compSvc.crawlCompetitorsByIds(compIds, ind, 5);
+    console.log("[PAID] competitors:", competitors.length);
+
+    // 3) (fallback) 추천 대표키워드 5개
     const recommendedKeywordsLocal = buildRecommendedKeywords({
       industry: ind,
       myName: crawlResult.data.name,
@@ -281,6 +289,23 @@ app.post("/api/diagnose/paid", async (req, res) => {
       targetScore: 90
     });
 
+    // ✅ 핵심: 대표키워드 불일치 방지
+    // - 최우선: gpt.improvements.keywords (통합본도 이걸 기준으로 만들어짐)
+    // - 다음: gpt.recommendedKeywords
+    // - 마지막: local
+    const gptKw = Array.isArray(gpt?.improvements?.keywords) ? gpt.improvements.keywords.slice(0, 5) : [];
+    const recommendedKeywords =
+      gptKw.length === 5
+        ? gptKw
+        : (Array.isArray(gpt?.recommendedKeywords) ? gpt.recommendedKeywords.slice(0, 5) : []).length === 5
+        ? gpt.recommendedKeywords.slice(0, 5)
+        : recommendedKeywordsLocal;
+
+    // ✅ improvements 안의 keywords도 서버에서 한번 더 강제(프론트가 improvements.keywords를 보더라도 동일)
+    if (gpt?.improvements) {
+      (gpt.improvements as any).keywords = recommendedKeywords;
+    }
+
     return res.json({
       success: true,
       data: {
@@ -293,17 +318,15 @@ app.post("/api/diagnose/paid", async (req, res) => {
 
         improvements: gpt.improvements,
 
-        // ✅ 불일치 방지: gpt.recommendedKeywords가 있으면 그걸 우선, 없으면 로컬
-        recommendedKeywords:
-          gpt.recommendedKeywords && gpt.recommendedKeywords.length
-            ? gpt.recommendedKeywords
-            : recommendedKeywordsLocal,
+        // ✅ 항상 5개로 통일
+        recommendedKeywords,
 
         competitors,
 
         predictedAfter: gpt.predicted,
         attempts: gpt.attempts,
 
+        // ✅ 통합본(내부도 recommendedKeywords 기준으로 통일됨)
         unifiedText: gpt.unifiedText
       },
       logs: crawlResult.logs || []
