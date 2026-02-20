@@ -7,6 +7,7 @@ import { DiagnosisService } from "./services/diagnosis";
 import type { Industry } from "./lib/scoring/types";
 import { scorePlace } from "./lib/scoring/engine";
 import { generatePaidConsultingByGPT } from "./services/gptConsulting";
+import { generatePaidConsultingGuaranteed } from "./services/gptConsulting";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -85,6 +86,7 @@ app.post("/api/diagnose/free", async (req, res) => {
  * ✅ PAID: 점수/등급 + GPT로 “바로 붙여넣기 개선안” 생성
  * - 유료만 GPT 호출 (수정방향 생성은 유료에서만)
  */
+
 app.post("/api/diagnose/paid", async (req, res) => {
   try {
     const { placeUrl, industry } = req.body as { placeUrl: string; industry?: Industry };
@@ -109,8 +111,8 @@ app.post("/api/diagnose/paid", async (req, res) => {
 
     const ind = normalizeIndustry(industry);
 
-    // ✅ 업종별 스코어링(새 로직)
-    const scored = scorePlace({
+    // ✅ 현재 점수(원본 기준)
+    const scoredNow = scorePlace({
       industry: ind as any,
       name: crawled.data.name,
       address: crawled.data.address,
@@ -124,25 +126,36 @@ app.post("/api/diagnose/paid", async (req, res) => {
       menus: (crawled.data as any).menus
     });
 
-    // ✅ GPT로 유료 컨설팅 생성
-    const gpt = await generatePaidConsultingByGPT({
+    // ✅ 90점 보장형 컨설팅 생성(루프)
+    const consulting = await generatePaidConsultingGuaranteed({
       industry: ind as any,
       placeData: crawled.data,
-      scores: scored.scores as any,
-      totalScore: scored.totalScore,
-      totalGrade: scored.totalGrade
+      scoredNow: {
+        totalScore: scoredNow.totalScore,
+        totalGrade: scoredNow.totalGrade,
+        scores: scoredNow.scores
+      },
+      targetScore: 90
     });
 
     return res.json({
       success: true,
       data: {
+        // 현재 원본 진단
         placeData: crawled.data,
-        scores: scored.scores,
-        totalScore: scored.totalScore,
-        totalGrade: scored.totalGrade,
+        scores: scoredNow.scores,
+        totalScore: scoredNow.totalScore,
+        totalGrade: scoredNow.totalGrade,
+
+        // 유료 컨설팅 결과(붙여넣기)
         isPaid: true,
-        improvements: gpt.improvements,
-        recommendedKeywords: gpt.recommendedKeywords || null,
+        improvements: consulting.improvements,
+        recommendedKeywords: consulting.recommendedKeywords || null,
+
+        // ✅ “이대로 적용하면 예상 점수”
+        predictedAfterApply: consulting.predicted,
+        attempts: consulting.attempts,
+
         competitors: null
       },
       logs: crawled.logs || []
