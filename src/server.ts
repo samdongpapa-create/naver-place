@@ -76,6 +76,12 @@ app.post("/api/diagnose/free", async (req, res) => {
   }
 });
 
+import type { Industry } from "./lib/scoring/types";
+import { generatePaidConsultingByGPT } from "./services/gptConsulting";
+import { scorePlace } from "./lib/scoring/engine";
+
+// ... (기존 코드 유지)
+
 app.post("/api/diagnose/paid", async (req, res) => {
   try {
     const { placeUrl, industry } = req.body as { placeUrl: string; industry?: Industry };
@@ -88,24 +94,56 @@ app.post("/api/diagnose/paid", async (req, res) => {
       });
     }
 
-    const crawled = await crawl(placeUrl);
+    const mobileUrl = convertToMobileUrl(placeUrl);
 
-    if (!crawled.success || !crawled.data) {
+    const crawler = new ModularCrawler();
+    const crawl = await crawler.crawlPlace(mobileUrl);
+
+    if (!crawl.success || !crawl.data) {
       return res.status(500).json({
         success: false,
-        message: crawled.error || "크롤링 실패",
-        logs: crawled.logs || []
+        message: crawl.error || "크롤링 실패",
+        logs: crawl.logs || []
       });
     }
 
-    // ✅ 여기서 결제검증 붙이면 됨(지금은 단순 isPaid=true)
-    const diag = new DiagnosisService();
-    const report = diag.generateDiagnosis(crawled.data, true, normalizeIndustry(industry));
+    // ✅ 로컬 점수(업종별 로직)로 먼저 채점
+    const scored = scorePlace({
+      industry: (industry || "hairshop") as any,
+      name: crawl.data.name,
+      address: crawl.data.address,
+      description: crawl.data.description,
+      directions: crawl.data.directions,
+      keywords: crawl.data.keywords,
+      reviewCount: crawl.data.reviewCount,
+      recentReviewCount30d: crawl.data.recentReviewCount30d,
+      photoCount: crawl.data.photoCount,
+      menuCount: crawl.data.menuCount,
+      menus: crawl.data.menus
+    });
+
+    // ✅ GPT로 유료 개선안 생성
+    const gpt = await generatePaidConsultingByGPT({
+      industry: (industry || "hairshop") as any,
+      placeData: crawl.data,
+      scores: scored.scores as any,
+      totalScore: scored.totalScore,
+      totalGrade: scored.totalGrade
+    });
 
     return res.json({
       success: true,
-      data: report,
-      logs: crawled.logs || []
+      data: {
+        placeData: crawl.data,
+        scores: scored.scores,
+        totalScore: scored.totalScore,
+        totalGrade: scored.totalGrade,
+        isPaid: true,
+        improvements: gpt.improvements,
+        recommendedKeywords: gpt.recommendedKeywords || null,
+        competitors: null
+      },
+      logs: crawl.logs || []
     });
   } catch (error: any) {
     console.error("paid diagnose 오류:", error);
@@ -116,7 +154,6 @@ app.post("/api/diagnose/paid", async (req, res) => {
     });
   }
 });
-
 // ✅ /api 제외한 나머지는 프론트로
 app.get("*", (req, res) => {
   if (req.path.startsWith("/api")) {
