@@ -71,7 +71,7 @@ export class ReviewPhotoExtractor {
 
         const photoHtml = await page.content();
 
-        // 1) key 기반 파싱(후보 확장: 구조 변경 대응)
+        // 1) key 기반 파싱(후보 확장)
         const keyBased = this.extractMaxNumber(photoHtml, [
           /"photoCount"[\s":]+([0-9,]+)/gi,
           /"businessPhotoCount"[\s":]+([0-9,]+)/gi,
@@ -86,7 +86,7 @@ export class ReviewPhotoExtractor {
 
         logs.push(`[PHOTO] key-based count: ${keyBased}`);
 
-        // 2) DOM 텍스트 기반 파싱(업체사진/사진(123) 등)
+        // 2) DOM 텍스트 기반 파싱
         let domParsed = 0;
         try {
           const domText = await page.evaluate(() => {
@@ -104,7 +104,9 @@ export class ReviewPhotoExtractor {
         let imgEstimate = 0;
         try {
           imgEstimate = await page.evaluate(() => {
-            const imgs = Array.from(document.querySelectorAll("img"));
+            const d = (globalThis as any).document as any;
+            const nodeList = d?.querySelectorAll ? d.querySelectorAll("img") : [];
+            const imgs = Array.from(nodeList || []);
             const candidates = imgs.filter((img: any) => {
               const src = String(img?.getAttribute?.("src") || img?.src || "").toLowerCase();
               if (!src) return false;
@@ -114,6 +116,7 @@ export class ReviewPhotoExtractor {
             });
             return candidates.length;
           });
+
           if (imgEstimate < 6) imgEstimate = 0;
           logs.push(`[PHOTO] img-thumb estimate: ${imgEstimate}`);
         } catch (e: any) {
@@ -136,7 +139,12 @@ export class ReviewPhotoExtractor {
       return { reviewCount, photoCount, recentReviewCount30d, logs };
     } catch (e: any) {
       logs.push(`[리뷰&사진] 오류: ${e?.message || String(e)}`);
-      return { reviewCount: reviewCount || 0, photoCount: photoCount || 0, recentReviewCount30d: recentReviewCount30d || 0, logs };
+      return {
+        reviewCount: reviewCount || 0,
+        photoCount: photoCount || 0,
+        recentReviewCount30d: recentReviewCount30d || 0,
+        logs
+      };
     }
   }
 
@@ -144,10 +152,7 @@ export class ReviewPhotoExtractor {
     try {
       const u = new URL(url);
       const parts = u.pathname.split("/").filter(Boolean);
-      // /hairshop/{id}/home 형태
-      if (parts.length >= 2 && parts[1] && /^\d+$/.test(parts[1])) {
-        return parts[0]; // hairshop/cafe/restaurant 등
-      }
+      if (parts.length >= 2 && parts[1] && /^\d+$/.test(parts[1])) return parts[0];
       return "";
     } catch {
       return "";
@@ -172,7 +177,6 @@ export class ReviewPhotoExtractor {
 
   private static extractMaxNumber(html: string, regexList: RegExp[]): number {
     const nums: number[] = [];
-
     for (const r of regexList) {
       const matches = html.matchAll(r);
       for (const m of matches) {
@@ -182,7 +186,6 @@ export class ReviewPhotoExtractor {
         if (!Number.isNaN(n) && n > 0 && n < 5000000) nums.push(n);
       }
     }
-
     if (!nums.length) return 0;
     return Math.max(...nums);
   }
@@ -192,14 +195,13 @@ export class ReviewPhotoExtractor {
     const limit = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
 
     const patterns = [
-      /\b(20\d{2})[.\-\/](\d{1,2})[.\-\/](\d{1,2})\b/g,         // 2026.02.13
-      /\b(\d{1,2})[.\-\/](\d{1,2})\b/g,                         // 02.13
-      /\b(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일\b/g    // 2026년 2월 13일
+      /\b(20\d{2})[.\-\/](\d{1,2})[.\-\/](\d{1,2})\b/g,
+      /\b(\d{1,2})[.\-\/](\d{1,2})\b/g,
+      /\b(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일\b/g
     ];
 
     const dates: Date[] = [];
 
-    // 1) 연도 포함
     for (const p of [patterns[0], patterns[2]]) {
       let m;
       while ((m = p.exec(text)) !== null) {
@@ -213,7 +215,6 @@ export class ReviewPhotoExtractor {
       }
     }
 
-    // 2) 월/일만 → 올해로 가정
     {
       const p = patterns[1];
       let m;
