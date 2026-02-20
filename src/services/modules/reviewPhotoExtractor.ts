@@ -81,23 +81,17 @@ export class ReviewPhotoExtractor {
         }
       }
 
-      if (recentReviewCount30d === undefined) {
-        logs.push("[리뷰&사진] 최근 30일 리뷰 수 추출 실패/스킵(중립 처리 예정)");
-      }
-
       // =========================
-      // 3) 사진 수: photo 탭 (✅ 네트워크 응답 캐치)
+      // 3) 사진 수: photo 탭 (✅ totalCount 오탐 제거 + 업체사진 DOM 카운트)
       // =========================
       const photoUrl = this.buildUrl("photo", placeId, categorySlug);
       logs.push(`[리뷰&사진] 사진탭 이동: ${photoUrl}`);
 
-      // ✅ 네트워크로 photoCount 후보 수집
+      // ✅ 네트워크로 "사진 관련 키"만 수집
       const net = this.createPhotoNetworkCollector(placeId, logs);
       page.on("response", net.onResponse);
 
       await page.goto(photoUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-
-      // 렌더/요청 더 기다리기
       await page.waitForLoadState("networkidle").catch(() => {});
       await page.waitForTimeout(2200);
 
@@ -105,7 +99,7 @@ export class ReviewPhotoExtractor {
       await this.scrollNudge(page);
       await page.waitForTimeout(1200);
 
-      // photo 페이지 redirect되면 slug 보정
+      // redirect slug 보정
       if (!categorySlug) {
         const redirectedSlug = this.detectSlugFromUrl(page.url());
         if (redirectedSlug) {
@@ -114,118 +108,44 @@ export class ReviewPhotoExtractor {
         }
       }
 
-      // ✅ 네트워크에서 잡은 값 우선 적용
+      // ✅ 1차: 네트워크에서 photoCount(best)
       const netPhoto = net.getBest();
-      logs.push(`[리뷰&사진] 네트워크 photoCount 후보(best): ${netPhoto || 0}`);
+      logs.push(`[리뷰&사진] 네트워크 photoCount(best, strict keys only): ${netPhoto || 0}`);
       if (netPhoto > 0) photoCount = netPhoto;
 
-      // ---- 아래는 “네트워크 실패 대비” DOM/HTML 보조 ----
-      const bodyTextLen = await page
-        .evaluate(() => {
-          const d = (globalThis as any).document;
-          const t = (d?.body?.innerText || "").trim();
-          return t.length;
-        })
-        .catch(() => 0);
-      logs.push(`[리뷰&사진] photo bodyText length: ${bodyTextLen}`);
+      // ✅ 2차: “업체사진” 필터/칩/탭 클릭 시도 후, 썸네일 개수 카운트
+      // (업체 등록 사진이 적으면 여기서 정확히 맞는 경우가 많음)
+      const businessClicked = await this.clickBusinessPhotoChip(page, logs);
+      if (businessClicked) {
+        await page.waitForLoadState("networkidle").catch(() => {});
+        await page.waitForTimeout(1200);
+        await this.scrollNudge(page);
+        await page.waitForTimeout(600);
 
-      const tabLabels = ["업체사진", "매장사진", "사진", "방문자사진", "리뷰사진"];
+        // 클릭 후 네트워크 재평가
+        const netAfter = net.getBest();
+        logs.push(`[리뷰&사진] (업체사진 선택 후) 네트워크 best: ${netAfter || 0}`);
+        if (netAfter > 0) photoCount = netAfter;
 
-      // 탭 텍스트 파싱
-      for (const label of tabLabels) {
-        const txt = await this.getTabText(page, label);
-        if (txt) logs.push(`[리뷰&사진] 탭 텍스트 후보(${label}): ${txt}`);
-        const n = this.parseCountFromAnyText(txt, label);
-        if (n > photoCount) {
-          photoCount = n;
-          logs.push(`[리뷰&사진] 탭 텍스트(${label})에서 photoCount 갱신: ${photoCount}`);
+        // DOM 썸네일 카운트 (업체사진 화면에서만)
+        const domCount = await this.countPhotoThumbnails(page);
+        logs.push(`[리뷰&사진] (업체사진 선택 후) DOM 썸네일 카운트: ${domCount}`);
+        if (domCount > 0 && domCount < 500) {
+          // DOM이 훨씬 신뢰할 수 있음(2개 같은 케이스)
+          photoCount = domCount;
+          logs.push(`[리뷰&사진] photoCount를 DOM 썸네일로 확정: ${photoCount}`);
         }
+      } else {
+        logs.push("[리뷰&사진] 업체사진 필터/칩을 찾지 못함 → DOM 카운트 스킵");
       }
 
-      // 탭 클릭 시도
-      for (const label of ["업체사진", "매장사진", "사진"]) {
-        const clicked = await this.clickTab(page, label);
-        logs.push(`[리뷰&사진] 탭 클릭(${label}): ${clicked ? "성공" : "실패/없음/이미선택"}`);
-        if (clicked) {
-          await page.waitForLoadState("networkidle").catch(() => {});
-          await page.waitForTimeout(1200);
-          await this.scrollNudge(page);
-          await page.waitForTimeout(800);
-
-          // 클릭 후 네트워크에서 새로 잡힌 후보 반영
-          const netAfter = net.getBest();
-          if (netAfter > photoCount) {
-            photoCount = netAfter;
-            logs.push(`[리뷰&사진] (클릭후) 네트워크 photoCount 갱신: ${photoCount}`);
-          }
-
-          const txtAfter = await this.getTabText(page, label);
-          if (txtAfter) logs.push(`[리뷰&사진] 탭 텍스트(클릭후 ${label}): ${txtAfter}`);
-
-          const n2 = this.parseCountFromAnyText(txtAfter, label);
-          if (n2 > photoCount) {
-            photoCount = n2;
-            logs.push(`[리뷰&사진] 클릭후(${label}) photoCount 갱신: ${photoCount}`);
-          }
-          break;
-        }
-      }
-
-      // 탭 영역 loose-number max
-      if (photoCount === 0) {
-        const tabAreaText = await page
-          .evaluate(() => {
-            const d = (globalThis as any).document;
-            const el =
-              d?.querySelector?.('[role="tablist"]') ||
-              d?.querySelector?.("nav") ||
-              d?.querySelector?.("header") ||
-              d?.body;
-            const t = (el?.textContent || "").replace(/\s+/g, " ").trim();
-            return t.slice(0, 2000);
-          })
-          .catch(() => "");
-
-        logs.push(`[리뷰&사진] 탭영역 text(일부): ${tabAreaText ? tabAreaText : "(없음)"}`);
-
-        const guess = this.extractMaxNumberFromLooseText(tabAreaText);
-        if (guess > 0) {
-          photoCount = guess;
-          logs.push(`[리뷰&사진] 탭영역 loose-number max로 photoCount 추정: ${photoCount}`);
-        }
-      }
-
-      // HTML 키 기반
-      if (photoCount === 0) {
-        const photoHtml = await page.content();
-
-        const htmlParsed = this.extractMaxNumber(photoHtml, [
-          /"photoCount"[\s":]+([0-9,]+)/gi,
-          /"businessPhotoCount"[\s":]+([0-9,]+)/gi,
-          /"placePhotoCount"[\s":]+([0-9,]+)/gi,
-          /업체사진\s*([0-9,]+)/gi,
-          /매장사진\s*([0-9,]+)/gi,
-          /방문자사진\s*([0-9,]+)/gi
-        ]);
-
-        if (htmlParsed > 0) {
-          photoCount = htmlParsed;
-          logs.push(`[리뷰&사진] HTML 키 기반 photoCount 파싱 성공: ${photoCount}`);
-        } else {
-          logs.push("[리뷰&사진] HTML 키 기반 photoCount 파싱 실패");
-        }
-      }
-
-      // ✅ 리스너 제거(중요)
+      // ✅ 리스너 제거
       page.off("response", net.onResponse);
 
-      // 오탐 컷
-      if (photoCount > 0 && photoCount < 5) {
-        logs.push(`[리뷰&사진] photoCount=${photoCount} 오탐 가능 → 0 처리`);
-        photoCount = 0;
-      }
-      if (photoCount === 5 && reviewCount >= 200) {
-        logs.push("[리뷰&사진] 사진=5 & 리뷰가 많음 → 탭 숫자 오탐으로 판단, 0 처리");
+      // 오탐 컷(너무 큰 값은 “업체사진”이 아닐 확률이 높음)
+      // 업종 공통으로 업체 등록 사진이 수천장은 거의 없음
+      if (photoCount > 3000) {
+        logs.push(`[리뷰&사진] photoCount=${photoCount} 비정상적으로 큼 → 오탐 처리(0)`);
         photoCount = 0;
       }
 
@@ -236,16 +156,12 @@ export class ReviewPhotoExtractor {
       return { reviewCount, photoCount, recentReviewCount30d, logs };
     } catch (e: any) {
       logs.push(`[리뷰&사진] 오류: ${e?.message || String(e)}`);
-      // 안전하게 리스너 제거 시도
-      try {
-        // no-op
-      } catch {}
       return { reviewCount: reviewCount || 0, photoCount: photoCount || 0, recentReviewCount30d, logs };
     }
   }
 
   // =========================
-  // ✅ 네트워크에서 photoCount 잡는 수집기
+  // ✅ 네트워크에서 “사진 관련 키”만 후보로 수집 (totalCount 금지)
   // =========================
   private static createPhotoNetworkCollector(placeId: string, logs: string[]) {
     const candidates: number[] = [];
@@ -255,52 +171,38 @@ export class ReviewPhotoExtractor {
       if (!Number.isFinite(num)) return;
       if (num <= 0 || num > 5000000) return;
       candidates.push(num);
-      // 로그는 너무 커지면 안되니 상위 몇개만
-      if (candidates.length <= 8) logs.push(`[NET] photoCount 후보 +${num} (${why}) @ ${url.slice(0, 140)}`);
+      if (candidates.length <= 10) logs.push(`[NET] photoKey 후보 +${num} (${why}) @ ${url.slice(0, 140)}`);
     };
 
-    const scanJson = (obj: any, url: string) => {
-      // 흔한 키 우선
-      const keyHits = [
-        "businessPhotoCount",
-        "placePhotoCount",
-        "photoCount",
-        "totalCount",
-        "total",
-        "count"
-      ];
+    const allowedKeys = new Set([
+      "businessPhotoCount",
+      "placePhotoCount",
+      "photoCount",
+      "businessPhotoTotalCount",
+      "placePhotoTotalCount"
+    ]);
 
-      for (const k of keyHits) {
-        if (obj && typeof obj === "object" && k in obj) {
-          pushCandidate((obj as any)[k], `key:${k}`, url);
-        }
+    const scanJson = (obj: any, url: string) => {
+      if (!obj || typeof obj !== "object") return;
+
+      // shallow
+      for (const k of Object.keys(obj)) {
+        if (allowedKeys.has(k)) pushCandidate((obj as any)[k], `key:${k}`, url);
       }
 
-      // 깊이 탐색(너무 깊으면 비용 큼 → depth 제한)
+      // deep (depth 제한)
       const walk = (v: any, depth: number) => {
-        if (depth > 4) return;
+        if (depth > 5) return;
         if (!v) return;
 
-        if (typeof v === "number") return;
-        if (typeof v === "string") return;
-
         if (Array.isArray(v)) {
-          for (const it of v.slice(0, 50)) walk(it, depth + 1);
+          for (const it of v.slice(0, 80)) walk(it, depth + 1);
           return;
         }
 
         if (typeof v === "object") {
-          const entries = Object.entries(v).slice(0, 80);
-          for (const [k, val] of entries) {
-            if (
-              k === "businessPhotoCount" ||
-              k === "placePhotoCount" ||
-              k === "photoCount" ||
-              k === "totalCount" ||
-              k === "total"
-            ) {
-              pushCandidate(val as any, `deepKey:${k}`, url);
-            }
+          for (const [k, val] of Object.entries(v).slice(0, 120)) {
+            if (allowedKeys.has(k)) pushCandidate(val as any, `deepKey:${k}`, url);
             walk(val, depth + 1);
           }
         }
@@ -310,18 +212,17 @@ export class ReviewPhotoExtractor {
     };
 
     const scanText = (text: string, url: string) => {
-      // json 텍스트에서 키-값 regex
+      // ✅ totalCount/total/count 금지. 오직 photo 관련 키만 regex로 잡는다.
       const patterns: Array<[RegExp, string]> = [
         [/"businessPhotoCount"\s*:\s*([0-9]{1,7})/g, "re:businessPhotoCount"],
         [/"placePhotoCount"\s*:\s*([0-9]{1,7})/g, "re:placePhotoCount"],
         [/"photoCount"\s*:\s*([0-9]{1,7})/g, "re:photoCount"],
-        [/"totalCount"\s*:\s*([0-9]{1,7})/g, "re:totalCount"],
-        [/"total"\s*:\s*([0-9]{1,7})/g, "re:total"]
+        [/"businessPhotoTotalCount"\s*:\s*([0-9]{1,7})/g, "re:businessPhotoTotalCount"],
+        [/"placePhotoTotalCount"\s*:\s*([0-9]{1,7})/g, "re:placePhotoTotalCount"]
       ];
 
       for (const [re, why] of patterns) {
-        const it = text.matchAll(re);
-        for (const m of it) {
+        for (const m of text.matchAll(re)) {
           if (m?.[1]) pushCandidate(parseInt(m[1], 10), why, url);
         }
       }
@@ -330,38 +231,25 @@ export class ReviewPhotoExtractor {
     const onResponse = async (res: Response) => {
       try {
         const url = res.url();
-
-        // 너무 광범위하면 비용/시간 증가 → 조건 걸기
-        // 1) placeId 포함 또는 2) photo 관련 단어 포함
         const u = url.toLowerCase();
-        const seemsRelated =
-          u.includes(String(placeId)) ||
-          u.includes("photo") ||
-          u.includes("image") ||
-          u.includes("media");
 
-        if (!seemsRelated) return;
+        // 너무 무관한 응답 제외 (placeId 또는 photo 관련만)
+        if (!u.includes(String(placeId)) && !u.includes("photo") && !u.includes("image") && !u.includes("media")) return;
 
-        const headers = res.headers();
-        const ct = String(headers["content-type"] || "").toLowerCase();
-
-        // json 또는 text만
-        if (!ct.includes("json") && !ct.includes("text")) return;
-
-        // 상태코드
+        const ct = String(res.headers()["content-type"] || "").toLowerCase();
         const status = res.status();
         if (status < 200 || status >= 400) return;
 
-        // json 우선
         if (ct.includes("json")) {
           const data = await res.json().catch(() => null);
           if (data) scanJson(data, url);
           return;
         }
 
-        // text fallback
-        const text = await res.text().catch(() => "");
-        if (text && text.length > 0) scanText(text, url);
+        if (ct.includes("text")) {
+          const text = await res.text().catch(() => "");
+          if (text) scanText(text, url);
+        }
       } catch {
         // ignore
       }
@@ -369,11 +257,66 @@ export class ReviewPhotoExtractor {
 
     const getBest = () => {
       if (!candidates.length) return 0;
-      // “사진 수”는 보통 꽤 큰 값. max가 그럴싸함.
+      // 사진 관련 키로만 들어오니 max가 대체로 안전
       return Math.max(...candidates);
     };
 
     return { onResponse, getBest };
+  }
+
+  // =========================
+  // ✅ 업체사진 필터/칩 클릭(탭이 아니라 “칩/버튼”일 수 있음)
+  // =========================
+  private static async clickBusinessPhotoChip(page: Page, logs: string[]): Promise<boolean> {
+    const labels = ["업체사진", "매장사진", "플레이스사진", "가게사진"];
+    const locators = [
+      // chips / buttons
+      (label: string) => page.locator("button, a, div[role='button'], span", { hasText: label }).first(),
+      // tabs
+      (label: string) => page.locator("a,button,div[role='tab']", { hasText: label }).first()
+    ];
+
+    for (const label of labels) {
+      for (const mk of locators) {
+        try {
+          const loc = mk(label);
+          const cnt = await loc.count().catch(() => 0);
+          if (cnt > 0) {
+            await loc.scrollIntoViewIfNeeded().catch(() => {});
+            await loc.click({ timeout: 1500 }).catch(() => {});
+            logs.push(`[리뷰&사진] 업체사진 필터 클릭 시도(${label}): OK`);
+            return true;
+          }
+        } catch {}
+      }
+    }
+    return false;
+  }
+
+  // =========================
+  // ✅ DOM 썸네일 카운트 (중복 제거)
+  // =========================
+  private static async countPhotoThumbnails(page: Page): Promise<number> {
+    try {
+      const urls: string[] = await page
+        .evaluate(() => {
+          const d = (globalThis as any).document;
+          if (!d) return [];
+          const imgs = Array.from(d.querySelectorAll("img")) as any[];
+          const srcs = imgs
+            .map((img) => String(img?.getAttribute?.("src") || img?.src || ""))
+            .filter((s) => s && s.length > 10)
+            // 아이콘/스프라이트 제외
+            .filter((s) => !s.includes("data:image") && !/sprite|icon/i.test(s));
+          // 중복 제거
+          return Array.from(new Set(srcs)).slice(0, 2000);
+        })
+        .catch(() => []);
+
+      return urls.length;
+    } catch {
+      return 0;
+    }
   }
 
   // =========================
@@ -420,68 +363,6 @@ export class ReviewPhotoExtractor {
         w?.scrollTo?.(0, 0);
       });
     } catch {}
-  }
-
-  private static async getTabText(page: Page, tabLabel: string): Promise<string> {
-    const candidates = [
-      page.locator("a,button,div[role='tab']", { hasText: tabLabel }).first(),
-      page.locator(`text=${tabLabel}`).first()
-    ];
-
-    for (const loc of candidates) {
-      try {
-        const cnt = await loc.count().catch(() => 0);
-        if (cnt > 0) {
-          const txt = await loc.textContent().catch(() => "");
-          if (txt && txt.trim()) return txt.trim();
-        }
-      } catch {}
-    }
-    return "";
-  }
-
-  private static async clickTab(page: Page, tabLabel: string): Promise<boolean> {
-    const loc = page.locator("a,button,div[role='tab']", { hasText: tabLabel }).first();
-    try {
-      const cnt = await loc.count().catch(() => 0);
-      if (cnt > 0) {
-        await loc.scrollIntoViewIfNeeded().catch(() => {});
-        await loc.click({ timeout: 1500 }).catch(() => {});
-        return true;
-      }
-    } catch {}
-    return false;
-  }
-
-  private static parseCountFromAnyText(text?: string | null, label?: string): number {
-    if (!text) return 0;
-    const t = String(text);
-
-    if (label) {
-      const m =
-        t.match(new RegExp(`${label}[^0-9]{0,12}([0-9][0-9,]{0,})`)) ||
-        t.match(/\(([0-9][0-9,]{0,})\)/);
-      if (m?.[1]) {
-        const n = parseInt(m[1].replace(/,/g, ""), 10);
-        return Number.isNaN(n) ? 0 : n;
-      }
-    }
-
-    return this.extractMaxNumberFromLooseText(t);
-  }
-
-  private static extractMaxNumberFromLooseText(text?: string | null): number {
-    if (!text) return 0;
-    const nums: number[] = [];
-    const matches = String(text).matchAll(/([0-9][0-9,]{0,})/g);
-    for (const m of matches) {
-      const raw = m?.[1];
-      if (!raw) continue;
-      const n = parseInt(raw.replace(/,/g, ""), 10);
-      if (!Number.isNaN(n) && n > 0 && n < 5000000) nums.push(n);
-    }
-    if (!nums.length) return 0;
-    return Math.max(...nums);
   }
 
   // =========================
