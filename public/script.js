@@ -1,6 +1,8 @@
 /* global document, window, fetch */
 
-const $ = (sel) => document.querySelector(sel);
+function $(id) {
+  return document.getElementById(id);
+}
 
 function escapeHtml(str) {
   return String(str ?? "")
@@ -23,89 +25,73 @@ function toNumber(v, def = 0) {
   return Number.isFinite(n) ? n : def;
 }
 
-function setText(sel, text) {
-  const el = $(sel);
+function setDisplay(id, show) {
+  const el = $(id);
+  if (!el) return;
+  el.style.display = show ? "" : "none";
+}
+
+function setText(id, text) {
+  const el = $(id);
   if (!el) return;
   el.textContent = text == null ? "" : String(text);
 }
 
-function setHtml(sel, html) {
-  const el = $(sel);
+function setHtml(id, html) {
+  const el = $(id);
   if (!el) return;
   el.innerHTML = html == null ? "" : String(html);
 }
 
-function renderChips(items) {
-  const arr = asArray(items).filter(Boolean);
+function renderTags(tags) {
+  const arr = asArray(tags).filter(Boolean);
   if (!arr.length) return `<div class="muted">없음</div>`;
-  return `<div class="chips">${arr.map((x) => `<span class="chip">${escapeHtml(x)}</span>`).join("")}</div>`;
+  return `<div class="keyword-tags">${arr
+    .map((t) => `<span class="keyword-tag">${escapeHtml(t)}</span>`)
+    .join("")}</div>`;
 }
 
 function renderPre(text) {
   const t = String(text ?? "").trim();
   if (!t) return `<div class="muted">없음</div>`;
-  return `<pre>${escapeHtml(t)}</pre>`;
+  return `<pre style="white-space:pre-wrap; margin:0;">${escapeHtml(t)}</pre>`;
 }
 
-function buildCard(title, bodyHtml) {
-  return `
-    <section class="card">
-      <h2>${escapeHtml(title)}</h2>
-      ${bodyHtml}
-    </section>
-  `;
-}
-
-function pick(obj, path, defVal = null) {
-  const parts = String(path).split(".");
-  let cur = obj;
-  for (const k of parts) {
-    if (cur && typeof cur === "object" && k in cur) cur = cur[k];
-    else return defVal;
-  }
-  return cur == null ? defVal : cur;
-}
-
-function normalizeResponse(serverJson) {
-  // 서버: { success, data, logs, message }
+function normalizeServerResponse(serverJson) {
+  // expected: { success, data, logs, message }
   const ok = !!serverJson?.success;
   const message = serverJson?.message || "";
   const logs = Array.isArray(serverJson?.logs) ? serverJson.logs : [];
-
   const data = serverJson?.data || {};
 
-  // place data
   const placeData = data.placeData || {};
-  const name = placeData.name || "";
-  const address = placeData.address || "";
-  const keywords = asArray(placeData.keywords || []);
-  const description = placeData.description || "";
-  const directions = placeData.directions || "";
-  const reviewCount = toNumber(placeData.reviewCount ?? placeData.reviewsTotal, 0);
-  const photoCount = toNumber(placeData.photoCount, 0);
-  const recent30d = toNumber(placeData.recentReviewCount30d ?? placeData.recent30d, 0);
-
-  // scores
-  const totalScore = toNumber(data.totalScore, 0);
-  const totalGrade = data.totalGrade || "";
-  const scores = data.scores || null;
-
-  // paid extras
-  const recommendedKeywords = asArray(data.recommendedKeywords || []);
-  const competitors = Array.isArray(data.competitors) ? data.competitors : [];
-  const unifiedText = data.unifiedText || "";
-
-  // improvements (paid)
-  const improvements = data.improvements || null;
-
-  return {
-    ok,
-    message,
-    logs,
-    placeData: { name, address, keywords, description, directions, reviewCount, photoCount, recent30d },
-    scoring: { totalScore, totalGrade, scores },
-    paid: { recommendedKeywords, competitors, unifiedText, improvements }
+  const place = {
+    name: placeData.name || "",
+    address: placeData.address || "",
+    keywords: asArray(placeData.keywords || []),
+    description: placeData.description || "",
+    directions: placeData.directions || "",
+    reviewCount: toNumber(placeData.reviewCount ?? placeData.reviewsTotal, 0),
+    photoCount: toNumber(placeData.photoCount, 0),
+    recent30d: toNumber(placeData.recentReviewCount30d ?? placeData.recent30d, 0)
   };
+
+  const scoring = {
+    totalScore: toNumber(data.totalScore, 0),
+    totalGrade: String(data.totalGrade || ""),
+    scores: data.scores || null
+  };
+
+  const paid = {
+    recommendedKeywords: asArray(data.recommendedKeywords || []),
+    competitors: Array.isArray(data.competitors) ? data.competitors : [],
+    unifiedText: String(data.unifiedText || ""),
+    improvements: data.improvements || null,
+    predictedAfter: data.predictedAfter || null,
+    attempts: toNumber(data.attempts, 0)
+  };
+
+  return { ok, message, logs, place, scoring, paid };
 }
 
 async function postJson(url, payload) {
@@ -125,157 +111,345 @@ async function postJson(url, payload) {
   return { res, json };
 }
 
-function getValueByAnyId(ids) {
-  for (const id of ids) {
-    const el = document.getElementById(id);
-    if (el && typeof el.value === "string") return el.value.trim();
-  }
-  return "";
+function showLoading() {
+  setDisplay("inputSection", false);
+  setDisplay("reportSection", false);
+  setDisplay("errorSection", false);
+  setDisplay("loadingSection", true);
 }
 
-async function analyze() {
-  // ✅ 다양한 UI 버전 대응 (id가 조금 달라도 동작)
-  const placeUrl = getValueByAnyId(["placeUrl", "url", "place_url"]);
-  const plan = (getValueByAnyId(["plan", "mode"]) || "free").toLowerCase();
-  const industry = (getValueByAnyId(["industry"]) || "hairshop").toLowerCase();
-  const searchQuery = getValueByAnyId(["searchQuery", "query", "competitorQuery"]);
+function showReport() {
+  setDisplay("loadingSection", false);
+  setDisplay("errorSection", false);
+  setDisplay("reportSection", true);
+}
 
-  if (!placeUrl) {
-    alert("플레이스 주소를 입력해줘.");
-    return;
+function showError(msg) {
+  setDisplay("loadingSection", false);
+  setDisplay("reportSection", false);
+  setDisplay("errorSection", true);
+  setText("errorMessage", msg || "알 수 없는 오류");
+}
+
+function clearReportSections() {
+  setHtml("categoryScores", "");
+  setHtml("improvementsSection", "");
+  setHtml("competitorsSection", "");
+  setHtml("debugLogs", "");
+
+  setDisplay("upgradeSection", false);
+  setDisplay("improvementsSection", false);
+  setDisplay("competitorsSection", false);
+  setDisplay("debugSection", false);
+}
+
+function gradeBadgeClass(grade) {
+  // CSS가 따로 있다면 여기를 맞춰도 됨. 없으면 기본
+  const g = String(grade || "").toUpperCase();
+  if (g === "S") return "grade-s";
+  if (g === "A") return "grade-a";
+  if (g === "B") return "grade-b";
+  if (g === "C") return "grade-c";
+  return "grade-d";
+}
+
+function renderCategoryScores(scoresObj) {
+  const scores = scoresObj && typeof scoresObj === "object" ? scoresObj : {};
+  const entries = Object.entries(scores);
+
+  if (!entries.length) {
+    return `<div class="muted">세부 점수 데이터가 없습니다.</div>`;
   }
 
-  // ✅ paid면 searchQuery 필수
-  if (plan === "paid" && !searchQuery) {
-    alert("유료 진단은 경쟁사 분석용 '검색어'가 필요해. (예: 서대문역 미용실)");
-    return;
-  }
+  // 점수 객체 구조가 어떻든 "label/value/priority"처럼 최대한 보여주기
+  return entries
+    .map(([key, val]) => {
+      let score = 0;
+      let grade = "";
+      let comment = "";
 
-  setText("#status", "분석 중...");
-  setHtml("#result", "");
+      if (typeof val === "number") {
+        score = val;
+      } else if (val && typeof val === "object") {
+        score = toNumber(val.score ?? val.value ?? val.points ?? 0, 0);
+        grade = String(val.grade ?? "");
+        comment = String(val.message ?? val.comment ?? "");
+      }
 
-  const endpoint = plan === "paid" ? "/api/diagnose/paid" : "/api/diagnose/free";
-  const payload = plan === "paid"
-    ? { placeUrl, industry, searchQuery }
-    : { placeUrl, industry };
+      return `
+        <div class="category-card">
+          <div class="category-top">
+            <div class="category-name">${escapeHtml(key)}</div>
+            <div class="category-score">${escapeHtml(score)}</div>
+          </div>
+          ${grade ? `<div class="category-grade">${escapeHtml(grade)}</div>` : ""}
+          ${comment ? `<div class="category-comment">${escapeHtml(comment)}</div>` : ""}
+        </div>
+      `;
+    })
+    .join("");
+}
 
-  let res, json;
-  try {
-    const r = await postJson(endpoint, payload);
-    res = r.res;
-    json = r.json;
-  } catch (e) {
-    setText("#status", "실패");
-    setHtml("#result", `<pre>${escapeHtml(String(e?.message || e))}</pre>`);
-    return;
-  }
+function renderDebugLogs(logs) {
+  const arr = asArray(logs);
+  if (!arr.length) return `<div class="muted">로그 없음</div>`;
+  return arr.map((l) => `<div class="log-line">${escapeHtml(l)}</div>`).join("");
+}
 
-  if (!res.ok || !json) {
-    setText("#status", "실패");
-    setHtml("#result", `<pre>${escapeHtml(JSON.stringify(json || { success: false, message: "응답 없음" }, null, 2))}</pre>`);
-    return;
-  }
+function renderPaidImprovementsUI(paid) {
+  const rec5 = asArray(paid.recommendedKeywords).slice(0, 5);
 
-  const n = normalizeResponse(json);
+  // ✅ 추가추천키워드/10개 섹션은 "아예" 없음 (요구사항 반영)
+  const parts = [];
 
-  if (!n.ok) {
-    setText("#status", "실패");
-    setHtml("#result", `
-      ${buildCard("오류", `<pre>${escapeHtml(n.message || "진단 실패")}</pre>`)}
-      ${buildCard("디버그 원본", `<pre>${escapeHtml(JSON.stringify(json, null, 2))}</pre>`)}
-    `);
-    return;
-  }
-
-  setText("#status", "완료");
-
-  const html = [];
-
-  html.push(
-    buildCard("기본 정보", `
-      <div><b>상호</b>: ${escapeHtml(n.placeData.name)}</div>
-      <div><b>주소</b>: ${escapeHtml(n.placeData.address)}</div>
-      <div style="margin-top:8px;"><b>리뷰</b>: ${escapeHtml(n.placeData.reviewCount)} (최근30일 ${escapeHtml(n.placeData.recent30d)})</div>
-      <div><b>사진 수</b>: ${escapeHtml(n.placeData.photoCount)}</div>
-    `)
-  );
-
-  html.push(
-    buildCard("추출 대표키워드", renderChips(n.placeData.keywords))
-  );
-
-  html.push(
-    buildCard("상세설명", renderPre(n.placeData.description))
-  );
-
-  html.push(
-    buildCard("오시는길", renderPre(n.placeData.directions))
-  );
-
-  html.push(
-    buildCard("점수", `
-      <div><b>Total</b>: ${escapeHtml(n.scoring.totalScore)}점 / ${escapeHtml(n.scoring.totalGrade)}</div>
-      <details style="margin-top:10px;">
-        <summary>세부 점수 보기</summary>
-        <pre>${escapeHtml(JSON.stringify(n.scoring.scores, null, 2))}</pre>
-      </details>
-    `)
-  );
-
-  if (plan === "paid") {
-    // ✅ 추천 대표키워드 5개
-    html.push(buildCard("추천 대표키워드 (5개)", renderChips(n.paid.recommendedKeywords)));
-
-    // ✅ 유료 통합본
-    if (n.paid.unifiedText && String(n.paid.unifiedText).trim()) {
-      html.push(buildCard("유료 컨설팅 통합본", renderPre(n.paid.unifiedText)));
-    }
-
-    // 경쟁사
-    if (n.paid.competitors && n.paid.competitors.length) {
-      const list = n.paid.competitors.map((c) => {
-        const name = c?.name ? String(c.name) : "경쟁사";
-        const addr = c?.address ? String(c.address) : "";
-        const rc = toNumber(c?.reviewCount, 0);
-        const pc = toNumber(c?.photoCount, 0);
-        const kws = asArray(c?.keywords || []).slice(0, 5).join(", ");
-        return `• ${name}${addr ? " / " + addr : ""} (리뷰 ${rc}, 사진 ${pc})\n  - ${kws}`;
-      }).join("\n");
-
-      html.push(buildCard("경쟁사 (best effort)", `<pre>${escapeHtml(list)}</pre>`));
-    } else {
-      html.push(buildCard("경쟁사", `<div class="muted">경쟁사 데이터를 가져오지 못했습니다.</div>`));
-    }
-  }
-
-  // 로그/원본 (문제 생기면 이거 복사해서 보내면 됨)
-  html.push(buildCard("크롤링 로그", `<pre>${escapeHtml((n.logs || []).join("\n"))}</pre>`));
-
-  html.push(`
-    <section class="card">
-      <details>
-        <summary>서버 원본 JSON 보기</summary>
-        <pre>${escapeHtml(JSON.stringify(json, null, 2))}</pre>
-      </details>
-    </section>
+  parts.push(`
+    <div class="improvement-card">
+      <h3>✅ 추천 대표키워드 (5개)</h3>
+      ${renderTags(rec5)}
+    </div>
   `);
 
-  setHtml("#result", html.join("\n"));
+  if (paid.unifiedText && paid.unifiedText.trim()) {
+    parts.push(`
+      <div class="improvement-card">
+        <h3>📌 유료 컨설팅 통합본 (복사-붙여넣기)</h3>
+        <div class="copy-block">${renderPre(paid.unifiedText)}</div>
+      </div>
+    `);
+  }
+
+  // improvements 구조가 있으면 보여주기 (description/directions/keywords 등)
+  const imp = paid.improvements || null;
+  if (imp && typeof imp === "object") {
+    if (imp.description) {
+      parts.push(`
+        <div class="improvement-card">
+          <h3>상세설명 개선안</h3>
+          ${renderPre(imp.description)}
+        </div>
+      `);
+    }
+    if (imp.directions) {
+      parts.push(`
+        <div class="improvement-card">
+          <h3>오시는길 개선안</h3>
+          ${renderPre(imp.directions)}
+        </div>
+      `);
+    }
+    if (Array.isArray(imp.keywords) && imp.keywords.length) {
+      parts.push(`
+        <div class="improvement-card">
+          <h3>키워드(유료 결과)</h3>
+          ${renderTags(imp.keywords.slice(0, 5))}
+        </div>
+      `);
+    }
+    if (imp.competitorKeywordInsights) {
+      parts.push(`
+        <div class="improvement-card">
+          <h3>경쟁사 키워드 인사이트</h3>
+          ${renderPre(imp.competitorKeywordInsights)}
+        </div>
+      `);
+    }
+    if (imp.priceGuidance) {
+      parts.push(`
+        <div class="improvement-card">
+          <h3>가격/메뉴 가이드</h3>
+          ${renderPre(imp.priceGuidance)}
+        </div>
+      `);
+    }
+  }
+
+  return parts.join("\n");
 }
 
-function bind() {
-  // ✅ 버튼 클릭
-  const btn = $("#analyzeBtn") || $("#diagnoseBtn") || document.querySelector('[data-action="analyze"]');
-  if (btn) btn.addEventListener("click", analyze);
+function renderCompetitorsUI(competitors) {
+  const list = Array.isArray(competitors) ? competitors : [];
+  if (!list.length) {
+    return `
+      <div class="improvement-card">
+        <h3>경쟁사 Top 5</h3>
+        <div class="muted">경쟁사 데이터를 가져오지 못했습니다.</div>
+      </div>
+    `;
+  }
 
-  // ✅ 폼 submit도 지원
-  const form = document.querySelector("form");
-  if (form) {
-    form.addEventListener("submit", (e) => {
-      e.preventDefault();
-      analyze();
-    });
+  return `
+    <div class="improvement-card">
+      <h3>🏁 경쟁사 Top ${list.length}</h3>
+      <div class="competitor-list">
+        ${list
+          .map((c) => {
+            const name = c?.name ? String(c.name) : "경쟁사";
+            const address = c?.address ? String(c.address) : "";
+            const reviewCount = toNumber(c?.reviewCount, 0);
+            const photoCount = toNumber(c?.photoCount, 0);
+            const keywords = asArray(c?.keywords || []).slice(0, 5);
+
+            return `
+              <div class="competitor-card">
+                <div class="competitor-name">${escapeHtml(name)}</div>
+                ${address ? `<div class="competitor-address">${escapeHtml(address)}</div>` : ""}
+                <div class="competitor-meta">리뷰 ${escapeHtml(reviewCount)} · 사진 ${escapeHtml(photoCount)}</div>
+                <div class="competitor-keywords">${renderTags(keywords)}</div>
+              </div>
+            `;
+          })
+          .join("")}
+      </div>
+    </div>
+  `;
+}
+
+function fillCommonReport(n) {
+  // place header
+  setText("placeName", n.place.name || "-");
+  setText("placeAddress", n.place.address || "-");
+
+  // total score
+  setText("totalScore", n.scoring.totalScore || 0);
+  setText("totalGrade", n.scoring.totalGrade || "-");
+
+  const badge = $("totalGradeBadge");
+  if (badge) {
+    badge.className = "grade-badge " + gradeBadgeClass(n.scoring.totalGrade);
+  }
+
+  // category scores
+  setHtml("categoryScores", renderCategoryScores(n.scoring.scores));
+
+  // debug logs
+  setHtml("debugLogs", renderDebugLogs(n.logs));
+  setDisplay("debugSection", true);
+}
+
+async function diagnose(mode) {
+  const placeUrl = ($("placeUrl")?.value || "").trim();
+  const industry = ($("industrySelect")?.value || "hairshop").trim();
+
+  if (!placeUrl) {
+    alert("네이버 플레이스 URL을 입력하세요.");
+    return;
+  }
+
+  showLoading();
+  clearReportSections();
+
+  try {
+    if (mode === "paid") {
+      // ✅ 유료는 searchQuery가 필요
+      // UI에 입력칸이 없으니: 기본값으로 "역/지역 + 업종" 조합을 자동 생성
+      const placeText = placeUrl;
+      const defaultQuery =
+        industry === "hairshop"
+          ? "서대문역 미용실"
+          : industry === "cafe"
+          ? "서대문역 카페"
+          : "서대문역 맛집";
+
+      const payload = {
+        placeUrl: placeText,
+        industry,
+        searchQuery: defaultQuery
+      };
+
+      const { res, json } = await postJson("/api/diagnose/paid", payload);
+
+      if (!res.ok || !json) {
+        showError("서버 응답이 올바르지 않습니다. (paid)");
+        return;
+      }
+
+      const n = normalizeServerResponse(json);
+
+      if (!n.ok) {
+        showError(n.message || "유료 진단 실패");
+        // debug
+        setHtml("debugLogs", `<pre>${escapeHtml(JSON.stringify(json, null, 2))}</pre>`);
+        setDisplay("debugSection", true);
+        return;
+      }
+
+      showReport();
+      fillCommonReport(n);
+
+      // paid sections
+      setHtml("improvementsSection", renderPaidImprovementsUI(n.paid));
+      setDisplay("improvementsSection", true);
+
+      setHtml("competitorsSection", renderCompetitorsUI(n.paid.competitors));
+      setDisplay("competitorsSection", true);
+
+      setDisplay("upgradeSection", false);
+
+      return;
+    }
+
+    // free
+    const payload = { placeUrl, industry };
+    const { res, json } = await postJson("/api/diagnose/free", payload);
+
+    if (!res.ok || !json) {
+      showError("서버 응답이 올바르지 않습니다. (free)");
+      return;
+    }
+
+    const n = normalizeServerResponse(json);
+
+    if (!n.ok) {
+      showError(n.message || "무료 진단 실패");
+      setHtml("debugLogs", `<pre>${escapeHtml(JSON.stringify(json, null, 2))}</pre>`);
+      setDisplay("debugSection", true);
+      return;
+    }
+
+    showReport();
+    fillCommonReport(n);
+
+    // ✅ 무료 진단 후 업셀 섹션 표시
+    setDisplay("upgradeSection", true);
+    setDisplay("improvementsSection", false);
+    setDisplay("competitorsSection", false);
+  } catch (e) {
+    showError(String(e?.message || e));
+  } finally {
+    setDisplay("loadingSection", false);
   }
 }
 
-window.addEventListener("DOMContentLoaded", bind);
+/* ====== index.html에서 직접 호출하는 함수들 ====== */
+window.diagnoseFree = function diagnoseFree() {
+  return diagnose("free");
+};
+
+window.diagnosePaid = function diagnosePaid() {
+  // 모달 닫고 실행
+  window.closePaidModal();
+  return diagnose("paid");
+};
+
+window.resetDiagnosis = function resetDiagnosis() {
+  // 입력 화면으로 복귀
+  setDisplay("reportSection", false);
+  setDisplay("loadingSection", false);
+  setDisplay("errorSection", false);
+  setDisplay("inputSection", true);
+
+  // 결과 초기화
+  clearReportSections();
+  setText("placeName", "-");
+  setText("placeAddress", "-");
+  setText("totalScore", "-");
+  setText("totalGrade", "-");
+};
+
+window.showPaidModal = function showPaidModal() {
+  setDisplay("paidModal", true);
+};
+
+window.closePaidModal = function closePaidModal() {
+  setDisplay("paidModal", false);
+};
