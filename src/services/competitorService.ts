@@ -15,94 +15,6 @@ function uniq<T>(arr: T[]) {
   return Array.from(new Set(arr));
 }
 
-function isPlaceIdLike(v: unknown): v is string | number {
-  if (typeof v === "number") {
-    // 5~12자리 숫자
-    return Number.isInteger(v) && v >= 10000 && v <= 999999999999;
-  }
-  if (typeof v === "string") {
-    const s = v.trim();
-    return /^\d{5,12}$/.test(s);
-  }
-  return false;
-}
-
-function toPlaceIdString(v: string | number): string {
-  return typeof v === "number" ? String(v) : v.trim();
-}
-
-/**
- * ✅ allSearch JSON에서 placeId를 "재귀적으로" 수집
- * - key가 id/placeId/bizId 등으로 다양할 수 있음
- * - 숫자(number)로 오는 케이스도 포함
- */
-function collectPlaceIdsFromJson(json: any): string[] {
-  const out: string[] = [];
-  const seen = new Set<any>();
-
-  const goodKey = (k: string) => {
-    const low = k.toLowerCase();
-    // place 관련 id 후보들
-    return (
-      low === "placeid" ||
-      low.endsWith("placeid") ||
-      low === "id" ||
-      low.endsWith("id") ||
-      low.includes("bizid") ||
-      low.includes("place_id")
-    );
-  };
-
-  const walk = (node: any, parentKey?: string) => {
-    if (node == null) return;
-    if (typeof node !== "object") return;
-    if (seen.has(node)) return;
-    seen.add(node);
-
-    if (Array.isArray(node)) {
-      for (const item of node) walk(item, parentKey);
-      return;
-    }
-
-    for (const [k, v] of Object.entries(node)) {
-      // 1) 키 기반 id 후보
-      if (goodKey(k) && isPlaceIdLike(v)) {
-        out.push(toPlaceIdString(v as any));
-      }
-
-      // 2) value가 객체/배열이면 계속 순회
-      if (v && typeof v === "object") {
-        walk(v, k);
-      } else {
-        // 3) 아주 드물게 URL 문자열에 /place/1234 패턴이 들어올 수 있어 regex도 한번
-        if (typeof v === "string" && v.includes("/place/")) {
-          const m = v.match(/\/place\/(\d{5,12})/);
-          if (m?.[1]) out.push(m[1]);
-        }
-      }
-    }
-  };
-
-  walk(json);
-  return uniq(out);
-}
-
-async function fetchText(url: string, extraHeaders?: Record<string, string>) {
-  const res = await fetch(url, {
-    method: "GET",
-    headers: {
-      "user-agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      "accept-language": "ko-KR,ko;q=0.9,en;q=0.7",
-      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      ...extraHeaders
-    }
-  });
-
-  const text = await res.text();
-  return { ok: res.ok, status: res.status, text, finalUrl: res.url };
-}
-
 async function fetchJson(url: string, extraHeaders?: Record<string, string>) {
   const res = await fetch(url, {
     method: "GET",
@@ -126,8 +38,28 @@ async function fetchJson(url: string, extraHeaders?: Record<string, string>) {
 }
 
 function buildCompetitorUrl(placeId: string) {
-  // slug 없이도 리다이렉트 되게 /place/{id}/home로 통일
   return `https://m.place.naver.com/place/${placeId}/home`;
+}
+
+/**
+ * ✅ JSON 전체에서 5~12자리 숫자 후보를 전부 수집
+ * - placeId가 어떤 키에 들어있든 관계없이 문자열/숫자 모두 긁어옴
+ * - 후보가 많을 수 있으니 상위 일부만 사용
+ */
+function collectIdCandidatesFromAnyJson(json: any): string[] {
+  if (!json) return [];
+
+  let s = "";
+  try {
+    s = JSON.stringify(json);
+  } catch {
+    s = "";
+  }
+  if (!s) return [];
+
+  // 5~12자리 숫자 후보 전부
+  const ids = s.match(/\b\d{5,12}\b/g) || [];
+  return uniq(ids);
 }
 
 export class CompetitorService {
@@ -144,93 +76,106 @@ export class CompetitorService {
     } catch {}
   }
 
+  /**
+   * ✅ 검색어로 경쟁사 placeId 후보 뽑기 (best-effort)
+   * - 현재 환경(Railway)에서 m.map.naver.com 은 500이 뜰 수 있어
+   * - m.place.naver.com/search 도 404인 케이스가 있어
+   * - 그래서 map.naver.com/p/api/search/* JSON을 주력으로 씀
+   */
   async findTopPlaceIds(query: string, excludePlaceId: string, limit = 5): Promise<string[]> {
     const q = (query || "").trim();
     if (!q) return [];
 
     const encoded = encodeURIComponent(q);
 
-    // #1, #2는 지금 로그상 막히므로 그대로 두되, 실질적으로 #3가 메인
-    const url1 = `https://m.map.naver.com/search2/search.naver?query=${encoded}`;
-    console.log("[COMP][findTopPlaceIds] try #1:", url1);
+    // ✅ 엔드포인트 여러 개 시도 (구조가 바뀌어도 하나는 살아남게)
+    const candidatesUrls = [
+      `https://map.naver.com/p/api/search/allSearch?query=${encoded}&type=all&displayCount=50`,
+      `https://map.naver.com/p/api/search/allSearch?query=${encoded}&type=place&displayCount=50`,
+      `https://map.naver.com/p/api/search/allSearch?query=${encoded}&type=local&displayCount=50`
+    ];
 
-    try {
-      const r1 = await fetchText(url1);
-      console.log("[COMP][#1] status:", r1.status, "final:", r1.finalUrl, "len:", r1.text?.length || 0);
-      // 막히면 len 0으로 끝날 것
-    } catch (e: any) {
-      console.log("[COMP][#1] error:", e?.message || String(e));
-    }
+    for (let i = 0; i < candidatesUrls.length; i++) {
+      const url = candidatesUrls[i];
+      console.log(`[COMP][findTopPlaceIds] try #${i + 1} (json):`, url);
 
-    const url2 = `https://m.place.naver.com/search?query=${encoded}`;
-    console.log("[COMP][findTopPlaceIds] try #2:", url2);
-
-    try {
-      const r2 = await fetchText(url2);
-      console.log("[COMP][#2] status:", r2.status, "final:", r2.finalUrl, "len:", r2.text?.length || 0);
-    } catch (e: any) {
-      console.log("[COMP][#2] error:", e?.message || String(e));
-    }
-
-    // ✅ 메인: allSearch JSON
-    const url3 = `https://map.naver.com/p/api/search/allSearch?query=${encoded}&type=all&searchCoord=&boundary=&displayCount=${Math.max(
-      limit * 4,
-      20
-    )}`;
-    console.log("[COMP][findTopPlaceIds] try #3 (json):", url3);
-
-    try {
-      const r3 = await fetchJson(url3, {
-        referer: "https://map.naver.com/",
-        "x-requested-with": "XMLHttpRequest"
-      });
-
-      console.log("[COMP][#3] status:", r3.status, "final:", r3.finalUrl);
-
-      if (!r3.ok || !r3.json) {
-        console.log("[COMP][#3] no json (parse fail or non-ok)");
-        return [];
-      }
-
-      // ✅ 여기 핵심
-      let ids = collectPlaceIdsFromJson(r3.json);
-
-      // exclude + 정리
-      ids = ids.filter((id) => id !== excludePlaceId);
-
-      // 너무 많이 나오면 앞에서 limit*5까지만 (잡음 id 섞일 수 있음)
-      ids = ids.slice(0, Math.max(limit * 5, 25));
-
-      // 최종 unique + limit
-      ids = uniq(ids);
-
-      console.log("[COMP][#3] extracted ids:", ids.length, ids.slice(0, 15));
-      return ids.slice(0, limit);
-    } catch (e: any) {
-      console.log("[COMP][#3] error:", e?.message || String(e));
-    }
-
-    console.log("[COMP][findTopPlaceIds] no ids found for query:", q);
-    return [];
-  }
-
-  async crawlCompetitorsByIds(placeIds: string[], industry: Industry, limit = 5): Promise<Competitor[]> {
-    const ids = (placeIds || []).filter(Boolean).slice(0, limit);
-    if (!ids.length) return [];
-
-    const out: Competitor[] = [];
-
-    for (const id of ids) {
       try {
-        const url = buildCompetitorUrl(id);
-        console.log("[COMP][crawl] start:", id, url);
+        const r = await fetchJson(url, {
+          referer: "https://map.naver.com/",
+          "x-requested-with": "XMLHttpRequest"
+        });
 
-        const r = await this.crawler.crawlPlace(url);
-        if (!r?.success || !r?.data) {
-          console.log("[COMP][crawl] fail:", id, r?.error || "no data");
+        console.log(`[COMP][#${i + 1}] status:`, r.status, "final:", r.finalUrl);
+
+        if (!r.ok || !r.json) {
+          console.log(`[COMP][#${i + 1}] json parse fail or non-ok`);
           continue;
         }
 
+        // ✅ 디버깅 로그(구조 파악용) — 너무 길게 안 찍고 앞부분만
+        try {
+          const topKeys = typeof r.json === "object" && !Array.isArray(r.json) ? Object.keys(r.json).slice(0, 20) : [];
+          console.log(`[COMP][#${i + 1}] topKeys:`, topKeys);
+
+          const snippet = JSON.stringify(r.json).slice(0, 600);
+          console.log(`[COMP][#${i + 1}] jsonSnippet(600):`, snippet);
+        } catch {}
+
+        let ids = collectIdCandidatesFromAnyJson(r.json);
+
+        // 내 placeId 제외
+        ids = ids.filter((id) => id !== excludePlaceId);
+
+        // 후보가 너무 많으면 일부만(크롤링 시도 비용 절감)
+        ids = ids.slice(0, 80);
+
+        console.log(`[COMP][#${i + 1}] extracted id candidates:`, ids.length, ids.slice(0, 20));
+
+        if (ids.length) {
+          // 여기서는 "후보"만 반환 — 실제 유효성은 crawlCompetitorsByIds에서 검증
+          return ids.slice(0, Math.max(limit * 5, 25));
+        }
+      } catch (e: any) {
+        console.log(`[COMP][#${i + 1}] error:`, e?.message || String(e));
+      }
+    }
+
+    console.log("[COMP][findTopPlaceIds] no candidates found for query:", q);
+    return [];
+  }
+
+  /**
+   * ✅ 후보 placeId들을 실제로 크롤링해서 "성공한 애들만" 경쟁사로 확정
+   * - candidates에 쓰레기 숫자가 섞여 있어도 상관 없음 (실패하면 버림)
+   */
+  async crawlCompetitorsByIds(placeIds: string[], industry: Industry, limit = 5): Promise<Competitor[]> {
+    const candidates = (placeIds || []).filter(Boolean);
+
+    if (!candidates.length) return [];
+
+    const out: Competitor[] = [];
+    const tried = new Set<string>();
+
+    for (const id of candidates) {
+      if (out.length >= limit) break;
+      if (tried.has(id)) continue;
+      tried.add(id);
+
+      // 너무 짧거나 너무 길면 스킵
+      if (!/^\d{5,12}$/.test(id)) continue;
+
+      try {
+        const url = buildCompetitorUrl(id);
+        console.log("[COMP][crawl] try:", id, url);
+
+        const r = await this.crawler.crawlPlace(url);
+
+        if (!r?.success || !r?.data?.name) {
+          // invalid id candidate
+          continue;
+        }
+
+        // name/address가 있는 정상 place만 채택
         out.push({
           placeId: id,
           url,
@@ -241,12 +186,13 @@ export class CompetitorService {
           photoCount: Number(r.data.photoCount || 0)
         });
 
-        console.log("[COMP][crawl] ok:", id, r.data?.name || "");
+        console.log("[COMP][crawl] ok:", id, r.data.name);
       } catch (e: any) {
         console.log("[COMP][crawl] error:", id, e?.message || String(e));
       }
     }
 
+    console.log("[COMP][crawl] final competitors:", out.length);
     return out;
   }
 }
