@@ -7,7 +7,9 @@ let currentPlaceUrl = '';
 // (옵션) 업종 저장 (index.html에 industrySelect가 없으면 자동 hairshop)
 let currentIndustry = 'hairshop';
 
-// URL 변환 함수 (프론트엔드)
+/* ---------------------------
+   URL 변환 함수 (프론트엔드)
+---------------------------- */
 function convertToMobileUrl(url) {
   try {
     if (!url) return '';
@@ -15,54 +17,39 @@ function convertToMobileUrl(url) {
     const urlObj = new URL(url);
 
     // 이미 모바일 URL인 경우
-    if (urlObj.hostname === 'm.place.naver.com') {
-      return url;
-    }
+    if (urlObj.hostname === 'm.place.naver.com') return url;
 
     // place ID 추출
     let placeId = null;
 
-    // 1. /entry/place/1234567 형식
     const entryMatch = url.match(/\/entry\/place\/(\d+)/);
-    if (entryMatch && entryMatch[1]) {
-      placeId = entryMatch[1];
-    }
+    if (entryMatch && entryMatch[1]) placeId = entryMatch[1];
 
-    // 2. place.naver.com/xxx/1234567
     if (!placeId) {
       const placeMatch = url.match(/place\.naver\.com\/[^/]+\/(\d+)/);
-      if (placeMatch && placeMatch[1]) {
-        placeId = placeMatch[1];
-      }
+      if (placeMatch && placeMatch[1]) placeId = placeMatch[1];
     }
 
-    // 3. ?place=1234567
     if (!placeId) {
       const paramMatch = url.match(/[?&]place=(\d+)/);
-      if (paramMatch && paramMatch[1]) {
-        placeId = paramMatch[1];
-      }
+      if (paramMatch && paramMatch[1]) placeId = paramMatch[1];
     }
 
-    // 4. 일반 숫자
     if (!placeId) {
       const numberMatch = url.match(/(\d{7,})/);
-      if (numberMatch && numberMatch[1]) {
-        placeId = numberMatch[1];
-      }
+      if (numberMatch && numberMatch[1]) placeId = numberMatch[1];
     }
 
-    if (placeId) {
-      return `https://m.place.naver.com/place/${placeId}`;
-    }
-
+    if (placeId) return `https://m.place.naver.com/place/${placeId}`;
     return url;
   } catch (error) {
     return url;
   }
 }
 
-// 섹션 표시 함수
+/* ---------------------------
+   섹션/에러/초기화
+---------------------------- */
 function showSection(sectionId) {
   const sections = ['inputSection', 'loadingSection', 'reportSection', 'errorSection'];
   sections.forEach(id => {
@@ -71,19 +58,16 @@ function showSection(sectionId) {
   });
 }
 
-// 오류 표시
 function showError(message) {
   document.getElementById('errorMessage').textContent = message;
   showSection('errorSection');
 }
 
-// 진단 초기화
 function resetDiagnosis() {
   document.getElementById('placeUrl').value = '';
   currentPlaceUrl = '';
   showSection('inputSection');
 
-  // 유료 섹션 리셋
   const upgrade = document.getElementById('upgradeSection');
   const imp = document.getElementById('improvementsSection');
   const comp = document.getElementById('competitorsSection');
@@ -97,14 +81,15 @@ function resetDiagnosis() {
     comp.innerHTML = '';
   }
 
-  // 로그 리셋
   const debugSection = document.getElementById('debugSection');
   const debugLogs = document.getElementById('debugLogs');
   if (debugSection) debugSection.style.display = 'none';
   if (debugLogs) debugLogs.innerHTML = '';
 }
 
-// 무료 진단
+/* ---------------------------
+   무료 진단
+---------------------------- */
 async function diagnoseFree() {
   const placeUrl = document.getElementById('placeUrl').value.trim();
   const industrySel = document.getElementById('industrySelect');
@@ -122,14 +107,12 @@ async function diagnoseFree() {
     const response = await fetch(`${API_BASE}/api/diagnose/free`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // ✅ industry도 함께 보내면 서버 업종별 점수에 바로 반영 가능
       body: JSON.stringify({ placeUrl, industry: currentIndustry })
     });
 
     const result = await response.json().catch(() => ({}));
 
     if (!response.ok) {
-      // 오류 발생 시에도 로그 표시
       if (result.logs) {
         displayLogs(result.logs);
         showSection('reportSection');
@@ -141,36 +124,44 @@ async function diagnoseFree() {
 
     displayReport(result.data, false);
 
-    // 로그 표시
-    if (result.logs) {
-      displayLogs(result.logs);
-    }
+    if (result.logs) displayLogs(result.logs);
   } catch (error) {
     console.error('Error:', error);
     showError(error.message);
   }
 }
 
-// 유료 진단 모달 표시
+/* ---------------------------
+   유료 모달
+---------------------------- */
 function showPaidModal() {
-  document.getElementById('paidModal').style.display = 'flex';
+  const modal = document.getElementById('paidModal');
+  modal.style.display = 'flex';
+
+  // ✅ 입력창이 안 보이는 문제를 JS로 강제 보정
+  const input = document.getElementById('searchQuery');
+  if (input) {
+    input.style.display = 'block';
+    input.style.visibility = 'visible';
+    input.style.opacity = '1';
+    input.style.height = 'auto';
+    input.style.pointerEvents = 'auto';
+
+    // UX: 바로 입력 가능하게 포커스
+    setTimeout(() => input.focus(), 50);
+  }
 }
 
-// 유료 진단 모달 닫기
 function closePaidModal() {
   document.getElementById('paidModal').style.display = 'none';
 }
 
-// 유료 진단
+/* ---------------------------
+   유료 진단
+---------------------------- */
 async function diagnosePaid() {
-  // ✅ 기존 UI(검색어 입력) 유지: 서버가 searchQuery를 안 쓰더라도 프론트는 그대로 보냄
   const searchQueryEl = document.getElementById('searchQuery');
   const searchQuery = searchQueryEl ? searchQueryEl.value.trim() : '';
-
-  if (!searchQuery) {
-    alert('경쟁사 분석을 위한 검색어를 입력해주세요\n(예: 강남 카페, 이태원 맛집)');
-    return;
-  }
 
   if (!currentPlaceUrl) {
     alert('플레이스 URL이 없습니다. 다시 시도해주세요.');
@@ -182,6 +173,8 @@ async function diagnosePaid() {
   const industrySel = document.getElementById('industrySelect');
   currentIndustry = industrySel ? industrySel.value : (currentIndustry || 'hairshop');
 
+  // ✅ 검색어는 "선택"으로 변경 (없어도 진행)
+  // 경쟁사 분석을 서버에서 searchQuery로만 한다면, 그때만 다시 필수로 바꾸면 됨.
   closePaidModal();
   showSection('loadingSection');
 
@@ -191,8 +184,8 @@ async function diagnosePaid() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         placeUrl: currentPlaceUrl,
-        industry: currentIndustry, // ✅ 추가
-        searchQuery // ✅ 유지
+        industry: currentIndustry,
+        searchQuery: searchQuery || '' // ✅ 빈 값 허용
       })
     });
 
@@ -202,37 +195,29 @@ async function diagnosePaid() {
       throw new Error(result.message || result.error || '진단 중 오류가 발생했습니다');
     }
 
-    // ✅ 유료 리포트 표시
     displayReport(result.data, true);
-
-    // 로그 표시(유료도)
-    if (result.logs) {
-      displayLogs(result.logs);
-    }
+    if (result.logs) displayLogs(result.logs);
   } catch (error) {
     console.error('Error:', error);
     showError(error.message);
   }
 }
 
-// 리포트 표시
+/* ---------------------------
+   리포트 표시
+---------------------------- */
 function displayReport(data, isPaid) {
-  // 플레이스 정보
   document.getElementById('placeName').textContent = data.placeData?.name || '-';
   document.getElementById('placeAddress').textContent = data.placeData?.address || '-';
 
-  // 총점
   document.getElementById('totalScore').textContent = data.totalScore ?? '-';
   document.getElementById('totalGrade').textContent = data.totalGrade ?? '-';
 
-  // 총점 배지 색상
   const gradeBadge = document.getElementById('totalGradeBadge');
   gradeBadge.className = `grade-badge grade-${data.totalGrade || 'C'}`;
 
-  // 카테고리별 점수
   displayCategoryScores(data.scores, data);
 
-  // 무료/유료 섹션 토글
   if (!isPaid) {
     document.getElementById('upgradeSection').style.display = 'block';
     document.getElementById('improvementsSection').style.display = 'none';
@@ -240,11 +225,9 @@ function displayReport(data, isPaid) {
   } else {
     document.getElementById('upgradeSection').style.display = 'none';
 
-    // ✅ 유료: 개선안 (무조건 섹션 하나는 보이게)
     displayImprovementsPaid(data);
     document.getElementById('improvementsSection').style.display = 'block';
 
-    // ✅ 유료: 경쟁사
     displayCompetitorsPaid(data);
     document.getElementById('competitorsSection').style.display = 'block';
   }
@@ -253,7 +236,9 @@ function displayReport(data, isPaid) {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-// 디버그 로그 표시
+/* ---------------------------
+   디버그 로그
+---------------------------- */
 function displayLogs(logs) {
   const debugSection = document.getElementById('debugSection');
   const debugLogs = document.getElementById('debugLogs');
@@ -265,19 +250,12 @@ function displayLogs(logs) {
 
   debugSection.style.display = 'block';
 
-  // 로그 포맷팅
   const formattedLogs = logs.map(log => {
-    if (log.includes('===')) {
-      return `<span class="log-section">${escapeHtml(log)}</span>`;
-    } else if (log.includes('✅') || log.includes('성공') || log.includes('완료')) {
-      return `<span class="log-success">${escapeHtml(log)}</span>`;
-    } else if (log.includes('❌') || log.includes('실패') || log.includes('오류')) {
-      return `<span class="log-error">${escapeHtml(log)}</span>`;
-    } else if (log.includes('⚠️') || log.includes('경고')) {
-      return `<span class="log-warning">${escapeHtml(log)}</span>`;
-    } else if (log.includes('[')) {
-      return `<span class="log-info">${escapeHtml(log)}</span>`;
-    }
+    if (log.includes('===')) return `<span class="log-section">${escapeHtml(log)}</span>`;
+    if (log.includes('✅') || log.includes('성공') || log.includes('완료')) return `<span class="log-success">${escapeHtml(log)}</span>`;
+    if (log.includes('❌') || log.includes('실패') || log.includes('오류')) return `<span class="log-error">${escapeHtml(log)}</span>`;
+    if (log.includes('⚠️') || log.includes('경고')) return `<span class="log-warning">${escapeHtml(log)}</span>`;
+    if (log.includes('[')) return `<span class="log-info">${escapeHtml(log)}</span>`;
     return escapeHtml(log);
   }).join('\n');
 
@@ -285,12 +263,16 @@ function displayLogs(logs) {
   debugLogs.scrollTop = debugLogs.scrollHeight;
 }
 
-// 카테고리별 점수 표시
+/* ---------------------------
+   ✅ 카테고리별 점수 표시 (개선)
+   - 대표키워드: "개수 외 점수요소" 표시
+   - 가격/메뉴: 총 메뉴 수 중복 제거
+   - 리뷰 목표(800 고정) 같은 문구는 아예 만들지 않음
+---------------------------- */
 function displayCategoryScores(scores, fullData) {
   const categoryScoresDiv = document.getElementById('categoryScores');
   categoryScoresDiv.innerHTML = '';
 
-  // menuCount 위치가 왔다갔다 해서 둘 다 커버
   const menuCount =
     (fullData?.placeData && fullData.placeData.menuCount !== undefined ? fullData.placeData.menuCount : undefined) ??
     (fullData?.menuCount !== undefined ? fullData.menuCount : undefined);
@@ -310,10 +292,57 @@ function displayCategoryScores(scores, fullData) {
 
     let issues = Array.isArray(safeScore.issues) ? [...safeScore.issues] : [];
 
+    // ✅ (1) 가격/메뉴: 총 메뉴 수 중복 제거
     if (cat.key === 'price') {
-      if (menuCount === undefined) issues.unshift('총 메뉴 수: (데이터 없음)');
-      else issues.unshift(`총 메뉴 수: ${menuCount}개`);
+      // 서버 issues에 이미 "총 메뉴 수:"가 들어오면 프론트에서 추가하지 않음
+      const hasMenuCountLine = issues.some(x => String(x).trim().startsWith('총 메뉴 수:'));
+      if (!hasMenuCountLine) {
+        if (menuCount === undefined) issues.unshift('총 메뉴 수: (데이터 없음)');
+        else issues.unshift(`총 메뉴 수: ${menuCount}개`);
+      }
+      // 혹시 중복이 있으면 1개만 남김
+      issues = dedupeByPrefix(issues, '총 메뉴 수:');
     }
+
+    // ✅ (2) 대표키워드: "개수 외 점수요소"를 표시
+    // - 서버가 breakdown/meta를 내려주면 그걸 그대로 보여주고,
+    // - 없으면 프론트에서 "참고지표"로라도 보여준다.
+    if (cat.key === 'keywords') {
+      const kws = Array.isArray(fullData?.placeData?.keywords) ? fullData.placeData.keywords : [];
+      const unique = Array.from(new Set(kws.map(k => String(k).trim()).filter(Boolean)));
+
+      const countLine = `키워드 개수: ${kws.length}/5`;
+      const uniqueLine = `중복 제거 기준: ${unique.length}/5 (중복 키워드 ${kws.length - unique.length}개)`;
+
+      // 서버가 세부 점수 breakdown을 내려주는 경우(미래 대비)
+      const breakdown = safeScore.breakdown || safeScore.meta || null;
+
+      // 이미 같은 문구가 있으면 중복 방지
+      if (!issues.some(x => String(x).includes('키워드 개수:'))) issues.unshift(countLine);
+      if (!issues.some(x => String(x).includes('중복 제거 기준:'))) issues.unshift(uniqueLine);
+
+      // "개수 외 점수요소" 안내 (서버 breakdown이 없을 때)
+      if (!breakdown) {
+        const extra = [
+          '점수 반영 요소(추가):',
+          '- 중복/유사 키워드 여부',
+          '- 업종/지역 적합도(예: 서대문역 미용실, 광화문 미용실 등)',
+          '- 고객 검색 의도 포함 여부(추천/후기/가격/예약 등)',
+          '- 경쟁사 상위 노출 키워드 커버 여부'
+        ].join('\n');
+
+        // 카드 issue는 한 줄 리스트라서, 줄바꿈 대신 bullet 느낌으로 쪼개서 넣자
+        if (!issues.some(x => String(x).includes('점수 반영 요소(추가)'))) {
+          issues.push('점수 반영 요소(추가): 중복/유사, 업종/지역 적합도, 검색의도, 경쟁사 커버');
+        }
+      } else {
+        // breakdown이 객체면 보기 좋게 펼침
+        issues.push(`[세부 점수] ${formatBreakdown(breakdown)}`);
+      }
+    }
+
+    // ✅ (3) 리뷰: "목표 800" 같은 문구는 여기서 절대 추가하지 않음
+    // (현재 프론트는 목표 문구를 만들고 있지 않으니, 서버 issues에만 있으면 서버에서 제거 필요)
 
     const card = document.createElement('div');
     card.className = 'category-card';
@@ -340,18 +369,14 @@ function displayCategoryScores(scores, fullData) {
 }
 
 /* ---------------------------
-   ✅ 유료 섹션 렌더링 (핵심)
+   ✅ 유료 섹션 렌더링
 ---------------------------- */
-
-// 유료 개선안 표시(새)
 function displayImprovementsPaid(fullData) {
   const improvementsSection = document.getElementById('improvementsSection');
   improvementsSection.innerHTML = '<h3 class="section-title">💡 맞춤 개선안</h3>';
 
   const improvements = fullData.improvements || null;
 
-  // 0) 추천 대표키워드 5개 (서버가 이 필드를 내려주면 가장 우선)
-  // - recommendedKeywords5 (권장) / recommendedKeywords (fallback)
   const rec5 =
     (Array.isArray(fullData.recommendedKeywords5) ? fullData.recommendedKeywords5 : null) ||
     (Array.isArray(fullData.recommendedKeywords) ? fullData.recommendedKeywords.slice(0, 5) : []);
@@ -362,7 +387,6 @@ function displayImprovementsPaid(fullData) {
 
     const contentId = `improvement-recommendedKeywords5`;
     const text = rec5.join('\n');
-
     const keywordTags = rec5.map(kw => `<span class="keyword-tag">${escapeHtml(kw)}</span>`).join('');
 
     card.innerHTML = `
@@ -375,7 +399,6 @@ function displayImprovementsPaid(fullData) {
     improvementsSection.appendChild(card);
   }
 
-  // 1) 통합본(unifiedText) — 프론트가 무엇을 보여주든 이것 하나로 “전부” 보이게
   if (fullData.unifiedText) {
     const card = document.createElement('div');
     card.className = 'improvement-card';
@@ -388,8 +411,6 @@ function displayImprovementsPaid(fullData) {
     improvementsSection.appendChild(card);
   }
 
-  // 2) 섹션별 improvements 표시 (기존 로직 + 확장)
-  // 기존에는 description/directions/reviewGuidance/photoGuidance만 있었음 → priceGuidance까지 추가
   const improvementTypes = [
     { key: 'description', icon: '📝', title: '상세설명 개선안' },
     { key: 'directions', icon: '🗺️', title: '오시는길 개선안' },
@@ -398,7 +419,6 @@ function displayImprovementsPaid(fullData) {
     { key: 'priceGuidance', icon: '💰', title: '가격/메뉴 개선 가이드' }
   ];
 
-  // improvements가 있으면 그걸 우선 표시
   if (improvements) {
     improvementTypes.forEach(type => {
       if (improvements[type.key]) {
@@ -415,7 +435,6 @@ function displayImprovementsPaid(fullData) {
       }
     });
 
-    // improvements.keywords (추가 추천 키워드)
     if (improvements.keywords && Array.isArray(improvements.keywords)) {
       const card = document.createElement('div');
       card.className = 'improvement-card';
@@ -428,27 +447,6 @@ function displayImprovementsPaid(fullData) {
     }
   }
 
-  // 3) 적용 후 예상점수 (서버가 내려주면 표시)
-  if (fullData.predictedAfterApply) {
-    const p = fullData.predictedAfterApply;
-    const card = document.createElement('div');
-    card.className = 'improvement-card';
-
-    const contentId = `improvement-predictedAfterApply`;
-    const text =
-      `예상 점수: ${p.totalScore ?? '-'}점\n` +
-      `예상 등급: ${p.totalGrade ?? '-'}\n\n` +
-      `* 목표: 컨설팅 적용 후 재진단 시 90점 이상`;
-
-    card.innerHTML = `
-      <h3>📈 적용 후 예상 점수(목표: 90점+)</h3>
-      <div class="improvement-content" id="${contentId}" style="white-space:pre-wrap;">${escapeHtml(text)}</div>
-      <button class="copy-button" onclick="copyToClipboard('${contentId}')">📋 복사하기</button>
-    `;
-    improvementsSection.appendChild(card);
-  }
-
-  // 4) 아무것도 없을 때 안내
   const hasAnything =
     !!fullData.unifiedText ||
     (rec5 && rec5.length) ||
@@ -468,13 +466,10 @@ function displayImprovementsPaid(fullData) {
   }
 }
 
-// 유료 경쟁사 섹션 표시(새)
 function displayCompetitorsPaid(fullData) {
   const competitorsSection = document.getElementById('competitorsSection');
   competitorsSection.innerHTML = '<h3 class="section-title">🏆 경쟁사 Top 5 분석</h3>';
 
-  // 1) 서버가 "요약 라인"을 내려주면 그대로 1~5. 업체명 : 키워드 형태로 표시
-  // - competitorSummaryLines 권장
   if (Array.isArray(fullData.competitorSummaryLines) && fullData.competitorSummaryLines.length) {
     const card = document.createElement('div');
     card.className = 'improvement-card';
@@ -490,7 +485,6 @@ function displayCompetitorsPaid(fullData) {
     competitorsSection.appendChild(card);
   }
 
-  // 2) 기존 competitors 배열이 있으면 상세 카드로 표시 (기존 로직 유지)
   if (Array.isArray(fullData.competitors) && fullData.competitors.length > 0) {
     fullData.competitors.slice(0, 5).forEach((comp, index) => {
       const card = document.createElement('div');
@@ -510,7 +504,6 @@ function displayCompetitorsPaid(fullData) {
       competitorsSection.appendChild(card);
     });
   } else {
-    // competitors 없을 때도 섹션은 보여야 함
     const info = document.createElement('div');
     info.className = 'improvement-card';
     info.innerHTML = `
@@ -523,7 +516,6 @@ function displayCompetitorsPaid(fullData) {
     competitorsSection.appendChild(info);
   }
 
-  // 3) 추천 키워드(추가) — 기존 recommendedKeywords도 계속 표시
   if (Array.isArray(fullData.recommendedKeywords) && fullData.recommendedKeywords.length > 0) {
     const recommendCard = document.createElement('div');
     recommendCard.className = 'improvement-card';
@@ -544,105 +536,8 @@ function displayCompetitorsPaid(fullData) {
 }
 
 /* ---------------------------
-   기존 함수들 (유지/호환)
+   복사 / 유틸
 ---------------------------- */
-
-// 개선안 표시 (유료) — 기존 함수는 유지하지만, 이제 유료는 displayImprovementsPaid를 사용
-function displayImprovements(improvements) {
-  const improvementsSection = document.getElementById('improvementsSection');
-  improvementsSection.innerHTML = '<h3 class="section-title">💡 맞춤 개선안</h3>';
-
-  const improvementTypes = [
-    { key: 'description', icon: '📝', title: '상세설명 개선안' },
-    { key: 'directions', icon: '🗺️', title: '오시는길 개선안' },
-    { key: 'reviewGuidance', icon: '⭐', title: '리뷰 개선 가이드' },
-    { key: 'photoGuidance', icon: '📸', title: '사진 개선 가이드' },
-    { key: 'priceGuidance', icon: '💰', title: '가격/메뉴 개선 가이드' } // ✅ 추가
-  ];
-
-  improvementTypes.forEach(type => {
-    if (improvements[type.key]) {
-      const card = document.createElement('div');
-      card.className = 'improvement-card';
-
-      const contentId = `improvement-${type.key}`;
-
-      card.innerHTML = `
-        <h3>${type.icon} ${type.title}</h3>
-        <div class="improvement-content" id="${contentId}" style="white-space:pre-wrap;">${escapeHtml(improvements[type.key])}</div>
-        <button class="copy-button" onclick="copyToClipboard('${contentId}')">
-          📋 복사하기
-        </button>
-      `;
-
-      improvementsSection.appendChild(card);
-    }
-  });
-
-  // 추천 키워드
-  if (improvements.keywords && Array.isArray(improvements.keywords)) {
-    const card = document.createElement('div');
-    card.className = 'improvement-card';
-
-    const keywordTags = improvements.keywords
-      .map(kw => `<span class="keyword-tag">${escapeHtml(kw)}</span>`)
-      .join('');
-
-    card.innerHTML = `
-      <h3>🔑 추천 대표키워드</h3>
-      <div class="competitor-keywords">${keywordTags}</div>
-    `;
-
-    improvementsSection.appendChild(card);
-  }
-}
-
-// 경쟁사 분석 표시 (유료) — 기존 함수도 유지하지만, 이제 displayCompetitorsPaid가 우선
-function displayCompetitors(competitors, recommendedKeywords) {
-  const competitorsSection = document.getElementById('competitorsSection');
-  competitorsSection.innerHTML = '<h3 class="section-title">🏆 경쟁사 Top 5 분석</h3>';
-
-  if (competitors && competitors.length > 0) {
-    competitors.forEach((comp, index) => {
-      const card = document.createElement('div');
-      card.className = 'competitor-card';
-
-      const keywordTags = comp.keywords && comp.keywords.length > 0
-        ? comp.keywords.map(kw => `<span class="keyword-tag">${escapeHtml(kw)}</span>`).join('')
-        : '<span style="color: #999;">키워드 없음</span>';
-
-      card.innerHTML = `
-        <h4>${index + 1}. ${escapeHtml(comp.name || '')}</h4>
-        <p>${escapeHtml(comp.address || '주소 정보 없음')}</p>
-        <p style="font-size: 0.85rem; color: #999;">리뷰: ${escapeHtml(comp.reviewCount)}개 | 사진: ${escapeHtml(comp.photoCount)}개</p>
-        <div class="competitor-keywords">${keywordTags}</div>
-      `;
-
-      competitorsSection.appendChild(card);
-    });
-  }
-
-  // 추천 키워드
-  if (recommendedKeywords && recommendedKeywords.length > 0) {
-    const recommendCard = document.createElement('div');
-    recommendCard.className = 'improvement-card';
-    recommendCard.style.marginTop = '20px';
-
-    const keywordTags = recommendedKeywords
-      .map(kw => `<span class="keyword-tag">${escapeHtml(kw)}</span>`)
-      .join('');
-
-    recommendCard.innerHTML = `
-      <h3>💡 추천 키워드</h3>
-      <p style="margin-bottom: 15px; color: #666;">경쟁사 분석을 바탕으로 한 추천 키워드입니다</p>
-      <div class="competitor-keywords">${keywordTags}</div>
-    `;
-
-    competitorsSection.appendChild(recommendCard);
-  }
-}
-
-// 클립보드 복사
 function copyToClipboard(elementId) {
   const element = document.getElementById(elementId);
   const text = element ? element.textContent : '';
@@ -657,7 +552,6 @@ function copyToClipboard(elementId) {
   }).catch(err => {
     console.error('복사 실패:', err);
 
-    // Fallback: 텍스트 선택
     const range = document.createRange();
     range.selectNode(element);
     window.getSelection().removeAllRanges();
@@ -674,7 +568,6 @@ function copyToClipboard(elementId) {
   });
 }
 
-// HTML escape (로그/컨텐츠 안전 표시)
 function escapeHtml(str) {
   return String(str ?? '')
     .replaceAll('&', '&amp;')
@@ -684,30 +577,53 @@ function escapeHtml(str) {
     .replaceAll("'", '&#039;');
 }
 
-// 초기화
+function dedupeByPrefix(lines, prefix) {
+  const out = [];
+  let seen = false;
+  for (const l of lines) {
+    const s = String(l);
+    if (s.trim().startsWith(prefix)) {
+      if (seen) continue;
+      seen = true;
+    }
+    out.push(l);
+  }
+  return out;
+}
+
+function formatBreakdown(b) {
+  try {
+    if (typeof b === 'string') return b;
+    if (typeof b !== 'object' || !b) return String(b);
+
+    const parts = [];
+    for (const k of Object.keys(b)) {
+      parts.push(`${k}:${b[k]}`);
+    }
+    return parts.join(' | ');
+  } catch {
+    return '';
+  }
+}
+
+/* ---------------------------
+   초기화
+---------------------------- */
 document.addEventListener('DOMContentLoaded', () => {
   showSection('inputSection');
 
-  // Enter 키 이벤트
   document.getElementById('placeUrl').addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') {
-      diagnoseFree();
-    }
+    if (e.key === 'Enter') diagnoseFree();
   });
 
   const sq = document.getElementById('searchQuery');
   if (sq) {
     sq.addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') {
-        diagnosePaid();
-      }
+      if (e.key === 'Enter') diagnosePaid();
     });
   }
 
-  // 모달 외부 클릭 시 닫기
   document.getElementById('paidModal').addEventListener('click', (e) => {
-    if (e.target.id === 'paidModal') {
-      closePaidModal();
-    }
+    if (e.target.id === 'paidModal') closePaidModal();
   });
 });
