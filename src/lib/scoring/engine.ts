@@ -62,6 +62,7 @@ function signalRatio(text: string | undefined, signals: string[]) {
    - intent(0~15)   : 추천/후기/가격/예약 등 검색 의도
    - industryFit(0~20) : 업종 핵심 단어 포함
 ---------------------------- */
+
 function keywordScore100Expanded(
   input: PlaceScoringInput,
   targetCount: number,
@@ -75,7 +76,16 @@ function keywordScore100Expanded(
       score: 0,
       grade: grade100(0),
       issues: ["대표키워드가 설정되지 않았습니다."],
-      breakdown: { count: 0, dedupe: 0, stopwordPenalty: 0, locality: 0, intent: 0, industryFit: 0 },
+      breakdown: {
+        count: 0,
+        dedupe: 0,
+        stopwordPenalty: 0,
+        locality: 0,
+        intent: 0,
+        industryFit: 0,
+        comboBonus: 0,
+        competitorCoverage: 0
+      },
       meta: { targetCount }
     };
   }
@@ -84,77 +94,140 @@ function keywordScore100Expanded(
   const uniq = Array.from(new Set(lower));
   const dupCount = raw.length - uniq.length;
 
-  // 1) count: 0~50
+  /* ---------------------------
+     1) 개수 (0~40)
+  ---------------------------- */
   const countRatio = clamp(raw.length / targetCount, 0, 1);
-  const countScore = Math.round(countRatio * 50);
+  const countScore = Math.round(countRatio * 40);
 
-  // 2) dedupe: 0~10 (중복 없으면 10, 중복 있으면 비례 감점)
-  const dedupeScore = dupCount <= 0 ? 10 : Math.max(0, 10 - Math.min(10, dupCount * 5));
+  /* ---------------------------
+     2) 중복 (0~10)
+  ---------------------------- */
+  const dedupeScore =
+    dupCount <= 0 ? 10 : Math.max(0, 10 - Math.min(10, dupCount * 5));
 
-  // 3) stopword penalty: 0 ~ -10
+  /* ---------------------------
+     3) stopword (-10~0)
+  ---------------------------- */
   const stopHit = raw.filter(k => stopWords.includes(k));
-  const stopwordPenalty = stopHit.length <= 0 ? 0 : -Math.min(10, stopHit.length * 5);
+  const stopwordPenalty =
+    stopHit.length <= 0 ? 0 : -Math.min(10, stopHit.length * 5);
 
-  // 4) locality: 0~15 (주소/역명/핵심 지명 커버)
+  /* ---------------------------
+     4) 지역 토큰 (0~15)
+  ---------------------------- */
   const localityTokens = extractLocalityTokens(input.name, input.address);
-  const localityHits = localityTokens.filter(tok => lower.some(k => k.includes(tok.toLowerCase())));
-  const localityRatio = localityTokens.length ? clamp(localityHits.length / Math.min(3, localityTokens.length), 0, 1) : 0;
+  const localityHits = localityTokens.filter(tok =>
+    lower.some(k => k.includes(tok.toLowerCase()))
+  );
+  const localityRatio = localityTokens.length
+    ? clamp(localityHits.length / Math.min(3, localityTokens.length), 0, 1)
+    : 0;
   const localityScore = Math.round(localityRatio * 15);
 
-  // 5) intent: 0~15 (검색 의도)
-  const intentTokens = ["추천", "후기", "리뷰", "가격", "예약", "잘하는", "근처", "best", "베스트"];
-  const intentHits = intentTokens.filter(tok => lower.some(k => k.includes(tok.toLowerCase())));
+  /* ---------------------------
+     5) 검색 의도 (0~15)
+  ---------------------------- */
+  const intentTokens = [
+    "추천",
+    "후기",
+    "리뷰",
+    "가격",
+    "예약",
+    "잘하는",
+    "근처",
+    "best",
+    "베스트"
+  ];
+
+  const intentHits = intentTokens.filter(tok =>
+    lower.some(k => k.includes(tok.toLowerCase()))
+  );
+
   const intentRatio = clamp(intentHits.length / 3, 0, 1);
   const intentScore = Math.round(intentRatio * 15);
 
-  // 6) industryFit: 0~20 (업종 핵심)
+  /* ---------------------------
+     6) 업종 적합도 (0~20)
+  ---------------------------- */
   const fitTokens = industryFitTokens(input.industry);
-  const fitHits = fitTokens.filter(tok => lower.some(k => k.includes(tok.toLowerCase())));
+  const fitHits = fitTokens.filter(tok =>
+    lower.some(k => k.includes(tok.toLowerCase()))
+  );
+
   const fitRatio = clamp(fitHits.length / 3, 0, 1);
   const industryFitScore = Math.round(fitRatio * 20);
 
-  // 합산
+  /* ---------------------------
+     7) 지역+업종 조합 보너스 (0 or 10)
+  ---------------------------- */
+  let comboBonus = 0;
+
+  if (localityTokens.length > 0) {
+    const hasCombo = raw.some(k =>
+      localityTokens.some(loc => k.includes(loc)) &&
+      fitTokens.some(f => k.includes(f))
+    );
+
+    if (hasCombo) comboBonus = 10;
+  }
+
+  /* ---------------------------
+     8) 경쟁사 커버율 (0~10)
+  ---------------------------- */
+  let competitorCoverageScore = 0;
+  const competitorKeywords = (input as any).competitorKeywords ?? [];
+
+  if (Array.isArray(competitorKeywords) && competitorKeywords.length > 0) {
+    const overlap = raw.filter(k =>
+      competitorKeywords.some(c =>
+        String(c).toLowerCase().includes(k.toLowerCase())
+      )
+    );
+
+    const coverageRatio = clamp(overlap.length / 3, 0, 1);
+    competitorCoverageScore = Math.round(coverageRatio * 10);
+  }
+
+  /* ---------------------------
+     총합
+  ---------------------------- */
   let score =
     countScore +
     dedupeScore +
     localityScore +
     intentScore +
     industryFitScore +
+    comboBonus +
+    competitorCoverageScore +
     stopwordPenalty;
 
   score = clamp(score, 0, 100);
 
-  // issues 구성
-  issues.push(`키워드 개수: ${raw.length}/${targetCount} (count ${countScore}/50)`);
-  issues.push(dupCount > 0 ? `중복 키워드 ${dupCount}개 → dedupe ${dedupeScore}/10` : `중복 없음 → dedupe ${dedupeScore}/10`);
-
-  if (stopHit.length > 0) {
-    issues.push(`너무 일반적인 키워드 감점: ${stopHit.slice(0, 3).join(", ")}${stopHit.length > 3 ? "…" : ""} (${stopwordPenalty}점)`);
-  } else {
-    issues.push(`일반 단어 감점 없음 (0점)`);
-  }
-
-  if (localityTokens.length > 0) {
-    issues.push(
-      localityHits.length > 0
-        ? `지역 커버: ${localityHits.slice(0, 3).join(", ")} (locality ${localityScore}/15)`
-        : `지역 키워드가 부족합니다(역/동/구 등) (locality ${localityScore}/15)`
-    );
-  } else {
-    issues.push(`주소 기반 지역 토큰 추출 실패 (locality ${localityScore}/15)`);
-  }
-
+  /* ---------------------------
+     issues
+  ---------------------------- */
+  issues.push(`키워드 개수: ${raw.length}/${targetCount} (count ${countScore}/40)`);
   issues.push(
-    intentHits.length > 0
-      ? `검색 의도 포함: ${intentHits.slice(0, 3).join(", ")} (intent ${intentScore}/15)`
-      : `추천/후기/가격/예약 등 검색 의도 키워드가 부족합니다 (intent ${intentScore}/15)`
+    dupCount > 0
+      ? `중복 ${dupCount}개 → dedupe ${dedupeScore}/10`
+      : `중복 없음 → dedupe ${dedupeScore}/10`
   );
 
-  issues.push(
-    fitHits.length > 0
-      ? `업종 적합도: ${fitHits.slice(0, 3).join(", ")} (industryFit ${industryFitScore}/20)`
-      : `업종 핵심 키워드가 부족합니다 (industryFit ${industryFitScore}/20)`
-  );
+  if (stopHit.length > 0)
+    issues.push(`일반 단어 감점 (${stopwordPenalty}점)`);
+
+  issues.push(`지역 커버 ${localityScore}/15`);
+  issues.push(`검색 의도 ${intentScore}/15`);
+  issues.push(`업종 적합도 ${industryFitScore}/20`);
+
+  if (comboBonus > 0)
+    issues.push(`지역+업종 조합 존재 (+${comboBonus})`);
+  else
+    issues.push(`지역+업종 조합 키워드 없음`);
+
+  if (competitorCoverageScore > 0)
+    issues.push(`경쟁사 키워드 커버 ${competitorCoverageScore}/10`);
 
   return {
     score,
@@ -166,7 +239,9 @@ function keywordScore100Expanded(
       stopwordPenalty,
       locality: localityScore,
       intent: intentScore,
-      industryFit: industryFitScore
+      industryFit: industryFitScore,
+      comboBonus,
+      competitorCoverage: competitorCoverageScore
     },
     meta: {
       targetCount,
