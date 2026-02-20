@@ -200,6 +200,19 @@ export class ModularCrawler {
       photoCount = r.photoCount || photoCount;
       recentReviewCount30d = r.recentReviewCount30d ?? undefined;
 
+      // === DEBUG SUMMARY (복사해서 보내면 원인 즉시 파악 가능) ===
+      logs.push("\n=== DEBUG SUMMARY ===");
+      logs.push(`[FINAL] name: ${name}`);
+      logs.push(`[FINAL] address: ${address}`);
+      logs.push(`[FINAL] keywords: ${(Array.isArray(keywords) ? keywords.join(", ") : String(keywords || ""))}`);
+      logs.push(`[FINAL] description(len): ${(description || "").length}`);
+      logs.push(`[FINAL] directions(len): ${(directions || "").length}`);
+      logs.push(`[FINAL] reviewsTotal: ${reviewCount}`);
+      logs.push(`[FINAL] recent30d: ${recentReviewCount30d ?? 0}`);
+      logs.push(`[FINAL] photoCount: ${photoCount}`);
+      logs.push(`[FINAL] menuCount: ${menuCount}`);
+      logs.push("=== DEBUG SUMMARY END ===");
+
       await context.close();
       logs.push("\n=== 크롤링 완료 ===");
 
