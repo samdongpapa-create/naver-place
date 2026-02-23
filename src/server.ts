@@ -107,13 +107,13 @@ function getCity(address: string): string {
  * - 컨설팅/대표키워드/자연삽입은 categoryK(업종군 한글) 기반으로 처리
  */
 type BusinessProfile = {
-  scoreIndustry: Industry;        // 점수 엔진용
-  category: string;              // 내부 업종군(english-ish)
-  categoryK: string;             // 업종 한글(대표키워드/문구에 사용)
-  serviceTokens: string[];       // A/C 자연삽입용
-  menuMustHave: string[];        // B 메뉴 점검 핵심단어
-  menuSuggestions: string[];     // B 메뉴명 추천
-  categoryBoost: string[];       // 트래픽 키워드용 카테고리 강화 토큰
+  scoreIndustry: Industry; // 점수 엔진용
+  category: string; // 내부 업종군(english-ish)
+  categoryK: string; // 업종 한글(대표키워드/문구에 사용)
+  serviceTokens: string[]; // A/C 자연삽입용
+  menuMustHave: string[]; // B 메뉴 점검 핵심단어
+  menuSuggestions: string[]; // B 메뉴명 추천
+  categoryBoost: string[]; // 트래픽 키워드용 카테고리 강화 토큰
 };
 
 function detectBusinessProfile(params: {
@@ -173,7 +173,7 @@ function detectBusinessProfile(params: {
   // 네일/피부/왁싱/뷰티
   if (has(/네일|젤네일|패디|아트|네일샵|왁싱|브라질리언|피부|에스테틱|관리|리프팅|윤곽|필링|속눈썹|왁스/)) {
     return {
-      scoreIndustry: "hairshop",   // 점수 엔진은 뷰티가 hairshop이 가장 유사
+      scoreIndustry: "hairshop",
       category: "beauty",
       categoryK: "뷰티샵",
       serviceTokens: ["관리", "상담", "예약", "시술"],
@@ -235,7 +235,7 @@ function detectBusinessProfile(params: {
     };
   }
 
-  // 기본 fallback (어떤 업종이든)
+  // 기본 fallback
   return {
     scoreIndustry: "restaurant",
     category: "generic",
@@ -253,13 +253,15 @@ function detectBusinessProfile(params: {
 function normalizeKw(k: string) {
   return String(k || "").replace(/\s+/g, "").trim();
 }
-function buildCompetitorKeywordTop(competitorKeywordsFlat: string[], topN = 20): { top: string[]; freq: Record<string, number> } {
+function buildCompetitorKeywordTop(
+  competitorKeywordsFlat: string[],
+  topN = 20
+): { top: string[]; freq: Record<string, number> } {
   const freq = new Map<string, number>();
   for (const k of competitorKeywordsFlat || []) {
     const nk = normalizeKw(k);
     if (!nk) continue;
     if (nk.length < 2 || nk.length > 25) continue;
-    // 너무 의미없는 단어 제거
     if (/(추천|베스트|할인|가격|이벤트|예약)/.test(nk)) continue;
     freq.set(nk, (freq.get(nk) || 0) + 1);
   }
@@ -276,7 +278,7 @@ function buildCompetitorKeywordTop(competitorKeywordsFlat: string[], topN = 20):
  * - 지역+업종 / 생활권 확장 / 카테고리 강화 / 브랜드 방어
  */
 function buildRecommendedKeywordsTrafficFirst(params: {
-  categoryK: string;            // "미용실" "카페" "맛집" "헬스장" ...
+  categoryK: string;
   categoryBoost: string[];
   myName: string;
   myAddress: string;
@@ -284,11 +286,10 @@ function buildRecommendedKeywordsTrafficFirst(params: {
 }): { recommended: string[]; debug: any } {
   const { categoryK, categoryBoost, myName, myAddress, competitorKeywordTop } = params;
 
-  const locality = getLocalityToken(myName, myAddress);   // "서대문역"
-  const district = getDistrictToken(myAddress);           // "종로"
-  const city = getCity(myAddress);                        // "서울"
+  const locality = getLocalityToken(myName, myAddress); // "서대문역"
+  const district = getDistrictToken(myAddress); // "종로"
+  const city = getCity(myAddress); // "서울"
 
-  // 생활권 확장 풀(기본)
   const expansionPool = ["광화문", "종로", "시청", "서울역", "경복궁", "명동", "충정로", district].filter(Boolean);
 
   const brand = normalizeKw(myName).replace(/[^\w가-힣]/g, "");
@@ -307,16 +308,15 @@ function buildRecommendedKeywordsTrafficFirst(params: {
   else if (district) push(`${district}${categoryK}`);
   else push(`${categoryK}`);
 
-  // 2) 경쟁사 Top에서 "생활권+업종" 있으면 우선 반영
+  // 2) 경쟁사 Top에서 생활권+업종 우선
   for (const kw of competitorKeywordTop || []) {
     if (out.length >= 3) break;
     if (!kw.includes(categoryK)) continue;
-    // 서비스조합 느낌 제거(대표키워드에는 트래픽형만)
     if (/(커트|컷|펌|염색|탈색|클리닉|다운펌|볼륨매직|매직|PT|수업|진료|검진)/.test(kw)) continue;
     push(kw);
   }
 
-  // 3) 생활권 확장 1~2개(예: 광화문미용실/종로미용실)
+  // 3) 생활권 확장 1~2개
   for (const w of expansionPool) {
     if (out.length >= 3) break;
     if (!w) continue;
@@ -337,12 +337,21 @@ function buildRecommendedKeywordsTrafficFirst(params: {
 
   return {
     recommended: out.slice(0, 5),
-    debug: { locality, district, city, expansionPool, brand, categoryK, categoryBoost, competitorKeywordTopSample: competitorKeywordTop.slice(0, 10) }
+    debug: {
+      locality,
+      district,
+      city,
+      expansionPool,
+      brand,
+      categoryK,
+      categoryBoost,
+      competitorKeywordTopSample: (competitorKeywordTop || []).slice(0, 10)
+    }
   };
 }
 
 /**
- * ✅ A) 상세설명/오시는길 자연삽입 강제 (도배 금지: 각 텍스트 최대 1~2개만)
+ * ✅ A) 상세설명/오시는길 자연삽입 강제
  */
 function injectNaturalServiceTerms(params: {
   text: string;
@@ -358,14 +367,12 @@ function injectNaturalServiceTerms(params: {
   const tokens = (params.serviceTokens || []).map((s) => String(s).trim()).filter(Boolean);
 
   const hasToken = (t: string) => base.includes(t);
-
   const need = tokens.filter((t) => !hasToken(t)).slice(0, params.maxInsert);
 
   if (!need.length) {
     return { text: clampText(base, params.maxLen), inserted: [] };
   }
 
-  // 자연문장 1개로 묶기
   const sentence =
     params.style === "description"
       ? ` 시술은 ${need.join(", ")} 등으로 진행되며, 컨디션에 맞춰 상담 후 맞춤으로 도와드립니다.`
@@ -378,15 +385,13 @@ function injectNaturalServiceTerms(params: {
 }
 
 /**
- * ✅ C) 리뷰요청 문구에 서비스 키워드 1문장 추가(도배X)
+ * ✅ C) 리뷰요청 문구 서비스 힌트 1문장
  */
 function injectReviewScriptServiceHint(s: string, token: string): string {
   const base = String(s || "").trim();
   if (!base) return "";
   if (token && base.includes(token)) return base;
   if (!token) return base;
-
-  // 너무 길게 늘리지 말고 1문장 추가
   return `${base} 가능하시다면 "${token}" 만족도도 한 줄만 적어주시면 다음 고객분들께 큰 도움이 됩니다 😊`;
 }
 
@@ -402,7 +407,6 @@ function buildMenuGuidance(params: {
   const text = menus.map((m) => String(m?.name || "")).join(" ");
 
   const missing = (params.mustHave || []).filter((t) => t && !text.includes(t));
-
   const suggestionExamples = (params.suggestions || []).slice(0, 6);
 
   const note =
@@ -431,7 +435,7 @@ async function getCompetitorsSafe(params: {
   industry: Industry;
   placeId: string;
   myName: string;
-  myAddress: string;
+  myAddress: string; // (이건 server 내부 로직에서 쿼리 후보 만들 때만 사용)
   queries: string[];
   limit: number;
   totalTimeoutMs: number;
@@ -455,11 +459,11 @@ async function getCompetitorsSafe(params: {
       );
       if (!ids?.length) continue;
 
+      // ✅ FIX: competitorService opts에는 myAddress 없음 -> 넘기지 말 것
       const comps = await withTimeout(
         compSvc.crawlCompetitorsByIds(ids, industry, limit, {
           excludePlaceId: placeId,
-          myName,
-          myAddress
+          myName
         }),
         Math.min(3800, remainingMs),
         "compCrawl-timeout"
@@ -498,7 +502,6 @@ app.post("/api/diagnose/free", async (req, res) => {
       return res.status(500).json({ success: false, message: crawled.error || "크롤링 실패", logs: crawled.logs || [] });
     }
 
-    // ✅ E) 업종군 추정(무료에도 debug로 내려줌)
     const prof = detectBusinessProfile({
       reqIndustry: industry,
       name: crawled.data.name,
@@ -567,7 +570,6 @@ app.post("/api/diagnose/paid", async (req, res) => {
       return res.status(500).json({ success: false, message: crawlResult.error || "크롤링 실패", logs: crawlResult.logs || [] });
     }
 
-    // ✅ E) 업종군 추정
     const prof = detectBusinessProfile({
       reqIndustry: industry,
       name: crawlResult.data.name,
@@ -618,13 +620,10 @@ app.post("/api/diagnose/paid", async (req, res) => {
 
     console.log("[PAID] competitors:", competitors.length, "queries:", queryCandidates);
 
-    // ✅ 경쟁사 키워드 flat
     const competitorKeywordsFlat = competitors.flatMap((c: any) => (Array.isArray(c.keywords) ? c.keywords : []));
 
-    // ✅ D) 경쟁사 키워드 TOP20 (빈도 기반)
     const compTop = buildCompetitorKeywordTop(competitorKeywordsFlat, 20);
 
-    // ✅ 트래픽 우선 대표키워드 5개 확정(업종군 기반)
     const traffic = buildRecommendedKeywordsTrafficFirst({
       categoryK: prof.categoryK,
       categoryBoost: prof.categoryBoost,
@@ -635,14 +634,12 @@ app.post("/api/diagnose/paid", async (req, res) => {
 
     const finalRecommendedKeywords = traffic.recommended;
 
-    // ✅ B) 메뉴 점검/가이드
     const menuGuidance = buildMenuGuidance({
       menus: (crawlResult.data as any).menus,
       mustHave: prof.menuMustHave,
       suggestions: prof.menuSuggestions
     });
 
-    // ✅ GPT 컨설팅 호출(키워드 인풋은 D의 top을 사용)
     const gpt = await generatePaidConsultingGuaranteed({
       industry: prof.scoreIndustry,
       placeData: crawlResult.data,
@@ -651,7 +648,6 @@ app.post("/api/diagnose/paid", async (req, res) => {
       targetScore: 90
     });
 
-    // ✅ A) 자연삽입 강제 (description/directions)
     const imp = (gpt as any)?.improvements || {};
 
     const descInjected = injectNaturalServiceTerms({
@@ -670,30 +666,26 @@ app.post("/api/diagnose/paid", async (req, res) => {
       style: "directions"
     });
 
-    // ✅ C) 리뷰요청 문구에도 1문장 서비스 힌트 강제
-    // - 업종별 대표 서비스 토큰 하나만 선택
     const reviewToken = prof.serviceTokens?.[0] || "";
     const rr = imp.reviewRequestScripts || {};
     rr.short = injectReviewScriptServiceHint(String(rr.short || ""), reviewToken);
     rr.friendly = injectReviewScriptServiceHint(String(rr.friendly || ""), reviewToken);
     rr.polite = injectReviewScriptServiceHint(String(rr.polite || ""), reviewToken);
 
-    // ✅ 최종 improvements 후처리 반영
     imp.description = descInjected.text;
     imp.directions = dirInjected.text;
     imp.reviewRequestScripts = rr;
 
-    // ✅ “대표키워드”는 서버 확정값으로 강제(유료 통합본 100% 일치)
     imp.keywords = finalRecommendedKeywords;
     (gpt as any).recommendedKeywords = finalRecommendedKeywords;
 
-    // ✅ 경쟁사 키워드 인사이트에도 TOP을 박아주면 설득력↑
-    // (기존 인사이트가 있어도, 끝에 TOP을 덧붙임)
     const baseInsight = String(imp.competitorKeywordInsights || "").trim();
     const topLine = compTop.top.length ? `\n\n[경쟁사 키워드 TOP]\n- ${compTop.top.slice(0, 10).join("\n- ")}` : "";
-    imp.competitorKeywordInsights = clampText((baseInsight ? baseInsight : "경쟁사 키워드에서 자주 등장하는 표현을 참고하세요.") + topLine, 1200);
+    imp.competitorKeywordInsights = clampText(
+      (baseInsight ? baseInsight : "경쟁사 키워드에서 자주 등장하는 표현을 참고하세요.") + topLine,
+      1200
+    );
 
-    // ✅ 디버그 (UI 없어도 Network에서 확인)
     const competitorKeywordsDebug = competitors.map((c: any) => ({
       placeId: c.placeId,
       name: c.name,
@@ -720,25 +712,20 @@ app.post("/api/diagnose/paid", async (req, res) => {
         improvements: imp,
         recommendedKeywords: finalRecommendedKeywords,
 
-        // 경쟁사
         competitors,
         competitorKeywordsDebug,
 
-        // ✅ D: 경쟁사 TOP
         competitorKeywordTop: compTop.top,
         competitorKeywordFreq: compTop.freq,
 
-        // ✅ B: 메뉴 가이드
         menuGuidance,
 
-        // ✅ A: 자연삽입 결과 debug
         injectDebug: {
           descriptionInserted: descInjected.inserted,
           directionsInserted: dirInjected.inserted,
           reviewTokenUsed: reviewToken
         },
 
-        // 키워드 전략 debug
         keywordStrategyDebug: traffic.debug,
 
         predictedAfter: (gpt as any).predicted,
