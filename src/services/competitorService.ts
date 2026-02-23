@@ -10,7 +10,7 @@ type Competitor = {
 
 type CrawlOpts = {
   excludePlaceId?: string;
-  myName?: string; // 내 업체명으로 자기자신 제거(추가 방어)
+  myName?: string;
 };
 
 function uniq<T>(arr: T[]) {
@@ -24,7 +24,16 @@ function normName(s: string) {
     .replace(/[^\w가-힣]/g, "");
 }
 
-/** --- fetch helpers --- */
+function sanitizeName(s: string) {
+  // "살롱 : 네이버" / 이상한 제어문자 제거
+  return String(s || "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\s*:\s*네이버.*$/i, "")
+    .replace(/\s*-\s*네이버.*$/i, "")
+    .trim();
+}
+
 async function fetchText(url: string, extraHeaders?: Record<string, string>) {
   const res = await fetch(url, {
     method: "GET",
@@ -54,7 +63,6 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label = "timeout"): Pro
   }
 }
 
-/** --- HTML utils --- */
 function decodeHtml(s: string) {
   return String(s || "")
     .replace(/&amp;/g, "&")
@@ -69,16 +77,13 @@ function extractNameFromHtml(html: string): string {
   if (!s) return "";
 
   const m1 = s.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i);
-  if (m1?.[1]) return decodeHtml(m1[1]).trim();
+  if (m1?.[1]) return sanitizeName(decodeHtml(m1[1]).trim());
 
   const m2 = s.match(/<title>\s*([^<]+)\s*<\/title>/i);
-  if (m2?.[1]) {
-    const t = decodeHtml(m2[1]).replace(/:\s*네이버.*$/i, "").trim();
-    return t;
-  }
+  if (m2?.[1]) return sanitizeName(decodeHtml(m2[1]).trim());
 
   const m3 = s.match(/"name"\s*:\s*"([^"]{2,80})"/);
-  if (m3?.[1]) return decodeHtml(m3[1]).trim();
+  if (m3?.[1]) return sanitizeName(decodeHtml(m3[1]).trim());
 
   return "";
 }
@@ -97,6 +102,7 @@ function cleanKeywordList(arr: string[]): string[] {
 
   for (const x of arr || []) {
     const k = String(x || "")
+      .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
       .replace(/\s+/g, "")
       .replace(/[^\w가-힣]/g, "")
       .trim();
@@ -116,11 +122,6 @@ function cleanKeywordList(arr: string[]): string[] {
   return out;
 }
 
-/**
- * ✅ “무료버전과 같은 계열”의 키워드 추출
- * - HTML 내 keywords/keywordList/.. 배열 패턴 우선
- * - 안 나오면 그럴듯한 문자열 배열 fallback
- */
 function extractKeywordsFromHtml(html: string): string[] {
   const s = String(html || "");
   if (!s) return [];
@@ -141,7 +142,7 @@ function extractKeywordsFromHtml(html: string): string[] {
     }
   }
 
-  // fallback: 문자열 배열 후보 중 “한글이 많고 URL이 적은 것” 우선
+  // fallback: "문자열 배열" 후보 중 그럴듯한 것
   const re = /\[(?:"[^"\n]{2,30}"\s*,\s*){2,30}"[^"\n]{2,30}"\]/g;
   const matches = s.match(re) || [];
   const parsed: { arr: string[]; score: number }[] = [];
@@ -170,9 +171,6 @@ function extractKeywordsFromHtml(html: string): string[] {
   return [];
 }
 
-/**
- * ✅ 핵심: /place/{id} hit → redirect finalUrl에서 slug 확보 → slug home으로 확정
- */
 async function resolveBestHomeUrl(placeId: string): Promise<string> {
   const tries = [
     `https://m.place.naver.com/place/${placeId}`,
@@ -193,24 +191,17 @@ async function resolveBestHomeUrl(placeId: string): Promise<string> {
         return `https://m.place.naver.com/${slug}/${pid}/home`;
       }
 
-      if (/\/place\/\d{5,12}/.test(finalUrl)) {
-        return `https://m.place.naver.com/place/${placeId}/home`;
-      }
+      if (/\/place\/\d{5,12}/.test(finalUrl)) return `https://m.place.naver.com/place/${placeId}/home`;
     } catch {}
   }
 
   return `https://m.place.naver.com/place/${placeId}/home`;
 }
 
-/**
- * ✅ (NEW) map API 버리고 “네이버 검색(플레이스)” HTML에서 placeId 수집
- * - Railway에서도 매우 잘 버팀
- */
 async function findPlaceIdsViaNaverSearchHTML(query: string): Promise<string[]> {
   const q = (query || "").trim();
   if (!q) return [];
 
-  // PC/모바일 둘 다 시도 (둘 중 하나는 살아남는 편)
   const urls = [
     `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`,
     `https://m.search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`
@@ -219,12 +210,9 @@ async function findPlaceIdsViaNaverSearchHTML(query: string): Promise<string[]> 
   for (const url of urls) {
     const r = await fetchText(url, { referer: "https://search.naver.com/" });
     console.log("[COMP][searchHTML] status:", r.status, "len:", (r.text || "").length, "url:", url);
-
     if (!r.ok || !r.text) continue;
 
     const html = r.text;
-
-    // placeId 패턴: m.place.naver.com/.../{id} 또는 /place/{id}
     const ids: string[] = [];
     const reList = [
       /m\.place\.naver\.com\/[a-zA-Z0-9_]+\/(\d{5,12})/g,
@@ -251,7 +239,6 @@ async function findPlaceIdsViaNaverSearchHTML(query: string): Promise<string[]> 
   return [];
 }
 
-/** --- service --- */
 export class CompetitorService {
   constructor() {}
 
@@ -259,32 +246,21 @@ export class CompetitorService {
     return;
   }
 
-  /**
-   * ✅ 경쟁사 후보 placeId 추출 (map API 완전 대체)
-   * 1) search.naver.com place 검색 HTML에서 id 추출
-   * 2) (옵션) map API는 아예 사용 안 함 (400/503 때문에)
-   */
   async findTopPlaceIds(query: string, excludePlaceId: string, limit = 5): Promise<string[]> {
     const q = (query || "").trim();
     if (!q) return [];
 
     console.log("[COMP][findTopPlaceIds] query:", q);
 
-    // 1) 네이버 검색 HTML에서 ID 확보
     const ids1 = await withTimeout(findPlaceIdsViaNaverSearchHTML(q), 2500, "searchHTML-timeout");
     let ids = ids1.filter((id) => id !== excludePlaceId);
     ids = uniq(ids).filter((id) => /^\d{5,12}$/.test(id));
 
-    // 후보는 넉넉히
-    if (ids.length) return ids.slice(0, Math.max(limit * 8, 40));
-
+    if (ids.length) return ids.slice(0, Math.max(limit * 10, 50));
     console.log("[COMP][findTopPlaceIds] no candidates for query:", q);
     return [];
   }
 
-  /**
-   * ✅ 경쟁사: 키워드만 빠르게 추출 + 중복/내업체 제거
-   */
   async crawlCompetitorsByIds(
     placeIds: string[],
     _industry: Industry,
@@ -320,7 +296,6 @@ export class CompetitorService {
           const nName = normName(comp.name || "");
           if (myNameN && nName && nName === myNameN) continue;
 
-          // 같은 업체(이름) 중복 제거
           if (nName && seenName.has(nName)) continue;
 
           seenId.add(id);
@@ -347,26 +322,19 @@ export class CompetitorService {
     const html = r.text;
     const len = html.length;
 
-    // shell 페이지(짧은 24만대) 방어: 키워드가 없으면 버림
-    if (len < 320_000) {
-      const kwTry = extractKeywordsFromHtml(html);
-      if (!kwTry.length) {
-        console.log("[COMP][shell] got shell page:", placeId, "final:", r.finalUrl, "len:", len);
-        return null;
-      }
-    }
-
     const name = extractNameFromHtml(html) || "";
-    if (!name || name.includes("네이버 플레이스")) return null;
+    const cleanName = sanitizeName(name);
 
-    const nName = normName(name);
+    if (!cleanName || /네이버\s*플레이스/i.test(cleanName)) return null;
+
+    const nName = normName(cleanName);
     if (myNameN && nName && nName === myNameN) return null;
 
     const keywords = extractKeywordsFromHtml(html);
-    console.log("[COMP][kw] probed:", placeId, "name:", name, "kw:", keywords.length, keywords.slice(0, 10));
+    console.log("[COMP][kw] probed:", placeId, "name:", cleanName, "kw:", keywords.length, keywords.slice(0, 10));
 
     if (!keywords.length) return null;
 
-    return { placeId, name, url: r.finalUrl || url, keywords };
+    return { placeId, name: cleanName, url: r.finalUrl || url, keywords };
   }
 }
