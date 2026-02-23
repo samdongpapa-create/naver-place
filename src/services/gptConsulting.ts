@@ -10,7 +10,13 @@ export type UnifiedPaidImprovements = {
   description: string;
   directions: string;
   keywords: string[];
-  reviewRequestScripts: { short: string; friendly: string; polite: string };
+
+  reviewRequestScripts: {
+    short: string;
+    friendly: string;
+    polite: string;
+  };
+
   ownerReplyTemplates: {
     satisfied: string;
     photoEncourage: string;
@@ -18,6 +24,7 @@ export type UnifiedPaidImprovements = {
     complaint: string;
     noShowOrDelay: string;
   };
+
   photoChecklist: string[];
   competitorKeywordInsights: string;
   priceGuidance?: string;
@@ -71,6 +78,7 @@ function extractRegionHint(address: string): string {
   return a.split(" ").slice(0, 2).join(" ");
 }
 
+// ✅ “서대문역” 같은 메인 지역
 function inferStation(placeName: string, address: string): string {
   const name = (placeName || "").replace(/\s+/g, " ").trim();
   const addr = (address || "").replace(/\s+/g, " ").trim();
@@ -84,6 +92,7 @@ function inferStation(placeName: string, address: string): string {
   if (/서대문/.test(name) || /서대문/.test(addr)) return "서대문역";
   if (/종로/.test(addr)) return "광화문";
   if (/중구/.test(addr)) return "시청";
+
   return "근처";
 }
 
@@ -93,176 +102,164 @@ function industryKorean(industry: Industry): string {
   return "카페";
 }
 
-function serviceHint(industry: Industry, placeData: PlaceData): string {
-  const kws = Array.isArray(placeData.keywords) ? placeData.keywords : [];
-  const menuNames = Array.isArray((placeData as any).menus)
-    ? (placeData as any).menus.map((m: any) => String(m?.name || ""))
-    : [];
-
-  const pool = [...kws, ...menuNames].map((s) => s.trim()).filter(Boolean).join(" ");
-
-  if (industry === "hairshop") {
-    if (/커트|컷/.test(pool)) return "커트";
-    if (/펌|볼륨매직|매직|다운펌/.test(pool)) return "펌";
-    if (/염색|컬러|아베다/.test(pool)) return "염색";
-    return "커트";
-  }
-  if (industry === "restaurant") {
-    if (/포장|배달/.test(pool)) return "포장";
-    if (/점심|런치/.test(pool)) return "점심";
-    return "대표메뉴";
-  }
-  if (/테이크아웃/.test(pool)) return "테이크아웃";
-  if (/디저트/.test(pool)) return "디저트";
-  return "시그니처";
+// ✅ 서비스 키워드(대표키워드가 아니라 “본문/리뷰/메뉴”에 녹여야 하는 것들)
+function serviceTokens(industry: Industry): string[] {
+  if (industry === "hairshop") return ["커트", "펌", "염색", "클리닉", "다운펌", "볼륨매직", "레이어드컷", "남자펌", "탈색"];
+  if (industry === "restaurant") return ["점심", "저녁", "포장", "배달", "예약", "회식", "데이트"];
+  return ["커피", "디저트", "브런치", "테이크아웃", "좌석", "작업", "콘센트", "조용한"];
 }
 
+// ✅ 상호명에서 “브랜드 방어 키워드” 만들기
+function makeBrandKeyword(placeName: string): string {
+  const name = (placeName || "").trim();
+  if (!name) return "";
+  // 괄호/지점/특수문자 제거 + 공백 제거
+  const cleaned = name
+    .replace(/\([^)]*\)/g, "")
+    .replace(/(서대문역점|교대역점|본점|지점|점)$/g, "")
+    .replace(/[^\w가-힣\s]/g, "")
+    .replace(/\s+/g, "")
+    .trim();
+
+  // 너무 길면 앞부분만 (브랜드 방어는 6~12자 정도가 보통 안정)
+  if (cleaned.length > 14) return cleaned.slice(0, 14);
+  return cleaned;
+}
+
+// ✅ 생활권/확장 지역 후보
 function buildNearbyLandmarks(industry: Industry, address: string, placeName: string) {
   const a = address || "";
   const defaults =
     industry === "hairshop"
-      ? ["서대문역", "광화문", "시청", "서울역", "경복궁", "종로", "명동"]
+      ? ["광화문", "종로", "시청", "서울역", "경복궁", "명동"]
       : industry === "restaurant"
-      ? ["역세권", "주차", "회식", "데이트", "가족모임"]
-      : ["역세권", "작업", "콘센트", "조용한", "테이크아웃"];
+      ? ["역세권", "주차", "회식", "데이트"]
+      : ["역세권", "작업", "조용한", "테이크아웃"];
 
   const hints: string[] = [];
   for (const k of defaults) if (placeName?.includes(k)) hints.push(k);
 
-  if (/종로/i.test(a)) hints.unshift("광화문", "경복궁", "종로");
+  if (/종로/i.test(a)) hints.unshift("광화문", "종로", "경복궁");
   if (/중구/i.test(a)) hints.unshift("시청", "명동", "서울역");
-  if (/서대문/i.test(a)) hints.unshift("서대문역", "충정로", "광화문");
+  if (/서대문/i.test(a)) hints.unshift("광화문", "충정로", "시청");
 
-  return Array.from(new Set(hints.concat(defaults))).slice(0, 3);
+  return Array.from(new Set(hints.concat(defaults))).filter(Boolean).slice(0, 3);
 }
 
 function buildConstraints(industry: Industry) {
   const base = {
+    keywordsCount: 5,
     descriptionMin: 360,
     descriptionMax: 650,
     directionsMin: 170,
     directionsMax: 420,
-    mustIncludeLandmarks: 2,
-    mustInclude:
-      industry === "hairshop"
-        ? ["예약", "상담", "시술", "디자이너"]
-        : industry === "restaurant"
-        ? ["대표메뉴", "가격", "포장", "주차"]
-        : ["시그니처", "좌석", "테이크아웃", "운영시간"],
-    pricePolicy:
-      industry === "hairshop"
-        ? "미용실은 '문의' 허용. 단, 글자수 늘리려고 가격/시술을 길게 나열하지 말 것. 주력 2~3개만 짧게 언급 가능."
-        : industry === "restaurant"
-        ? "식당은 대표메뉴 2~3개 가격은 명확히. 대신 과도한 가격 나열 금지."
-        : "카페는 시그니처/좌석/작업/콘센트/테이크아웃 등 전환요소 강조. 가격 나열로 글자수 채우지 말 것."
+    mustIncludeLandmarks: 2
   };
-  return base;
+
+  if (industry === "hairshop") {
+    return {
+      ...base,
+      mustInclude: ["예약", "상담", "시술", "디자이너"],
+      pricePolicy:
+        "미용실은 '문의' 허용. 단, 글자수 늘리려고 가격/시술을 길게 나열하지 말 것. 주력 2~3개만 짧게 언급 가능."
+    };
+  }
+  if (industry === "restaurant") {
+    return {
+      ...base,
+      mustInclude: ["대표메뉴", "가격", "포장", "주차"],
+      pricePolicy: "식당은 대표메뉴 2~3개 가격은 명확히. 대신 과도한 가격 나열 금지."
+    };
+  }
+  return {
+    ...base,
+    mustInclude: ["시그니처", "좌석", "테이크아웃", "운영시간"],
+    pricePolicy: "카페는 시그니처/좌석/작업/콘센트/테이크아웃 등 전환요소 강조. 가격 나열로 글자수 채우지 말 것."
+  };
 }
 
-function buildLocalFallbackFive(args: {
+/**
+ * ✅ 너가 원한 대표키워드 전략 “강제”
+ * 1) 메인지역+업종 (트래픽)
+ * 2) 확장지역(광화문)+업종 (확장)
+ * 3) 생활권(종로)+업종 (생활권 확장)
+ * 4) 카테고리 강화 (헤어살롱/카페/맛집 등)
+ * 5) 브랜드 방어 (상호명)
+ *
+ * ⚠️ 지역 중복/이상 조합(서대문역+광화문미용실) 절대 금지
+ */
+function buildKeywordStrategy5(args: {
   industry: Industry;
+  placeName: string;
   address: string;
   station: string;
-  landmarks: string[];
-  competitorTopKeywords: string[];
+  nearby: string[];
 }): string[] {
   const indK = industryKorean(args.industry);
-  const baseArea = args.station && args.station !== "근처" ? args.station : extractRegionHint(args.address) || args.landmarks?.[0] || "";
+  const station = args.station && args.station !== "근처" ? args.station : "";
 
-  const serviceCandidates =
-    args.industry === "hairshop"
-      ? ["미용실", "커트", "펌", "염색", "클리닉"]
-      : args.industry === "restaurant"
-      ? ["맛집", "점심", "저녁", "포장", "데이트"]
-      : ["카페", "커피", "디저트", "브런치", "테이크아웃"];
+  // 확장/생활권 후보: nearby에서 지역성 있는 것만 골라 사용
+  const areaCandidates = uniq((args.nearby || []).filter(Boolean))
+    .map((x) => x.replace(/\s+/g, "").trim())
+    .filter((x) => x.length >= 2 && x.length <= 10)
+    // "역세권/주차" 같은 건 지역이 아니라서 제외(미용실 기준)
+    .filter((x) => !/(역세권|주차|회식|데이트|가족모임|작업|조용한|테이크아웃)/.test(x));
 
-  const cand: string[] = [];
-  if (baseArea) cand.push(`${baseArea}${indK}`);
-  for (const s of serviceCandidates.slice(0, 3)) if (baseArea) cand.push(`${baseArea}${s}`);
+  // 미용실이면 광화문/종로 우선 (없으면 후보에서)
+  const secondary = areaCandidates.find((x) => x === "광화문") || areaCandidates[0] || "";
+  const tertiary = areaCandidates.find((x) => x === "종로") || areaCandidates.find((x) => x !== secondary) || "";
 
-  const preferComp = uniq(args.competitorTopKeywords || [])
-    .map((k) => String(k || "").trim())
-    .filter((k) => k.length >= 2 && k.length <= 14)
-    .filter((k) => !/추천$/.test(k))
-    .slice(0, 10);
+  const brand = makeBrandKeyword(args.placeName);
 
-  cand.push(...preferComp);
+  const category =
+    args.industry === "hairshop" ? "헤어살롱" : args.industry === "cafe" ? "카페" : "맛집";
 
-  const five = uniq(cand).slice(0, 5);
-  while (five.length < 5) {
-    const t = serviceCandidates[five.length % serviceCandidates.length];
-    five.push(baseArea ? `${baseArea}${t}` : `${t}`);
-  }
-  return five.slice(0, 5);
-}
-
-function finalizeKeywords5(args: {
-  industry: Industry;
-  station: string;
-  regionHint: string;
-  landmarks: string[];
-  gptKeywords5?: any;
-  fallbackFive: string[];
-}): string[] {
-  const stop = new Set<string>(["추천", "인기", "잘하는곳", "잘하는집", "최고", "1등", "베스트", "가격", "할인", "예약"]);
-
-  const normalize = (k: string) => {
-    let x = (k || "").replace(/\s+/g, "").trim();
-    if (!x) return "";
-    x = x.replace(/헤어샵/g, "미용실");
-    x = x.replace(/컷$/g, "커트");
-    x = x.replace(/컷/gi, "커트");
-    x = x.replace(/[^\w가-힣]/g, "");
-    return x;
+  const out: string[] = [];
+  const push = (k: string) => {
+    const t = (k || "").replace(/\s+/g, "").trim();
+    if (!t) return;
+    if (out.includes(t)) return;
+    out.push(t);
   };
 
-  const cleaned: string[] = [];
-  if (Array.isArray(args.gptKeywords5)) {
-    for (const x of args.gptKeywords5) {
-      const s = normalize(String(x || ""));
-      if (!s) continue;
-      if (s.length < 2 || s.length > 18) continue;
-      if (stop.has(s)) continue;
-      if (/추천$/.test(s)) continue;
-      cleaned.push(s);
-    }
-  }
+  // 1) 메인지역+업종
+  if (station) push(`${station}${indK}`);
+  else push(`${extractRegionHint(args.address)}${indK}`);
 
-  let base = cleaned.length >= 5 ? cleaned.slice(0, 5) : args.fallbackFive.slice(0, 5);
+  // 2) 확장지역+업종 (광화문미용실)
+  if (secondary) push(`${secondary}${indK}`);
 
-  const baseArea = args.station && args.station !== "근처" ? args.station : args.regionHint || args.landmarks?.[0] || "";
-  if (baseArea) {
-    base = base.map((k) => (k.startsWith(baseArea) ? k : `${baseArea}${k.replace(baseArea, "")}`));
-  }
+  // 3) 생활권+업종 (종로미용실)
+  if (tertiary) push(`${tertiary}${indK}`);
 
-  const out = uniq(base.map(normalize)).filter((k) => k && !stop.has(k) && !/추천$/.test(k));
-  while (out.length < 5) {
-    for (const k of args.fallbackFive) {
-      const nk = normalize(k);
-      if (!nk || stop.has(nk) || /추천$/.test(nk)) continue;
-      if (!out.includes(nk)) out.push(nk);
-      if (out.length >= 5) break;
-    }
-    if (out.length < 5 && baseArea) out.push(`${baseArea}${industryKorean(args.industry)}`);
-    if (out.length < 5) out.push(industryKorean(args.industry));
-  }
+  // 4) 카테고리 강화
+  push(category);
 
-  return uniq(out).slice(0, 5);
+  // 5) 브랜드 방어
+  if (brand) push(brand);
+
+  // 부족하면 업종 키워드로 채움
+  while (out.length < 5) push(indK);
+
+  return out.slice(0, 5);
 }
 
 function buildReviewBundle(industry: Industry, placeName: string, station: string, landmarks: string[]) {
   const indK = industryKorean(industry);
   const lm = landmarks?.[0] ? landmarks[0] : station;
 
+  const svc = serviceTokens(industry);
+
+  // ✅ 리뷰요청 문구에 서비스 키워드 자연 포함(염색 만족 등)
   const short = [`${placeName} 방문 후`, "후기 한 줄만 남겨주시면 큰 힘이 됩니다 🙏", "사진 1장도 함께 부탁드려요!"].join(" ");
   const friendly = [
     `${placeName} (${lm} 근처 ${indK}) 이용하셨다면`,
-    "리뷰로 느낌을 남겨주시면 다음 고객분들께 도움이 돼요 😊",
+    `리뷰로 느낌을 남겨주시면 다음 고객분들께 도움이 돼요 😊 (예: ${svc.slice(0, 3).join(", ")} 만족도)`,
     "가능하면 사진 1~2장도 부탁드릴게요!"
   ].join(" ");
   const polite = [
     `${placeName}를 이용해 주셔서 감사합니다.`,
-    "방문 후기(리뷰)를 남겨주시면 서비스 개선에 큰 도움이 됩니다.",
+    `방문 후기(리뷰)에 ${svc.slice(0, 2).join("/")} 등 경험을 남겨주시면 서비스 개선에 큰 도움이 됩니다.`,
     "사진 첨부도 가능하시면 함께 부탁드립니다."
   ].join(" ");
 
@@ -328,11 +325,11 @@ function buildUnifiedText(name: string, out: UnifiedPaidImprovements, predictedS
 async function callGptJSON(prompt: string): Promise<any> {
   const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
-  // response_format 지원 시도
+  // response_format 지원되면 JSON 강제
   try {
     const res = await client.chat.completions.create({
       model,
-      temperature: 0.25,
+      temperature: 0.35,
       response_format: { type: "json_object" } as any,
       messages: [
         { role: "system", content: "You output valid JSON only. No markdown. No explanation." },
@@ -341,16 +338,12 @@ async function callGptJSON(prompt: string): Promise<any> {
     });
 
     const text = res.choices?.[0]?.message?.content?.trim() || "{}";
-    try {
-      return JSON.parse(text);
-    } catch {
-      return {};
-    }
+    return JSON.parse(text);
   } catch {}
 
   const res = await client.chat.completions.create({
     model,
-    temperature: 0.25,
+    temperature: 0.35,
     messages: [
       { role: "system", content: "You output valid JSON only. No markdown. No explanation." },
       { role: "user", content: prompt }
@@ -384,33 +377,46 @@ export async function generatePaidConsultingGuaranteed(args: {
   const regionHint = extractRegionHint(args.placeData.address);
   const station = inferStation(args.placeData.name, args.placeData.address);
   const nearby = buildNearbyLandmarks(industry, args.placeData.address, args.placeData.name);
-  const service = serviceHint(industry, args.placeData);
 
-  const competitorTop = Array.isArray(args.competitorTopKeywords) ? args.competitorTopKeywords : [];
-  const fallbackFive = buildLocalFallbackFive({
+  // ✅ 대표키워드 5개는 “전략대로 강제”
+  const strategy5 = buildKeywordStrategy5({
     industry,
+    placeName: args.placeData.name,
     address: args.placeData.address,
     station,
-    landmarks: nearby,
-    competitorTopKeywords: competitorTop
+    nearby
   });
 
   const reviewBundle = buildReviewBundle(industry, args.placeData.name, station, nearby);
+
+  const competitorTop = Array.isArray(args.competitorTopKeywords) ? args.competitorTopKeywords : [];
   const target = clamp(args.targetScore ?? 90, 70, 98);
 
   let bestSim = args.scoredNow;
   let feedback = "";
   let lastRaw: any = null;
 
+  const svc = serviceTokens(industry);
+
   for (let attempt = 1; attempt <= 3; attempt++) {
     const prompt = `
 [역할]
-너는 네이버 플레이스 상위노출(검색 유입)과 전환(예약/문의)을 동시에 올리는 컨설팅 전문가다.
+너는 네이버 플레이스 상위노출(검색 유입) + 전환(예약/문의)을 동시에 올리는 컨설팅 전문가다.
+
+[대표키워드 정책(매우 중요)]
+- 대표키워드는 5개 "고정 전략"이다. (검색량 높은 키워드 중심)
+- 아래 5개를 그대로 사용하라. 절대 다른 조합(서대문역+광화문미용실 등)을 만들지 말 것.
+- 대표키워드 5개:
+${strategy5.map((k) => `- ${k}`).join("\n")}
+
+[서비스 키워드 활용(중요)]
+- 커트/펌/염색/클리닉 같은 서비스 키워드는 대표키워드에 억지로 넣지 않는다.
+- 대신 상세설명/오시는길 문장 속에 자연스럽게 1~2회만 녹여서 "조합검색"을 만든다.
+- 참고 서비스 키워드: ${svc.slice(0, 6).join(", ")}
 
 [목표]
 - 상세설명: ${constraints.descriptionMin}~${constraints.descriptionMax}자
 - 오시는길: ${constraints.directionsMin}~${constraints.directionsMax}자
-- 대표키워드: 5개 (중복 금지 / 2~18자 / 금칙어 금지)
 - 지역 힌트: "${regionHint}"를 자연스럽게 포함
 - 랜드마크: 최소 ${constraints.mustIncludeLandmarks}개 포함 (예: ${nearby.join(", ")})
 
@@ -419,10 +425,7 @@ export async function generatePaidConsultingGuaranteed(args: {
 - ❌ 글자수 채우려고 가격/시술을 길게 나열하지 말 것
 - 가격 정책: ${constraints.pricePolicy}
 
-[금칙어]
-추천, 인기, 잘하는곳, 잘하는집, 최고, 1등, 베스트, 가격, 할인
-
-[경쟁사 키워드 참고(빈도 TOP)]
+[경쟁사 키워드 참고(있으면만)]
 ${competitorTop.slice(0, 40).join(", ")}
 
 [현재 플레이스 데이터]
@@ -440,7 +443,6 @@ ${feedback ? feedback : "(없음)"}
   "improvements": {
     "description": "string",
     "directions": "string",
-    "keywords5": ["string","string","string","string","string"],
     "competitorKeywordInsights": "string",
     "priceGuidance": "string"
   }
@@ -455,15 +457,20 @@ ${feedback ? feedback : "(없음)"}
     let description = safeStr(imp.description);
     let directions = safeStr(imp.directions);
 
+    // ✅ 기본값에도 서비스 키워드 자연 삽입
     if (!description) {
-      description = `${args.placeData.name}은(는) ${regionHint}에 위치한 ${industryKorean(industry)}입니다. ${nearby
-        .slice(0, 2)
-        .join(", ")} 생활권에서 방문하기 편하고, 예약 후 1:1 상담으로 ${service} 등 이용을 안내합니다.`;
+      description = `${args.placeData.name}은(는) ${regionHint}에 위치한 ${industryKorean(industry)}입니다. ${
+        nearby.slice(0, 2).join(", ")
+      } 생활권에서 방문이 편하고, 예약 후 1:1 상담을 통해 ${
+        svc.slice(0, 3).join(", ")
+      } 등 시술/이용을 안내합니다. 디자이너가 취향과 손질 습관을 고려해 유지가 쉬운 스타일을 제안합니다.`;
     }
     if (!directions) {
       directions = `${regionHint} ${args.placeData.address}에 위치해 있습니다. ${
         station !== "근처" ? `${station} 기준` : "주변"
-      }으로 도보 이동이 가능하며, 건물 입구/층수는 지도와 사진을 함께 확인하시면 더 빠릅니다.`;
+      }으로 도보 이동이 가능하며, 건물 입구/층수는 지도와 사진을 함께 확인하시면 더 빠릅니다. 예약/문의 후 방문하시면 ${
+        svc[0] || "이용"
+      } 상담이 더 정확합니다.`;
     }
 
     description = clampText(description, constraints.descriptionMax);
@@ -471,18 +478,9 @@ ${feedback ? feedback : "(없음)"}
 
     const competitorKeywordInsights =
       safeStr(imp.competitorKeywordInsights) ||
-      `경쟁사는 '지역+서비스' 조합을 반복적으로 사용합니다.\n- ${regionHint} + (${service}) 형태로 생활권 검색어를 문장에 자연스럽게 배치\n- 랜드마크(예: ${nearby.join(", ")})를 1~2개 포함`;
+      `경쟁사 상위노출 패턴은 '지역+업종' 트래픽 키워드 중심 + 본문에 서비스 키워드를 자연 삽입하는 방식입니다.\n- 대표키워드: ${strategy5.join(", ")}\n- 본문에는 ${svc.slice(0, 4).join(", ")} 같은 서비스를 1~2회 자연 삽입(도배 금지)\n- 랜드마크(${nearby.join(", ")})를 1~2개 포함해 생활권 검색 유입 흡수`;
 
     const priceGuidance = safeStr(imp.priceGuidance) || constraints.pricePolicy;
-
-    const finalKeywords5 = finalizeKeywords5({
-      industry,
-      station,
-      regionHint,
-      landmarks: nearby,
-      gptKeywords5: (imp as any)?.keywords5,
-      fallbackFive
-    });
 
     const simulated = scorePlace({
       industry,
@@ -490,7 +488,7 @@ ${feedback ? feedback : "(없음)"}
       address: args.placeData.address,
       description,
       directions,
-      keywords: finalKeywords5,
+      keywords: strategy5, // ✅ 대표키워드 5개는 전략 고정
       reviewCount: args.placeData.reviewCount,
       recentReviewCount30d: (args.placeData as any).recentReviewCount30d,
       photoCount: args.placeData.photoCount,
@@ -504,9 +502,11 @@ ${feedback ? feedback : "(없음)"}
     const improvements: UnifiedPaidImprovements = {
       description,
       directions,
-      keywords: finalKeywords5,
+      keywords: strategy5,
+
       reviewRequestScripts: reviewBundle.reviewRequestScripts,
       ownerReplyTemplates: reviewBundle.ownerReplyTemplates,
+
       photoChecklist: [
         "대표사진 1장: 가장 자신 있는 결과(컷/펌/염색) 1컷",
         "매장 외관 1장: 입구/간판이 보이게",
@@ -526,7 +526,7 @@ ${feedback ? feedback : "(없음)"}
     if (sim.totalScore >= target) {
       return {
         improvements,
-        recommendedKeywords: finalKeywords5,
+        recommendedKeywords: strategy5, // ✅ recommendedKeywords도 100% 동일
         unifiedText,
         predicted: bestSim,
         attempts: attempt
@@ -536,54 +536,23 @@ ${feedback ? feedback : "(없음)"}
     feedback = `목표 ${target}점 미달(예상 ${sim.totalScore}점). 다음 생성에서는 글자수/랜드마크/필수요소를 보완. 점수 상세: ${JSON.stringify(sim.scores)}`;
   }
 
-  // ✅ 3회 실패해도 반환(여기서 redeclare 안 나게 변수명 변경)
+  // 3회 실패해도 반환
   const imp = lastRaw?.improvements || {};
-  const regionHint2 = extractRegionHint(args.placeData.address);
-  const station2 = inferStation(args.placeData.name, args.placeData.address);
-  const nearby2 = buildNearbyLandmarks(industry, args.placeData.address, args.placeData.name);
-  const service2 = serviceHint(industry, args.placeData);
+  const description = clampText(safeStr(imp.description) || "", constraints.descriptionMax) || `${args.placeData.name}은(는) ${regionHint}에 위치한 ${industryKorean(industry)}입니다. ${nearby.slice(0, 2).join(", ")} 생활권에서 방문이 편하고, 예약 후 상담을 통해 ${svc.slice(0, 3).join(", ")} 등을 안내합니다.`;
+  const directions = clampText(safeStr(imp.directions) || "", constraints.directionsMax) || `${regionHint} ${args.placeData.address}에 위치해 있습니다. ${station !== "근처" ? `${station} 기준` : "주변"}으로 도보 이동이 가능하며, 건물 입구/층수는 지도와 사진을 함께 확인하시면 더 빠릅니다.`;
 
-  const competitorTop2 = Array.isArray(args.competitorTopKeywords) ? args.competitorTopKeywords : [];
-  const fallbackFive2 = buildLocalFallbackFive({
-    industry,
-    address: args.placeData.address,
-    station: station2,
-    landmarks: nearby2,
-    competitorTopKeywords: competitorTop2
-  });
+  const competitorKeywordInsights =
+    safeStr((imp as any).competitorKeywordInsights) ||
+    `대표키워드는 트래픽/생활권/브랜드 방어 중심으로 구성하고, 서비스 키워드는 본문에 자연 삽입해 조합검색을 노립니다.\n- 대표키워드: ${strategy5.join(", ")}\n- 본문 서비스 키워드: ${svc.slice(0, 4).join(", ")}`;
 
-  const finalKeywords5 = finalizeKeywords5({
-    industry,
-    station: station2,
-    regionHint: regionHint2,
-    landmarks: nearby2,
-    gptKeywords5: (imp as any)?.keywords5,
-    fallbackFive: fallbackFive2
-  });
-
-  const reviewBundle2 = buildReviewBundle(industry, args.placeData.name, station2, nearby2);
-  const description = clampText(
-    safeStr(imp.description) ||
-      `${args.placeData.name}은(는) ${regionHint2}에 위치한 ${industryKorean(industry)}입니다. ${nearby2
-        .slice(0, 2)
-        .join(", ")} 생활권에서 방문이 편하고, 예약 후 1:1 상담으로 ${service2} 등 이용을 안내합니다.`,
-    constraints.descriptionMax
-  );
-
-  const directions = clampText(
-    safeStr(imp.directions) ||
-      `${regionHint2} ${args.placeData.address}에 위치해 있습니다. ${
-        station2 !== "근처" ? `${station2} 기준` : "주변"
-      }으로 도보 이동이 가능하며, 건물 입구/층수는 지도와 사진을 함께 확인하시면 더 빠릅니다.`,
-    constraints.directionsMax
-  );
+  const priceGuidance = safeStr((imp as any).priceGuidance) || constraints.pricePolicy;
 
   const improvements: UnifiedPaidImprovements = {
     description,
     directions,
-    keywords: finalKeywords5,
-    reviewRequestScripts: reviewBundle2.reviewRequestScripts,
-    ownerReplyTemplates: reviewBundle2.ownerReplyTemplates,
+    keywords: strategy5,
+    reviewRequestScripts: reviewBundle.reviewRequestScripts,
+    ownerReplyTemplates: reviewBundle.ownerReplyTemplates,
     photoChecklist: [
       "대표사진 1장: 가장 자신 있는 결과(컷/펌/염색) 1컷",
       "매장 외관 1장: 입구/간판이 보이게",
@@ -594,17 +563,15 @@ ${feedback ? feedback : "(없음)"}
       "찾아오는 길 2장: 건물 입구/층수/엘리베이터",
       "주차/대중교통 1장: 가능 여부/근처 주차장"
     ],
-    competitorKeywordInsights:
-      safeStr((imp as any).competitorKeywordInsights) ||
-      `경쟁사는 '지역+서비스' 조합을 반복적으로 사용합니다.\n- ${regionHint2} + (${service2}) 형태로 생활권 검색어를 문장에 자연스럽게 배치\n- 랜드마크(예: ${nearby2.join(", ")})를 1~2개 포함`,
-    priceGuidance: safeStr((imp as any).priceGuidance) || buildConstraints(industry).pricePolicy
+    competitorKeywordInsights,
+    priceGuidance
   };
 
   const unifiedText = buildUnifiedText(args.placeData.name, improvements, bestSim.totalScore, bestSim.totalGrade);
 
   return {
     improvements,
-    recommendedKeywords: finalKeywords5,
+    recommendedKeywords: strategy5,
     unifiedText,
     predicted: bestSim,
     attempts: 3
