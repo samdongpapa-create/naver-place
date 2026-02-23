@@ -1,14 +1,11 @@
 // src/services/competitorService.ts
 import type { Industry } from "../lib/scoring/types";
-import { ModularCrawler } from "./modularCrawler";
 
 type Competitor = {
   placeId: string;
   name?: string;
   address?: string;
   keywords?: string[];
-  reviewCount?: number;
-  photoCount?: number;
   url?: string;
 };
 
@@ -37,6 +34,24 @@ function extractPlaceIdsFromText(text: string): string[] {
   return uniq(ids);
 }
 
+function normalizeName(name: string): string {
+  let x = String(name || "").trim();
+  if (!x) return "";
+  x = stripHtml(x);
+  x = x.replace(/\([^)]*\)/g, ""); // (서대문역점) 같은 괄호 제거
+  x = x.replace(/(서대문역점|교대역점|역점|본점|지점|점)$/g, "");
+  x = x.replace(/[^\w가-힣]/g, ""); // 특수문자 제거
+  x = x.replace(/\s+/g, "");
+  return x.toLowerCase();
+}
+
+function addressPrefix(addr: string): string {
+  const a = String(addr || "").replace(/\s+/g, " ").trim();
+  if (!a) return "";
+  // "서울 서대문구" 정도까지만 비교
+  return a.split(" ").slice(0, 2).join(" ");
+}
+
 async function fetchWithTimeout(url: string, ms: number, headers: Record<string, string>) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), ms);
@@ -51,9 +66,6 @@ async function fetchWithTimeout(url: string, ms: number, headers: Record<string,
   }
 }
 
-/**
- * __NEXT_DATA__ 파싱 (m.place.naver.com은 Next.js 기반이라 대부분 존재)
- */
 function parseNextData(html: string): any | null {
   const m = String(html || "").match(
     /<script[^>]+id="__NEXT_DATA__"[^>]*>\s*([\s\S]*?)\s*<\/script>/i
@@ -66,10 +78,6 @@ function parseNextData(html: string): any | null {
   }
 }
 
-/**
- * JSON에서 특정 key를 “가장 그럴듯한 값”으로 찾기
- * - 구조가 바뀌어도 최대한 버티는 방식
- */
 function deepFindFirstString(obj: any, keys: string[]): string {
   const want = new Set(keys);
   const seen = new Set<any>();
@@ -97,36 +105,6 @@ function deepFindFirstString(obj: any, keys: string[]): string {
   return "";
 }
 
-function deepFindFirstNumber(obj: any, keys: string[]): number {
-  const want = new Set(keys);
-  const seen = new Set<any>();
-  const stack: any[] = [obj];
-
-  while (stack.length) {
-    const cur = stack.pop();
-    if (!cur || typeof cur !== "object") continue;
-    if (seen.has(cur)) continue;
-    seen.add(cur);
-
-    if (!Array.isArray(cur)) {
-      for (const k of Object.keys(cur)) {
-        const v = (cur as any)[k];
-        if (want.has(k)) {
-          const n = Number(v);
-          if (Number.isFinite(n) && n > 0) return n;
-        }
-      }
-    }
-
-    if (Array.isArray(cur)) {
-      for (const v of cur) stack.push(v);
-    } else {
-      for (const v of Object.values(cur)) stack.push(v);
-    }
-  }
-  return 0;
-}
-
 function deepFindStringArray(obj: any, keys: string[]): string[] {
   const want = new Set(keys);
   const seen = new Set<any>();
@@ -143,7 +121,7 @@ function deepFindStringArray(obj: any, keys: string[]): string[] {
         const v = (cur as any)[k];
         if (want.has(k) && Array.isArray(v)) {
           const out = v.map((x: any) => String(x || "").trim()).filter(Boolean);
-          if (out.length) return uniq(out).slice(0, 20);
+          if (out.length) return uniq(out).slice(0, 30);
         }
       }
     }
@@ -188,33 +166,19 @@ async function naverLocalSearchRaw(query: string, display = 25) {
 async function mapLimit<T, R>(items: T[], limit: number, fn: (x: T, idx: number) => Promise<R>): Promise<R[]> {
   const out: R[] = [];
   let i = 0;
-
   const workers = Array.from({ length: Math.max(1, limit) }, async () => {
     while (i < items.length) {
       const idx = i++;
       out[idx] = await fn(items[idx], idx);
     }
   });
-
   await Promise.all(workers);
   return out;
 }
 
 export class CompetitorService {
-  private crawler: ModularCrawler;
-  // ✅ OpenAPI에서 얻은 기본 정보(이름/주소)를 id별로 저장
+  // ✅ OpenAPI seed(이름/주소) 저장
   private seed = new Map<string, Partial<Competitor>>();
-
-  constructor() {
-    this.crawler = new ModularCrawler();
-  }
-
-  async close() {
-    try {
-      const anyCrawler = this.crawler as any;
-      if (typeof anyCrawler.close === "function") await anyCrawler.close();
-    } catch {}
-  }
 
   /**
    * ✅ OpenAPI로 후보 placeId 뽑기 + seed 저장
@@ -243,9 +207,10 @@ export class CompetitorService {
       const blob = JSON.stringify(it || {});
       const ids = extractPlaceIdsFromText(blob).filter((id) => /^\d{5,12}$/.test(id));
       for (const id of ids) {
+        if (id === excludePlaceId) continue;
         bag.push(id);
 
-        // ✅ seed에 기본 정보 저장(크롤링 실패해도 0 방지용)
+        // seed
         const title = stripHtml(String(it?.title || ""));
         const address = String(it?.roadAddress || it?.address || "").trim();
         this.seed.set(id, {
@@ -257,20 +222,15 @@ export class CompetitorService {
       }
     }
 
-    const ids = uniq(bag)
-      .filter((id) => id !== excludePlaceId)
-      .slice(0, Math.max(limit * 6, 25)); // 검증용 여유
-
+    const ids = uniq(bag).slice(0, Math.max(limit * 10, 40)); // 후보 넉넉히(중복 제거 대비)
     console.log("[COMP][OpenAPI] id candidates:", ids.length, ids.slice(0, 15));
     return ids;
   }
 
   /**
-   * ✅ 초경량 경쟁사 “프로브”
-   * - Playwright(무거움) 대신 fetch(가벼움)로 m.place HTML만 받아서 __NEXT_DATA__ 파싱
-   * - 실패하면 seed 정보만이라도 반환(0 방지)
+   * ✅ 초경량 keyword 프로브 (fetch + __NEXT_DATA__)
    */
-  private async probeCompetitorFast(id: string): Promise<Competitor | null> {
+  private async probeKeywordsFast(id: string): Promise<Competitor | null> {
     const url = buildCompetitorUrl(id);
 
     const headers = {
@@ -280,102 +240,129 @@ export class CompetitorService {
       Accept: "text/html,application/xhtml+xml"
     };
 
-    // ✅ 빠르게(1.2초) 프로브
     const r = await fetchWithTimeout(url, Number(process.env.COMPETITOR_PROBE_TIMEOUT_MS || 1200), headers);
+
+    // 실패하면 seed만
     if (!r.ok || !r.text) {
-      // seed라도 주자
       const s = this.seed.get(id);
-      return s?.name ? ({ placeId: id, url, ...s } as Competitor) : null;
+      if (!s?.name) return null;
+      return {
+        placeId: id,
+        url,
+        name: s.name,
+        address: s.address,
+        keywords: [] // seed는 키워드 없음
+      };
     }
 
     const next = parseNextData(r.text);
     if (!next) {
       const s = this.seed.get(id);
-      return s?.name ? ({ placeId: id, url, ...s } as Competitor) : null;
+      if (!s?.name) return null;
+      return { placeId: id, url, name: s.name, address: s.address, keywords: [] };
     }
 
-    // ✅ 구조가 바뀌어도 버티는 key 탐색
     const name =
-      deepFindFirstString(next, ["name", "placeName", "businessName"]) ||
-      this.seed.get(id)?.name ||
-      "";
+      deepFindFirstString(next, ["name", "placeName", "businessName"]) || this.seed.get(id)?.name || "";
     const address =
-      deepFindFirstString(next, ["roadAddress", "address", "fullAddress"]) ||
-      this.seed.get(id)?.address ||
-      "";
+      deepFindFirstString(next, ["roadAddress", "address", "fullAddress"]) || this.seed.get(id)?.address || "";
 
-    const reviewCount =
-      deepFindFirstNumber(next, ["visitorReviewCount", "visitorReviews", "reviewCount", "reviewCnt"]) || 0;
-    const photoCount =
-      deepFindFirstNumber(next, ["photoCount", "photoCnt", "imagesCount", "imageCount"]) || 0;
+    const keywords =
+      deepFindStringArray(next, ["keywords", "keywordList", "searchKeywords", "recommendedKeywords"]) || [];
 
-    const keywords = deepFindStringArray(next, ["keywords", "keywordList", "searchKeywords"]) || [];
-
-    if (!name) {
-      const s = this.seed.get(id);
-      return s?.name ? ({ placeId: id, url, ...s } as Competitor) : null;
-    }
+    if (!name) return null;
 
     return {
       placeId: id,
       url,
       name,
       address,
-      reviewCount,
-      photoCount,
-      keywords
+      keywords: uniq(keywords).slice(0, 20)
     };
   }
 
   /**
-   * ✅ 후보들을 빠르게 검증해서 Top5 확정
-   * - 동시 4개 병렬
-   * - 전체 하드 타임(기본 4.5초) 안에 최대한 뽑기
-   * - 그래도 부족하면 seed로 채워서 “0” 방지
+   * ✅ 후보들을 빠르게 프로브해서 Top5 확정
+   * - 중복 제거(같은 업체) + 내 업체 제거
+   * - 최종적으로 "키워드가 있는 경쟁사"를 우선
    */
-  async crawlCompetitorsByIds(placeIds: string[], industry: Industry, limit = 5): Promise<Competitor[]> {
+  async crawlCompetitorsByIds(
+    placeIds: string[],
+    industry: Industry,
+    limit = 5,
+    opts?: { excludePlaceId?: string; myName?: string; myAddress?: string }
+  ): Promise<Competitor[]> {
     const candidates = (placeIds || []).filter((x) => /^\d{5,12}$/.test(String(x)));
     if (!candidates.length) return [];
 
     const hardMs = Number(process.env.COMPETITOR_CRAWL_HARD_TIMEOUT_MS || 4500);
     const concurrency = Number(process.env.COMPETITOR_PROBE_CONCURRENCY || 4);
-
     const started = Date.now();
-    const out: Competitor[] = [];
-    const tried = new Set<string>();
 
-    // ✅ 앞쪽 후보만 (너무 많이 돌면 시간 초과)
-    const slice = candidates.slice(0, Math.max(limit * 6, 18));
+    const myNameNorm = normalizeName(opts?.myName || "");
+    const myAddrPref = addressPrefix(opts?.myAddress || "");
+    const excludePlaceId = String(opts?.excludePlaceId || "");
+
+    // ✅ 너무 많이 돌지 말기
+    const slice = candidates.slice(0, Math.max(limit * 10, 40));
 
     const results = await mapLimit(slice, concurrency, async (id) => {
       if (Date.now() - started > hardMs) return null;
-      if (tried.has(id)) return null;
-      tried.add(id);
+      if (excludePlaceId && id === excludePlaceId) return null;
 
       try {
-        return await this.probeCompetitorFast(id);
+        return await this.probeKeywordsFast(id);
       } catch {
         return null;
       }
     });
 
+    // 1) 내 업체 제거 + 2) 중복 제거(같은 업체)
+    const seenName = new Set<string>();
+    const seenAddr = new Set<string>();
+
+    const filtered: Competitor[] = [];
+
     for (const c of results) {
-      if (c && c.name) out.push(c);
-      if (out.length >= limit) break;
+      if (!c?.name) continue;
+
+      const nNorm = normalizeName(c.name);
+      const aPref = addressPrefix(c.address || "");
+
+      // ✅ 내 업체 제거(이름 기준)
+      if (myNameNorm && nNorm && nNorm === myNameNorm) continue;
+
+      // ✅ 내 업체 제거(주소 prefix 기준) - 같은 생활권이면 오탐 가능해서 "myNameNorm 없는 경우"엔 적용 안 함
+      if (myNameNorm && myAddrPref && aPref && aPref === myAddrPref) {
+        // 이름이 비슷하거나(부분 포함) 같은 경우만 제거
+        if (nNorm.includes(myNameNorm) || myNameNorm.includes(nNorm)) continue;
+      }
+
+      // ✅ 같은 업체 중복 제거(이름 정규화 기준)
+      if (nNorm && seenName.has(nNorm)) continue;
+      if (nNorm) seenName.add(nNorm);
+
+      // ✅ 보조 중복 제거(주소 prefix도 똑같으면 중복으로 간주)
+      if (aPref && seenAddr.has(`${nNorm}|${aPref}`)) continue;
+      if (aPref) seenAddr.add(`${nNorm}|${aPref}`);
+
+      filtered.push(c);
+      if (filtered.length >= limit) break;
       if (Date.now() - started > hardMs) break;
     }
 
-    // ✅ 그래도 부족하면 seed로 채워서 “0 방지”
-    if (out.length < limit) {
-      for (const id of slice) {
-        if (out.length >= limit) break;
-        if (out.some((x) => x.placeId === id)) continue;
-        const s = this.seed.get(id);
-        if (s?.name) out.push({ placeId: id, url: buildCompetitorUrl(id), ...s } as Competitor);
-      }
-    }
+    // ✅ 키워드가 있는 애들 우선 정렬 (없으면 뒤로)
+    filtered.sort((a, b) => (b.keywords?.length || 0) - (a.keywords?.length || 0));
+
+    const out = filtered.slice(0, limit).map((x) => ({
+      placeId: x.placeId,
+      url: x.url,
+      name: x.name,
+      // 너 요청대로: 리뷰/사진 다 빼고 키워드만
+      keywords: Array.isArray(x.keywords) ? x.keywords : []
+    }));
 
     console.log("[COMP][crawl-fast] final competitors:", out.length);
-    return out.slice(0, limit);
+    return out;
   }
 }
