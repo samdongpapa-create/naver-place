@@ -427,61 +427,45 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label = "timeout"): Pro
  * - crawlCompetitorsByIds는 "전체 timeout"으로 감싸지 않는다 (부분 성공을 0으로 날리지 않기 위함)
  * - totalTimeoutMs는 query 반복을 멈출지 판단하는 용도로만 사용
  */
+
 async function getCompetitorsSafe(params: {
   compSvc: CompetitorService;
-  industry: Industry;
   placeId: string;
-  myName: string;
-  myAddress: string; // server 내부에서만 사용(쿼리 후보/디버그)
   queries: string[];
   limit: number;
   totalTimeoutMs: number;
 }) {
-  const { compSvc, industry, placeId, myName, myAddress, queries, limit, totalTimeoutMs } = params;
+  const { compSvc, placeId, queries, limit, totalTimeoutMs } = params;
 
   const started = Date.now();
-  let best: any[] = [];
 
   for (const q of queries) {
-    const elapsed = Date.now() - started;
-    const remainingMs = totalTimeoutMs - elapsed;
-
-    // 남은 시간이 너무 없으면 더 시도하지 않음
-    if (remainingMs < 1200) break;
+    const remainingMs = totalTimeoutMs - (Date.now() - started);
+    if (remainingMs <= 200) break;
 
     try {
       console.log("[PAID][COMP] try query:", q, "remainingMs:", remainingMs);
 
-      const ids = await withTimeout(
-        compSvc.findTopPlaceIds(q, placeId, limit),
-        Math.min(2500, remainingMs),
-        "compIds-timeout"
+      const comps = await withTimeout(
+        compSvc.findTopCompetitorsByKeyword(q, {
+          excludePlaceId: placeId,
+          limit,
+          timeoutMs: Math.min(remainingMs, 9000)
+        }),
+        Math.min(remainingMs, 9000),
+        "compTop-timeout"
       );
-      if (!ids?.length) continue;
-
-      // ✅ FIX: 전체 timeout 래핑 제거 (부분 성공 살리기)
-      const comps = await compSvc.crawlCompetitorsByIds(ids, industry, limit, {
-        excludePlaceId: placeId,
-        myName
-      });
 
       if (Array.isArray(comps) && comps.length) {
-        best = comps;
-        break;
+        // ✅ 여기서 바로 리턴: 이미 TOPN + keywords까지 포함
+        return comps.slice(0, limit);
       }
     } catch (e: any) {
       console.log("[PAID][COMP] query failed:", q, e?.message || String(e));
     }
   }
 
-  const uniqById = new Map<string, any>();
-  for (const c of best) {
-    if (!c?.placeId) continue;
-    if (!uniqById.has(c.placeId)) uniqById.set(c.placeId, c);
-    if (uniqById.size >= limit) break;
-  }
-
-  return Array.from(uniqById.values()).slice(0, limit);
+  return [];
 }
 
 /** FREE */
@@ -603,16 +587,13 @@ app.post("/api/diagnose/paid", async (req, res) => {
       ].filter(Boolean)
     ).slice(0, 3);
 
-    const competitors = await getCompetitorsSafe({
-      compSvc,
-      industry: prof.scoreIndustry,
-      placeId,
-      myName: crawlResult.data.name,
-      myAddress: crawlResult.data.address,
-      queries: queryCandidates,
-      limit: 5,
-      totalTimeoutMs: Number(process.env.COMPETITOR_TIMEOUT_MS || 9000) // ✅ 9초 권장
-    });
+const competitors = await getCompetitorsSafe({
+  compSvc,
+  placeId,
+  queries: queryCandidates,
+  limit: 5,
+  totalTimeoutMs: Number(process.env.COMPETITOR_TIMEOUT_MS || 9000)
+});
 
     console.log("[PAID] competitors:", competitors.length, "queries:", queryCandidates);
 
