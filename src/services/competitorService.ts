@@ -38,13 +38,10 @@ function collectIdCandidatesFromAnyJson(json: any): string[] {
 }
 
 /**
- * 네이버 모바일 지도 검색 URL (검색어만 바꿔치기)
- * - m.map.naver.com은 서버에서 단순 fetch하면 500/차단 나는데,
- *   Playwright로 브라우저 컨텍스트를 만들면 통과 확률이 훨씬 높음.
+ * 네이버 모바일 지도 검색 URL
  */
 function buildMobileMapSearchUrl(query: string) {
   const q = encodeURIComponent((query || "").trim());
-  // query parameter만 중요. path는 가끔 바뀌어도 리다이렉트로 살아남는 편.
   return `https://m.map.naver.com/search2/search.naver?query=${q}`;
 }
 
@@ -88,17 +85,13 @@ export class CompetitorService {
 
   /**
    * ✅ Playwright로 m.map.naver.com 검색 페이지를 열고
-   * 페이지에서 발생하는 네트워크 응답(JSON)들을 가로채 placeId 후보를 뽑는다.
-   *
-   * 장점:
-   * - Railway에서 map API 직접 호출(400/503) 우회
-   * - DOM 셀렉터가 바뀌어도, 네트워크 응답만 잡히면 placeId는 계속 나온다
+   * 네트워크 응답(JSON)을 가로채 placeId 후보를 뽑는다.
    */
   async findTopPlaceIds(query: string, excludePlaceId: string, limit = 5): Promise<string[]> {
     const q = (query || "").trim();
     if (!q) return [];
 
-    const MAX_CANDIDATES = Math.max(limit * 20, 80); // 후보 넉넉히
+    const MAX_CANDIDATES = Math.max(limit * 20, 80);
     const collected: string[] = [];
     const tried = new Set<string>();
 
@@ -133,23 +126,17 @@ export class CompetitorService {
 
       page = await context.newPage();
 
-      // ✅ 네트워크 응답 가로채서 placeId 후보 긁기
+      // ✅ 네트워크 응답에서 placeId 후보 수집
       page.on("response", async (res) => {
         try {
-          // 너무 오래 걸리면 무시
           if (Date.now() - started > hardTimeoutMs) return;
 
           const url = res.url();
           const ct = (res.headers()["content-type"] || "").toLowerCase();
 
-          // JSON류만 (가끔 text/plain으로 JSON 내려줌)
           if (!ct.includes("application/json") && !ct.includes("text/plain")) return;
-
-          // 네이버 지도 내부 API 힌트: search/list/places 등
-          // (너무 엄격히 필터링하면 구조 바뀔 때 놓침)
           if (!/naver\.com/i.test(url)) return;
 
-          // body size/속도 때문에 json() 말고 text() 우선
           const txt = await res.text();
           if (!txt || txt.length < 20) return;
 
@@ -162,8 +149,6 @@ export class CompetitorService {
           if (!json) return;
 
           let ids = collectIdCandidatesFromAnyJson(json);
-
-          // exclude & 형태 검증
           ids = ids.filter((id) => /^\d{5,12}$/.test(id));
           ids = ids.filter((id) => id !== excludePlaceId);
 
@@ -181,25 +166,26 @@ export class CompetitorService {
       const url = buildMobileMapSearchUrl(q);
       console.log("[COMP][PW-search] goto:", url);
 
-      // ✅ 페이지 로드 (가벼운 로드 전략)
       await withTimeout(
         page.goto(url, { waitUntil: "domcontentloaded" }),
         Number(process.env.COMPETITOR_PW_GOTO_TIMEOUT_MS || 4000),
         "pw-goto-timeout"
       );
 
-      // ✅ search 결과가 내부적으로 추가 XHR을 부르는 시간을 조금 준다
+      // XHR 유도 대기
       await page.waitForTimeout(Number(process.env.COMPETITOR_PW_WAIT_MS || 1200));
 
-      // ✅ 스크롤 한 번(추가 로딩 유도)
+      // ✅ DOM(window/document) 없이 스크롤 유도 (TS 에러 방지)
       try {
-        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-        await page.waitForTimeout(700);
+        await page.mouse.wheel(0, 1600);
+        await page.waitForTimeout(600);
+        await page.mouse.wheel(0, 1600);
+        await page.waitForTimeout(600);
       } catch {}
 
       const finalIds = uniq(collected)
         .filter((id) => id !== excludePlaceId)
-        .slice(0, Math.max(limit * 5, 25)); // "검증용" 후보
+        .slice(0, Math.max(limit * 5, 25));
 
       console.log("[COMP][PW-search] candidates:", finalIds.length, finalIds.slice(0, 15));
       return finalIds;
@@ -214,7 +200,6 @@ export class CompetitorService {
 
   /**
    * ✅ 후보 placeId들을 실제로 크롤링해서 "성공한 애들만" 경쟁사로 확정
-   * - candidates에 쓰레기 숫자가 섞여 있어도 상관 없음 (실패하면 버림)
    */
   async crawlCompetitorsByIds(placeIds: string[], industry: Industry, limit = 5): Promise<Competitor[]> {
     const candidates = (placeIds || []).filter(Boolean);
@@ -223,7 +208,6 @@ export class CompetitorService {
     const out: Competitor[] = [];
     const tried = new Set<string>();
 
-    // ✅ 너무 오래 걸리면 유료 API가 답답해지므로 하드 컷
     const hardTimeoutMs = Number(process.env.COMPETITOR_CRAWL_HARD_TIMEOUT_MS || 7000);
     const started = Date.now();
 
