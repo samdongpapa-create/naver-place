@@ -38,7 +38,7 @@ function normalizeName(name: string): string {
   let x = String(name || "").trim();
   if (!x) return "";
   x = stripHtml(x);
-  x = x.replace(/\([^)]*\)/g, "");
+  x = x.replace(/\([^)]*\)/g, ""); // (서대문역점) 제거
   x = x.replace(/(서대문역점|교대역점|역점|본점|지점|점)$/g, "");
   x = x.replace(/[^\w가-힣]/g, "");
   x = x.replace(/\s+/g, "");
@@ -48,6 +48,7 @@ function normalizeName(name: string): string {
 function addressPrefix(addr: string): string {
   const a = String(addr || "").replace(/\s+/g, " ").trim();
   if (!a) return "";
+  // "서울 종로구" 정도로만 비교
   return a.split(" ").slice(0, 2).join(" ");
 }
 
@@ -105,30 +106,26 @@ function deepFindFirstString(obj: any, keys: string[]): string {
 }
 
 /**
- * ✅ 키워드 추출 강화 버전
- * - 1) string[] 형태
- * - 2) [{keyword:"..."},{name:"..."}] 형태
- * - 3) JSON 문자열에서 "keyword":"..." 정규식 스캔
+ * ✅ 1) __NEXT_DATA__ 기반 키워드 추출 (string[] / object[] 지원)
  */
-function extractKeywordsFromAny(obj: any): string[] {
+function extractKeywordsFromNextData(next: any): string[] {
+  if (!next) return [];
+
   const out: string[] = [];
 
   const push = (v: any) => {
     const s = String(v || "").trim();
     if (!s) return;
-    // 너무 짧거나 이상한 값 제거 (필요하면 완화 가능)
     if (s.length < 2 || s.length > 30) return;
-    // 흔한 노이즈 제거
     if (/^http/i.test(s)) return;
     out.push(s);
   };
 
-  // 1) BFS로 돌면서 키 후보 찾기
   const arrayKeys = new Set(["keywords", "keywordList", "searchKeywords", "recommendedKeywords", "mainKeywords"]);
-  const objectWordKeys = new Set(["keyword", "name", "text", "title"]); // 객체 배열 요소에서 후보 키
+  const objectWordKeys = new Set(["keyword", "name", "text", "title"]);
 
   const seen = new Set<any>();
-  const stack: any[] = [obj];
+  const stack: any[] = [next];
 
   while (stack.length) {
     const cur = stack.pop();
@@ -138,12 +135,10 @@ function extractKeywordsFromAny(obj: any): string[] {
 
     if (!Array.isArray(cur)) {
       for (const [k, v] of Object.entries(cur)) {
-        // string[] 바로 추출
         if (arrayKeys.has(k) && Array.isArray(v)) {
           for (const it of v) {
             if (typeof it === "string") push(it);
             else if (it && typeof it === "object") {
-              // 객체 배열이면 keyword/name 등을 우선 추출
               for (const kk of Object.keys(it)) {
                 if (objectWordKeys.has(kk) && typeof (it as any)[kk] === "string") push((it as any)[kk]);
               }
@@ -160,33 +155,66 @@ function extractKeywordsFromAny(obj: any): string[] {
     }
   }
 
-  // 2) JSON 문자열 정규식 스캔 (최후의 수단, 구조 변경에도 버팀)
-  let jsonText = "";
-  try {
-    jsonText = JSON.stringify(obj);
-  } catch {
-    jsonText = "";
-  }
-  if (jsonText) {
-    // "keyword":"서대문역미용실" 패턴
-    const re = /"keyword"\s*:\s*"([^"]{2,40})"/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(jsonText))) push(m[1]);
-
-    // "name":"서대문역미용실" 같은 경우 (너무 광범위하면 노이즈 생길 수 있어 최소한만)
-    const re2 = /"mainKeyword"\s*:\s*"([^"]{2,40})"/g;
-    while ((m = re2.exec(jsonText))) push(m[1]);
-  }
-
-  // 3) 후처리: 공백/특수문자 정리 + 중복 제거
-  const cleaned = uniq(
+  return uniq(
     out
       .map((s) => s.replace(/\s+/g, " ").trim())
-      .map((s) => s.replace(/[<>]/g, ""))
       .filter(Boolean)
-  );
+  ).slice(0, 30);
+}
 
-  return cleaned.slice(0, 30);
+/**
+ * ✅ 2) HTML regex fallback (네 ModularCrawler처럼)
+ * - "keywords":[ "a","b",... ] 형태
+ * - 또는 ["a","b",...] 단독 배열 형태(페이지에 종종 존재)
+ */
+function extractKeywordsFromHtmlFallback(html: string): string[] {
+  const text = String(html || "");
+  if (!text) return [];
+
+  const results: string[] = [];
+
+  const push = (s: string) => {
+    const x = String(s || "").trim();
+    if (!x) return;
+    if (x.length < 2 || x.length > 30) return;
+    if (/^http/i.test(x)) return;
+    results.push(x);
+  };
+
+  // (A) "keywords":[ "a","b","c" ]
+  {
+    const m = text.match(/"keywords"\s*:\s*\[([\s\S]*?)\]/i);
+    if (m?.[1]) {
+      const inner = m[1];
+      const items = inner.match(/"([^"]{2,40})"/g) || [];
+      for (const it of items) push(it.replace(/^"|"$/g, ""));
+    }
+  }
+
+  // (B) "keywordList":[ ... ] 혹은 "searchKeywords":[ ... ]
+  {
+    const m = text.match(/"(keywordList|searchKeywords|recommendedKeywords|mainKeywords)"\s*:\s*\[([\s\S]*?)\]/i);
+    if (m?.[2]) {
+      const inner = m[2];
+      const items = inner.match(/"([^"]{2,40})"/g) || [];
+      for (const it of items) push(it.replace(/^"|"$/g, ""));
+    }
+  }
+
+  // (C) 객체 배열에서 "keyword":"..."
+  {
+    const re = /"keyword"\s*:\s*"([^"]{2,40})"/g;
+    let mm: RegExpExecArray | null;
+    while ((mm = re.exec(text))) push(mm[1]);
+  }
+
+  // 최종 정리
+  return uniq(
+    results
+      .map((s) => stripHtml(s))
+      .map((s) => s.replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+  ).slice(0, 30);
 }
 
 async function naverLocalSearchRaw(query: string, display = 25) {
@@ -233,11 +261,14 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (x: T, idx: number)
 export class CompetitorService {
   private seed = new Map<string, Partial<Competitor>>();
 
-  // ✅ server.ts 호환용
+  // ✅ server.ts 호환용 (현재 리소스 보유 X)
   async close() {
     return;
   }
 
+  /**
+   * ✅ OpenAPI로 후보 placeId 뽑기 + seed(name/address) 저장
+   */
   async findTopPlaceIds(query: string, excludePlaceId: string, limit = 5): Promise<string[]> {
     const q = (query || "").trim();
     if (!q) return [];
@@ -267,6 +298,7 @@ export class CompetitorService {
 
         const title = stripHtml(String(it?.title || ""));
         const address = String(it?.roadAddress || it?.address || "").trim();
+
         this.seed.set(id, {
           placeId: id,
           name: title || undefined,
@@ -281,6 +313,9 @@ export class CompetitorService {
     return ids;
   }
 
+  /**
+   * ✅ 경쟁사 1개: fetch HTML → (1) __NEXT_DATA 키워드 → (2) HTML regex fallback
+   */
   private async probeKeywordsFast(id: string): Promise<Competitor | null> {
     const url = buildCompetitorUrl(id);
 
@@ -291,33 +326,40 @@ export class CompetitorService {
       Accept: "text/html,application/xhtml+xml"
     };
 
-    const r = await fetchWithTimeout(url, Number(process.env.COMPETITOR_PROBE_TIMEOUT_MS || 1500), headers);
+    const r = await fetchWithTimeout(url, Number(process.env.COMPETITOR_PROBE_TIMEOUT_MS || 1800), headers);
 
+    // 실패하면 seed만
     if (!r.ok || !r.text) {
       const s = this.seed.get(id);
       if (!s?.name) return null;
+      console.log("[COMP][kw] probe fail html:", id, "status:", r.status);
       return { placeId: id, url, name: s.name, address: s.address, keywords: [] };
     }
 
+    // name/address
     const next = parseNextData(r.text);
-    if (!next) {
-      const s = this.seed.get(id);
-      if (!s?.name) return null;
-      return { placeId: id, url, name: s.name, address: s.address, keywords: [] };
-    }
+    const nameFromNext = next ? deepFindFirstString(next, ["name", "placeName", "businessName"]) : "";
+    const addrFromNext = next ? deepFindFirstString(next, ["roadAddress", "address", "fullAddress"]) : "";
 
-    const name =
-      deepFindFirstString(next, ["name", "placeName", "businessName"]) || this.seed.get(id)?.name || "";
-    const address =
-      deepFindFirstString(next, ["roadAddress", "address", "fullAddress"]) || this.seed.get(id)?.address || "";
-
-    // ✅ 핵심: 강화된 키워드 추출
-    const keywords = extractKeywordsFromAny(next);
+    const seed = this.seed.get(id);
+    const name = (nameFromNext || seed?.name || "").trim();
+    const address = (addrFromNext || seed?.address || "").trim();
 
     if (!name) return null;
 
+    // keywords: 1) nextData 2) html fallback
+    let keywords: string[] = [];
+    if (next) keywords = extractKeywordsFromNextData(next);
+
     if (!keywords.length) {
-      console.log("[COMP][kw] empty keywords:", id, "name:", name);
+      const fromHtml = extractKeywordsFromHtmlFallback(r.text);
+      if (fromHtml.length) keywords = fromHtml;
+    }
+
+    // 디버그 로그
+    console.log("[COMP][kw] probed:", id, "name:", name, "kw:", keywords.length, keywords.slice(0, 8));
+    if (!keywords.length) {
+      console.log("[COMP][kw] empty keywords:", id, "name:", name, "htmlLen:", r.text.length, "hasNext:", Boolean(next));
     }
 
     return {
@@ -325,10 +367,13 @@ export class CompetitorService {
       url,
       name,
       address,
-      keywords: keywords.slice(0, 20)
+      keywords: uniq(keywords).slice(0, 20)
     };
   }
 
+  /**
+   * ✅ 후보들 → 빠르게 키워드 프로브 → 중복/내업체 제거 → TopN
+   */
   async crawlCompetitorsByIds(
     placeIds: string[],
     industry: Industry,
@@ -338,7 +383,7 @@ export class CompetitorService {
     const candidates = (placeIds || []).filter((x) => /^\d{5,12}$/.test(String(x)));
     if (!candidates.length) return [];
 
-    const hardMs = Number(process.env.COMPETITOR_CRAWL_HARD_TIMEOUT_MS || 4500);
+    const hardMs = Number(process.env.COMPETITOR_CRAWL_HARD_TIMEOUT_MS || 5000);
     const concurrency = Number(process.env.COMPETITOR_PROBE_CONCURRENCY || 4);
     const started = Date.now();
 
@@ -346,7 +391,7 @@ export class CompetitorService {
     const myAddrPref = addressPrefix(opts?.myAddress || "");
     const excludePlaceId = String(opts?.excludePlaceId || "");
 
-    const slice = candidates.slice(0, Math.max(limit * 10, 40));
+    const slice = candidates.slice(0, Math.max(limit * 12, 60));
 
     const results = await mapLimit(slice, concurrency, async (id) => {
       if (Date.now() - started > hardMs) return null;
@@ -368,19 +413,19 @@ export class CompetitorService {
       const nNorm = normalizeName(c.name);
       const aPref = addressPrefix(c.address || "");
 
-      // 내 업체 제거(이름)
+      // ✅ 내 업체 제거(이름)
       if (myNameNorm && nNorm && nNorm === myNameNorm) continue;
 
-      // 내 업체 제거(주소 prefix + 이름 유사)
+      // ✅ 내 업체 제거(주소 prefix + 이름 유사)
       if (myNameNorm && myAddrPref && aPref && aPref === myAddrPref) {
         if (nNorm.includes(myNameNorm) || myNameNorm.includes(nNorm)) continue;
       }
 
-      // 중복 제거(이름)
+      // ✅ 중복 제거(이름)
       if (nNorm && seenName.has(nNorm)) continue;
       if (nNorm) seenName.add(nNorm);
 
-      // 보조 중복(이름+주소prefix)
+      // ✅ 보조 중복(이름+주소prefix)
       const key = `${nNorm}|${aPref}`;
       if (aPref && seenNameAddr.has(key)) continue;
       if (aPref) seenNameAddr.add(key);
@@ -390,7 +435,7 @@ export class CompetitorService {
       if (Date.now() - started > hardMs) break;
     }
 
-    // 키워드 있는 애 우선
+    // ✅ 키워드 많은 순 우선
     filtered.sort((a, b) => (b.keywords?.length || 0) - (a.keywords?.length || 0));
 
     const out = filtered.slice(0, limit).map((x) => ({
