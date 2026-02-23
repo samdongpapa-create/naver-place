@@ -10,7 +10,7 @@ type Competitor = {
 
 type CrawlOpts = {
   excludePlaceId?: string;
-  myName?: string; // 내 업체명으로 중복/자기자신 제거
+  myName?: string; // 내 업체명으로 자기자신 제거(추가 방어)
 };
 
 function uniq<T>(arr: T[]) {
@@ -24,29 +24,7 @@ function normName(s: string) {
     .replace(/[^\w가-힣]/g, "");
 }
 
-/** --- low-level fetch helpers --- */
-async function fetchJson(url: string, extraHeaders?: Record<string, string>) {
-  const res = await fetch(url, {
-    method: "GET",
-    headers: {
-      "user-agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      "accept-language": "ko-KR,ko;q=0.9,en;q=0.7",
-      accept: "application/json,text/plain,*/*",
-      ...extraHeaders
-    }
-  });
-
-  const text = await res.text();
-  let json: any = null;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = null;
-  }
-  return { ok: res.ok, status: res.status, json, text, finalUrl: res.url };
-}
-
+/** --- fetch helpers --- */
 async function fetchText(url: string, extraHeaders?: Record<string, string>) {
   const res = await fetch(url, {
     method: "GET",
@@ -76,24 +54,7 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label = "timeout"): Pro
   }
 }
 
-/**
- * ✅ JSON 전체에서 5~12자리 숫자 후보를 전부 수집
- * - placeId가 어떤 키에 들어있든 관계없이 문자열/숫자 모두 긁어옴
- */
-function collectIdCandidatesFromAnyJson(json: any): string[] {
-  if (!json) return [];
-  let s = "";
-  try {
-    s = JSON.stringify(json);
-  } catch {
-    s = "";
-  }
-  if (!s) return [];
-  const ids = s.match(/\b\d{5,12}\b/g) || [];
-  return uniq(ids);
-}
-
-/** --- HTML extraction (키워드/이름) --- */
+/** --- HTML utils --- */
 function decodeHtml(s: string) {
   return String(s || "")
     .replace(/&amp;/g, "&")
@@ -156,18 +117,17 @@ function cleanKeywordList(arr: string[]): string[] {
 }
 
 /**
- * ✅ 무료 크롤러가 하던 방식과 “동일 계열”
- * - page HTML에서 키워드 배열 패턴을 찾는다
+ * ✅ “무료버전과 같은 계열”의 키워드 추출
+ * - HTML 내 keywords/keywordList/.. 배열 패턴 우선
+ * - 안 나오면 그럴듯한 문자열 배열 fallback
  */
 function extractKeywordsFromHtml(html: string): string[] {
   const s = String(html || "");
   if (!s) return [];
 
-  // 1) 흔한 패턴들
   const patterns = [
     /"keywords"\s*:\s*(\[[^\]]+\])/,
     /"keywordList"\s*:\s*(\[[^\]]+\])/,
-    /"keyword"\s*:\s*(\[[^\]]+\])/,
     /"placeKeywords"\s*:\s*(\[[^\]]+\])/,
     /"keywordsJson"\s*:\s*(\[[^\]]+\])/
   ];
@@ -181,16 +141,15 @@ function extractKeywordsFromHtml(html: string): string[] {
     }
   }
 
-  // 2) 최후 fallback: 문자열 배열 후보를 여러 개 찾고 그 중 그럴싸한 것 선택
+  // fallback: 문자열 배열 후보 중 “한글이 많고 URL이 적은 것” 우선
   const re = /\[(?:"[^"\n]{2,30}"\s*,\s*){2,30}"[^"\n]{2,30}"\]/g;
   const matches = s.match(re) || [];
-  const parsed: string[][] = [];
+  const parsed: { arr: string[]; score: number }[] = [];
 
-  for (const raw of matches.slice(0, 60)) {
+  for (const raw of matches.slice(0, 80)) {
     const arr = safeParseStringArray(raw);
     if (!arr.length) continue;
 
-    // 점수화: 한글 포함/URL 포함/길이
     let score = 0;
     for (const it of arr) {
       const t = String(it || "");
@@ -198,30 +157,25 @@ function extractKeywordsFromHtml(html: string): string[] {
       if (/https?:\/\//i.test(t)) score -= 3;
       if (t.length > 20) score -= 1;
     }
-    if (score >= 6) parsed.push(arr);
+    if (score >= 6) parsed.push({ arr, score });
   }
 
-  parsed.sort((a, b) => countKo(b) - countKo(a));
+  parsed.sort((a, b) => b.score - a.score);
 
-  for (const arr of parsed) {
-    const cleaned = cleanKeywordList(arr);
+  for (const p of parsed) {
+    const cleaned = cleanKeywordList(p.arr);
     if (cleaned.length >= 3) return cleaned.slice(0, 20);
   }
 
   return [];
-
-  function countKo(arr: string[]) {
-    return arr.filter((x) => /[가-힣]/.test(String(x || ""))).length;
-  }
 }
 
 /**
- * ✅ 핵심: /place/{id} 로 먼저 hit → redirect 최종 URL에서 slug를 알아낸다
- * - 어떤 id가 들어와도 /hairshop/{id}/home 같은 “진짜 페이지”를 최대한 확보
+ * ✅ 핵심: /place/{id} hit → redirect finalUrl에서 slug 확보 → slug home으로 확정
  */
 async function resolveBestHomeUrl(placeId: string): Promise<string> {
   const tries = [
-    `https://m.place.naver.com/place/${placeId}`, // ← 이게 제일 잘 redirect 나옴
+    `https://m.place.naver.com/place/${placeId}`,
     `https://m.place.naver.com/place/${placeId}/home`,
     `https://m.place.naver.com/place/${placeId}?entry=pll`,
     `https://m.place.naver.com/place/${placeId}/home?entry=pll`
@@ -232,14 +186,13 @@ async function resolveBestHomeUrl(placeId: string): Promise<string> {
       const r = await fetchText(u, { referer: "https://m.place.naver.com/" });
       const finalUrl = r.finalUrl || u;
 
-      // finalUrl이 이미 /hairshop/{id}/... 형태면 home으로 맞춤
       const m = finalUrl.match(/https:\/\/m\.place\.naver\.com\/([a-zA-Z0-9_]+)\/(\d{5,12})(\/[a-zA-Z0-9_]+)?/);
       if (m?.[1] && m?.[2]) {
         const slug = m[1];
         const pid = m[2];
         return `https://m.place.naver.com/${slug}/${pid}/home`;
       }
-      // 그래도 /place/{id}면 home 고정
+
       if (/\/place\/\d{5,12}/.test(finalUrl)) {
         return `https://m.place.naver.com/place/${placeId}/home`;
       }
@@ -249,70 +202,95 @@ async function resolveBestHomeUrl(placeId: string): Promise<string> {
   return `https://m.place.naver.com/place/${placeId}/home`;
 }
 
+/**
+ * ✅ (NEW) map API 버리고 “네이버 검색(플레이스)” HTML에서 placeId 수집
+ * - Railway에서도 매우 잘 버팀
+ */
+async function findPlaceIdsViaNaverSearchHTML(query: string): Promise<string[]> {
+  const q = (query || "").trim();
+  if (!q) return [];
+
+  // PC/모바일 둘 다 시도 (둘 중 하나는 살아남는 편)
+  const urls = [
+    `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`,
+    `https://m.search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`
+  ];
+
+  for (const url of urls) {
+    const r = await fetchText(url, { referer: "https://search.naver.com/" });
+    console.log("[COMP][searchHTML] status:", r.status, "len:", (r.text || "").length, "url:", url);
+
+    if (!r.ok || !r.text) continue;
+
+    const html = r.text;
+
+    // placeId 패턴: m.place.naver.com/.../{id} 또는 /place/{id}
+    const ids: string[] = [];
+    const reList = [
+      /m\.place\.naver\.com\/[a-zA-Z0-9_]+\/(\d{5,12})/g,
+      /m\.place\.naver\.com\/place\/(\d{5,12})/g,
+      /\/place\/(\d{5,12})/g
+    ];
+
+    for (const re of reList) {
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(html))) {
+        if (m?.[1]) ids.push(m[1]);
+        if (ids.length >= 120) break;
+      }
+      if (ids.length >= 120) break;
+    }
+
+    const out = uniq(ids).filter((x) => /^\d{5,12}$/.test(x));
+    if (out.length) {
+      console.log("[COMP][searchHTML] id candidates:", out.length, out.slice(0, 20));
+      return out;
+    }
+  }
+
+  return [];
+}
+
 /** --- service --- */
 export class CompetitorService {
   constructor() {}
 
   async close() {
-    // 서버.ts finally에서 호출하므로 유지
     return;
   }
 
   /**
-   * ✅ OpenAPI / map search JSON 기반 후보 placeId 추출 (너가 쓰던 방식 그대로)
-   * - (m.map은 Railway에서 500 나는 경우가 많아서 안 씀)
+   * ✅ 경쟁사 후보 placeId 추출 (map API 완전 대체)
+   * 1) search.naver.com place 검색 HTML에서 id 추출
+   * 2) (옵션) map API는 아예 사용 안 함 (400/503 때문에)
    */
   async findTopPlaceIds(query: string, excludePlaceId: string, limit = 5): Promise<string[]> {
     const q = (query || "").trim();
     if (!q) return [];
 
-    const encoded = encodeURIComponent(q);
+    console.log("[COMP][findTopPlaceIds] query:", q);
 
-    const urls = [
-      `https://map.naver.com/p/api/search/allSearch?query=${encoded}&type=place&displayCount=50`,
-      `https://map.naver.com/p/api/search/allSearch?query=${encoded}&type=all&displayCount=50`,
-      `https://map.naver.com/p/api/search/allSearch?query=${encoded}&type=local&displayCount=50`
-    ];
+    // 1) 네이버 검색 HTML에서 ID 확보
+    const ids1 = await withTimeout(findPlaceIdsViaNaverSearchHTML(q), 2500, "searchHTML-timeout");
+    let ids = ids1.filter((id) => id !== excludePlaceId);
+    ids = uniq(ids).filter((id) => /^\d{5,12}$/.test(id));
 
-    for (let i = 0; i < urls.length; i++) {
-      const url = urls[i];
-      console.log(`[COMP][OpenAPI] query: ${q}`);
-      console.log(`[COMP][OpenAPI] try #${i + 1}:`, url);
-
-      const r = await fetchJson(url, {
-        referer: "https://map.naver.com/",
-        "x-requested-with": "XMLHttpRequest"
-      });
-
-      console.log(`[COMP][OpenAPI] status:`, r.status);
-
-      if (!r.ok || !r.json) continue;
-
-      let ids = collectIdCandidatesFromAnyJson(r.json);
-      ids = ids.filter((id) => id !== excludePlaceId);
-      ids = uniq(ids).filter((id) => /^\d{5,12}$/.test(id));
-
-      // 너무 많으면 비용 절감
-      ids = ids.slice(0, 80);
-
-      console.log(`[COMP][OpenAPI] id candidates: ${ids.length}`, ids.slice(0, 20));
-
-      if (ids.length) {
-        return ids.slice(0, Math.max(limit * 6, 30));
-      }
-    }
+    // 후보는 넉넉히
+    if (ids.length) return ids.slice(0, Math.max(limit * 8, 40));
 
     console.log("[COMP][findTopPlaceIds] no candidates for query:", q);
     return [];
   }
 
   /**
-   * ✅ 경쟁사: “키워드만” 빠르게 추출
-   * - 1) placeId → redirect 기반으로 slug home URL resolve
-   * - 2) 해당 URL HTML에서 name/keywords 추출
-   * - 3) shell(네이버플레이스) / 키워드0 / 내업체 / 중복 제거
+   * ✅ 경쟁사: 키워드만 빠르게 추출 + 중복/내업체 제거
    */
-  async crawlCompetitorsByIds(placeIds: string[], industry: Industry, limit = 5, opts?: CrawlOpts): Promise<Competitor[]> {
+  async crawlCompetitorsByIds(
+    placeIds: string[],
+    _industry: Industry,
+    limit = 5,
+    opts?: CrawlOpts
+  ): Promise<Competitor[]> {
     const candidates = (placeIds || []).filter(Boolean).filter((x) => /^\d{5,12}$/.test(x));
     if (!candidates.length) return [];
 
@@ -323,9 +301,8 @@ export class CompetitorService {
     const seenId = new Set<string>();
     const seenName = new Set<string>();
 
-    // ✅ 병렬(너무 세게 때리면 block/timeout ↑) → 3~4가 적당
     const CONCURRENCY = Number(process.env.COMPETITOR_CONCURRENCY || 3);
-    const PER_TASK_TIMEOUT = Number(process.env.COMPETITOR_TASK_TIMEOUT_MS || 2500);
+    const PER_TASK_TIMEOUT = Number(process.env.COMPETITOR_TASK_TIMEOUT_MS || 2600);
 
     let idx = 0;
 
@@ -340,48 +317,41 @@ export class CompetitorService {
           const comp = await withTimeout(this.fetchCompetitorKeywordsOnly(id, myNameN), PER_TASK_TIMEOUT, "kw-timeout");
           if (!comp) continue;
 
-          // 내 업체명 제거
           const nName = normName(comp.name || "");
           if (myNameN && nName && nName === myNameN) continue;
 
-          // name 중복 제거(같은 업체가 다른 placeId로 중복될 때)
+          // 같은 업체(이름) 중복 제거
           if (nName && seenName.has(nName)) continue;
 
           seenId.add(id);
           if (nName) seenName.add(nName);
 
           out.push(comp);
-        } catch (e: any) {
-          // 조용히 패스 (timeout/403 등)
+        } catch {
+          // timeout/403 등은 스킵
         }
       }
     };
 
-    const workers = Array.from({ length: CONCURRENCY }, () => worker());
-    await Promise.all(workers);
-
-    // 혹시 name 중복으로 빠져서 limit 미만이면 그대로 리턴
+    await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
     return out.slice(0, limit);
   }
 
   private async fetchCompetitorKeywordsOnly(placeId: string, myNameN: string): Promise<Competitor | null> {
-    // 1) home URL resolve (slug)
     const url = await resolveBestHomeUrl(placeId);
     console.log("[COMP][resolve] id:", placeId, "->", url);
 
-    // 2) 실제 페이지 fetch
     const r = await fetchText(url, { referer: "https://m.place.naver.com/" });
     if (!r.ok || !r.text) return null;
 
     const html = r.text;
     const len = html.length;
 
-    // shell 컷 (너 로그에서 243k가 shell)
+    // shell 페이지(짧은 24만대) 방어: 키워드가 없으면 버림
     if (len < 320_000) {
-      // 그래도 키워드가 있으면 살려봄
       const kwTry = extractKeywordsFromHtml(html);
       if (!kwTry.length) {
-        console.log("[COMP][shell] got Naver shell page:", placeId, "final:", r.finalUrl, "len:", len);
+        console.log("[COMP][shell] got shell page:", placeId, "final:", r.finalUrl, "len:", len);
         return null;
       }
     }
@@ -389,12 +359,10 @@ export class CompetitorService {
     const name = extractNameFromHtml(html) || "";
     if (!name || name.includes("네이버 플레이스")) return null;
 
-    // 내 업체와 이름 동일하면 컷(방어)
     const nName = normName(name);
     if (myNameN && nName && nName === myNameN) return null;
 
     const keywords = extractKeywordsFromHtml(html);
-
     console.log("[COMP][kw] probed:", placeId, "name:", name, "kw:", keywords.length, keywords.slice(0, 10));
 
     if (!keywords.length) return null;
