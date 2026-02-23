@@ -104,8 +104,29 @@ function deepFindFirstString(obj: any, keys: string[]): string {
   return "";
 }
 
-function deepFindStringArray(obj: any, keys: string[]): string[] {
-  const want = new Set(keys);
+/**
+ * ✅ 키워드 추출 강화 버전
+ * - 1) string[] 형태
+ * - 2) [{keyword:"..."},{name:"..."}] 형태
+ * - 3) JSON 문자열에서 "keyword":"..." 정규식 스캔
+ */
+function extractKeywordsFromAny(obj: any): string[] {
+  const out: string[] = [];
+
+  const push = (v: any) => {
+    const s = String(v || "").trim();
+    if (!s) return;
+    // 너무 짧거나 이상한 값 제거 (필요하면 완화 가능)
+    if (s.length < 2 || s.length > 30) return;
+    // 흔한 노이즈 제거
+    if (/^http/i.test(s)) return;
+    out.push(s);
+  };
+
+  // 1) BFS로 돌면서 키 후보 찾기
+  const arrayKeys = new Set(["keywords", "keywordList", "searchKeywords", "recommendedKeywords", "mainKeywords"]);
+  const objectWordKeys = new Set(["keyword", "name", "text", "title"]); // 객체 배열 요소에서 후보 키
+
   const seen = new Set<any>();
   const stack: any[] = [obj];
 
@@ -116,11 +137,18 @@ function deepFindStringArray(obj: any, keys: string[]): string[] {
     seen.add(cur);
 
     if (!Array.isArray(cur)) {
-      for (const k of Object.keys(cur)) {
-        const v = (cur as any)[k];
-        if (want.has(k) && Array.isArray(v)) {
-          const out = v.map((x: any) => String(x || "").trim()).filter(Boolean);
-          if (out.length) return uniq(out).slice(0, 30);
+      for (const [k, v] of Object.entries(cur)) {
+        // string[] 바로 추출
+        if (arrayKeys.has(k) && Array.isArray(v)) {
+          for (const it of v) {
+            if (typeof it === "string") push(it);
+            else if (it && typeof it === "object") {
+              // 객체 배열이면 keyword/name 등을 우선 추출
+              for (const kk of Object.keys(it)) {
+                if (objectWordKeys.has(kk) && typeof (it as any)[kk] === "string") push((it as any)[kk]);
+              }
+            }
+          }
         }
       }
     }
@@ -131,7 +159,34 @@ function deepFindStringArray(obj: any, keys: string[]): string[] {
       for (const v of Object.values(cur)) stack.push(v);
     }
   }
-  return [];
+
+  // 2) JSON 문자열 정규식 스캔 (최후의 수단, 구조 변경에도 버팀)
+  let jsonText = "";
+  try {
+    jsonText = JSON.stringify(obj);
+  } catch {
+    jsonText = "";
+  }
+  if (jsonText) {
+    // "keyword":"서대문역미용실" 패턴
+    const re = /"keyword"\s*:\s*"([^"]{2,40})"/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(jsonText))) push(m[1]);
+
+    // "name":"서대문역미용실" 같은 경우 (너무 광범위하면 노이즈 생길 수 있어 최소한만)
+    const re2 = /"mainKeyword"\s*:\s*"([^"]{2,40})"/g;
+    while ((m = re2.exec(jsonText))) push(m[1]);
+  }
+
+  // 3) 후처리: 공백/특수문자 정리 + 중복 제거
+  const cleaned = uniq(
+    out
+      .map((s) => s.replace(/\s+/g, " ").trim())
+      .map((s) => s.replace(/[<>]/g, ""))
+      .filter(Boolean)
+  );
+
+  return cleaned.slice(0, 30);
 }
 
 async function naverLocalSearchRaw(query: string, display = 25) {
@@ -178,7 +233,7 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (x: T, idx: number)
 export class CompetitorService {
   private seed = new Map<string, Partial<Competitor>>();
 
-  // ✅ server.ts 호환용 (지금 구조에서는 리소스 보유 안 함)
+  // ✅ server.ts 호환용
   async close() {
     return;
   }
@@ -236,7 +291,7 @@ export class CompetitorService {
       Accept: "text/html,application/xhtml+xml"
     };
 
-    const r = await fetchWithTimeout(url, Number(process.env.COMPETITOR_PROBE_TIMEOUT_MS || 1200), headers);
+    const r = await fetchWithTimeout(url, Number(process.env.COMPETITOR_PROBE_TIMEOUT_MS || 1500), headers);
 
     if (!r.ok || !r.text) {
       const s = this.seed.get(id);
@@ -256,17 +311,21 @@ export class CompetitorService {
     const address =
       deepFindFirstString(next, ["roadAddress", "address", "fullAddress"]) || this.seed.get(id)?.address || "";
 
-    const keywords =
-      deepFindStringArray(next, ["keywords", "keywordList", "searchKeywords", "recommendedKeywords"]) || [];
+    // ✅ 핵심: 강화된 키워드 추출
+    const keywords = extractKeywordsFromAny(next);
 
     if (!name) return null;
+
+    if (!keywords.length) {
+      console.log("[COMP][kw] empty keywords:", id, "name:", name);
+    }
 
     return {
       placeId: id,
       url,
       name,
       address,
-      keywords: uniq(keywords).slice(0, 20)
+      keywords: keywords.slice(0, 20)
     };
   }
 
@@ -309,19 +368,19 @@ export class CompetitorService {
       const nNorm = normalizeName(c.name);
       const aPref = addressPrefix(c.address || "");
 
-      // ✅ 내 업체 제거(이름)
+      // 내 업체 제거(이름)
       if (myNameNorm && nNorm && nNorm === myNameNorm) continue;
 
-      // ✅ 내 업체 제거(주소 prefix + 이름 유사)
+      // 내 업체 제거(주소 prefix + 이름 유사)
       if (myNameNorm && myAddrPref && aPref && aPref === myAddrPref) {
         if (nNorm.includes(myNameNorm) || myNameNorm.includes(nNorm)) continue;
       }
 
-      // ✅ 중복 제거(이름)
+      // 중복 제거(이름)
       if (nNorm && seenName.has(nNorm)) continue;
       if (nNorm) seenName.add(nNorm);
 
-      // ✅ 보조 중복(이름+주소prefix)
+      // 보조 중복(이름+주소prefix)
       const key = `${nNorm}|${aPref}`;
       if (aPref && seenNameAddr.has(key)) continue;
       if (aPref) seenNameAddr.add(key);
