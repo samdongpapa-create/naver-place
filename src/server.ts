@@ -26,7 +26,7 @@ app.use(express.static(publicDir));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 app.get("/", (_req, res) => res.sendFile(path.join(publicDir, "index.html")));
 
-// ✅ 누락되어 TS 에러났던 유틸
+// ✅ util
 function uniq<T>(arr: T[]) {
   return Array.from(new Set(arr));
 }
@@ -85,98 +85,162 @@ function getLocalityToken(name: string, address: string): string {
   return "";
 }
 
-function buildRecommendedKeywordsLocal(params: {
+function getDistrictToken(address: string): string {
+  const ad = (address || "").replace(/\s+/g, " ").trim();
+  if (!ad) return "";
+  const parts = ad.split(" ").filter(Boolean);
+
+  // "서울 종로구 ..." -> "종로"
+  const gu = parts.find((p) => /구$/.test(p) && p.length <= 6);
+  if (gu) return gu.replace(/구$/, "");
+
+  // 혹시 "강남" 같은 이미 구 없이 들어오는 경우는 거의 없어서 스킵
+  return "";
+}
+
+function getCityDistrict(address: string): { city: string; district: string } {
+  const ad = (address || "").replace(/\s+/g, " ").trim();
+  const parts = ad.split(" ").filter(Boolean);
+  const city = parts[0] || "";
+  const gu = parts.find((p) => /구$/.test(p) && p.length <= 6) || "";
+  return { city, district: gu.replace(/구$/, "") };
+}
+
+function industryKorean(ind: Industry): string {
+  if (ind === "hairshop") return "미용실";
+  if (ind === "cafe") return "카페";
+  return "맛집";
+}
+
+/**
+ * ✅ 트래픽 우선형 대표키워드 5개
+ * - 대표키워드에는 '커트/펌/염색' 같이 검색량 낮은 서비스키워드 넣지 않음
+ * - "지역+업종", "생활권 확장(랜드마크/인접상권)", "카테고리/브랜드" 중심
+ * - 경쟁사 키워드는 참고하되, 지역서비스 조합은 대표키워드에 직접 넣지 않음
+ */
+function buildRecommendedKeywordsTrafficFirst(params: {
   industry: Industry;
   myName: string;
   myAddress: string;
-  myKeywords: string[];
-  competitorKeywords: string[][];
-}): string[] {
-  const { industry, myName, myAddress, myKeywords, competitorKeywords } = params;
+  competitorKeywordsFlat: string[];
+}): { recommended: string[]; debug: any } {
+  const { industry, myName, myAddress, competitorKeywordsFlat } = params;
 
-  const serviceTokens =
+  const indK = industryKorean(industry);
+  const locality = getLocalityToken(myName, myAddress); // "서대문역"
+  const district = getDistrictToken(myAddress); // "종로"
+  const { city } = getCityDistrict(myAddress);
+
+  // ✅ 업종별 "카테고리 강화" 키워드 (대표키워드용)
+  const categoryBoost =
     industry === "hairshop"
-      ? ["미용실", "커트", "펌", "염색", "클리닉", "다운펌", "볼륨매직", "레이어드컷", "단발", "남자펌"]
+      ? ["헤어살롱", "헤어샵", "미용실추천"]
       : industry === "cafe"
-      ? ["카페", "커피", "디저트", "베이커리", "브런치", "케이크", "라떼", "테이크아웃"]
-      : ["맛집", "식당", "점심", "저녁", "예약", "포장", "배달", "회식", "데이트"];
+      ? ["카페추천", "디저트카페", "브런치카페"]
+      : ["맛집추천", "현지맛집", "숨은맛집"];
 
-  const locality = (() => {
-    const toks: string[] = [];
-    const nm = (myName || "").trim();
-    const ad = (myAddress || "").trim();
+  // ✅ 대표키워드에 넣으면 오히려 구린 “저트래픽 서비스키워드” 제거
+  const serviceLowTraffic =
+    industry === "hairshop"
+      ? ["커트", "컷", "펌", "염색", "탈색", "클리닉", "다운펌", "볼륨매직", "매직", "레이어드컷", "단발", "남자펌"]
+      : industry === "cafe"
+      ? ["아메리카노", "라떼", "케이크", "디저트", "브런치", "테이크아웃", "베이커리"]
+      : ["점심", "저녁", "포장", "배달", "회식", "데이트", "예약"];
 
-    const m = nm.match(/([가-힣]{2,10})역/);
-    if (m?.[1]) toks.push(`${m[1]}역`);
+  const svcSet = new Set(serviceLowTraffic);
 
-    if (ad) {
-      const parts = ad.split(/\s+/).map((s) => s.trim()).filter(Boolean);
-      for (const p of parts) {
-        if (/(역|구|동)$/.test(p) && p.length <= 10) toks.push(p);
-      }
-    }
-    return Array.from(new Set(toks))[0] || "";
-  })();
+  const normalize = (k: string) => String(k || "").replace(/\s+/g, "").trim();
 
-  const normalize = (k: string) => {
-    let x = (k || "").replace(/\s+/g, "").trim();
-    if (!x) return "";
-    x = x.replace(/헤어샵/g, "미용실");
-    x = x.replace(/컷$/g, "커트");
-    x = x.replace(/컷/gi, "커트");
-    x = x.replace(/[^\w가-힣]/g, "");
-    return x;
-  };
+  // ✅ 경쟁사 키워드에서 "역/구/동 + 업종" 형태의 ‘큰 트래픽 후보’만 골라온다
+  const comp = uniq((competitorKeywordsFlat || []).map(normalize))
+    .filter((k) => k.length >= 3 && k.length <= 18)
+    .filter((k) => !svcSet.has(k)) // 서비스 단어 단독 제거
+    .filter((k) => !/(커트|컷|펌|염색|탈색|클리닉|다운펌|볼륨매직|매직)/.test(k)); // 서비스 포함 조합 제거(대표키워드엔 안 넣음)
 
-  const stop = new Set<string>(["추천", "인기", "잘하는곳", "잘하는집", "최고", "1등", "베스트", "가격", "할인", "예약"]);
+  const compHighTraffic = comp.filter((k) => {
+    // "서대문역미용실", "광화문미용실", "종로미용실" 같은 패턴 선호
+    if (k.includes(indK)) return true;
+    // 업종 키워드를 안 붙인 경우는 대표키워드용으로 애매해서 제외
+    return false;
+  });
 
-  const seen = new Set<string>();
+  // ✅ 생활권 확장 후보(미용실 예: 광화문/시청/서울역/명동/종로/경복궁)
+  // - 하드코딩+주소 기반 혼합
+  const expansionPool =
+    industry === "hairshop"
+      ? ["광화문", "종로", "시청", "서울역", "경복궁", "명동", "충정로"]
+      : industry === "cafe"
+      ? ["광화문", "종로", "시청", "서울역", "경복궁", "명동", "서촌"]
+      : ["광화문", "종로", "시청", "서울역", "경복궁", "명동", "서촌"];
+
+  // district가 있으면 우선
+  const districtWord = district ? `${district}${indK}` : "";
+  const cityWord = city && district ? `${city}${district}${indK}` : "";
+
   const out: string[] = [];
   const push = (k: string) => {
-    const nk = normalize(k);
-    if (!nk) return;
-    if (nk.length < 3) return;
-    if (stop.has(nk)) return;
-    if (seen.has(nk)) return;
-    seen.add(nk);
-    out.push(nk);
+    const x = normalize(k);
+    if (!x) return;
+    if (x.length < 3) return;
+    if (out.includes(x)) return;
+    out.push(x);
   };
 
-  const freq = new Map<string, number>();
-  for (const list of competitorKeywords || []) {
-    for (const k of list || []) {
-      const nk = normalize(k);
-      if (!nk) continue;
-      if (stop.has(nk)) continue;
-      freq.set(nk, (freq.get(nk) || 0) + 1);
+  // 1) 핵심 트래픽: 역/동네 + 업종
+  if (locality) push(`${locality}${indK}`); // 서대문역미용실
+  else if (district) push(`${district}${indK}`);
+
+  // 2) 생활권 확장(경쟁사/풀에서 1~2개)
+  // - 경쟁사에 "광화문미용실" 있으면 그걸 우선
+  const pickFromComp = (word: string) => compHighTraffic.find((k) => k.startsWith(word) && k.includes(indK));
+
+  for (const w of expansionPool) {
+    if (out.length >= 3) break;
+    const fromComp = pickFromComp(w);
+    if (fromComp) push(fromComp);
+    else push(`${w}${indK}`);
+  }
+
+  // 3) 구 단위 확장(종로미용실 같은)
+  if (out.length < 3 && districtWord) push(districtWord);
+
+  // 4) 카테고리 강화(헤어살롱/헤어샵 등) 1개
+  // - 단, "헤어샵"은 "미용실"과 중복 느낌이면 industry별로 1개만
+  if (out.length < 4) push(categoryBoost[0] || indK);
+
+  // 5) 브랜드 방어(상호명) 1개
+  // - 공백 제거
+  const brand = normalize(myName).replace(/[^\w가-힣]/g, "");
+  if (brand) push(brand);
+
+  // 6) 그래도 부족하면 (도시+구+업종) 같은 큰 단위로 채움
+  if (out.length < 5 && cityWord) push(cityWord);
+  if (out.length < 5 && districtWord) push(districtWord);
+  if (out.length < 5 && (categoryBoost[1] || "")) push(categoryBoost[1]);
+  if (out.length < 5) push(indK);
+
+  const final5 = out.slice(0, 5);
+
+  return {
+    recommended: final5,
+    debug: {
+      locality,
+      district,
+      city,
+      usedExpansionPool: expansionPool,
+      compHighTrafficSample: compHighTraffic.slice(0, 12)
     }
-  }
+  };
+}
 
-  if (locality) {
-    for (const t of serviceTokens.slice(0, 4)) {
-      push(`${locality}${t}`);
-      if (out.length >= 3) break;
-    }
-  }
-
-  const sorted = Array.from(freq.entries()).sort((a, b) => b[1] - a[1]);
-  for (const [k] of sorted) {
-    if (out.length >= 5) break;
-    if (locality && !k.startsWith(locality)) push(`${locality}${k.replace(locality, "")}`);
-    else push(k);
-  }
-
-  for (const k of myKeywords || []) {
-    if (out.length >= 5) break;
-    push(locality ? `${locality}${normalize(k).replace(locality, "")}` : k);
-  }
-
-  for (const t of serviceTokens) {
-    if (out.length >= 5) break;
-    push(locality ? `${locality}${t}` : t);
-  }
-
-  return out.slice(0, 5);
+/**
+ * ✅ 점수용 텍스트(상세설명/리뷰요청/메뉴)에 서비스 키워드 자연 삽입용 힌트
+ * - 대표키워드에는 넣지 않지만, 컨설팅 문구에서 점수/노출을 끌어올릴 때 쓰는 용도
+ */
+function buildServiceInsertHints(industry: Industry): string[] {
+  if (industry === "hairshop") return ["커트", "펌", "염색", "클리닉"];
+  if (industry === "cafe") return ["디저트", "브런치", "테이크아웃", "커피"];
+  return ["점심", "저녁", "포장", "예약"];
 }
 
 async function withTimeout<T>(p: Promise<T>, ms: number, label = "timeout"): Promise<T> {
@@ -221,7 +285,6 @@ async function getCompetitorsSafe(params: {
       if (!ids?.length) continue;
 
       const comps = await withTimeout(
-        // ✅ 내 업체 제외 + 중복 제거 옵션 전달
         compSvc.crawlCompetitorsByIds(ids, industry, limit, {
           excludePlaceId: placeId,
           myName,
@@ -240,7 +303,6 @@ async function getCompetitorsSafe(params: {
     }
   }
 
-  // ✅ placeId 기준 중복 제거(혹시나)
   const uniqById = new Map<string, any>();
   for (const c of competitors) {
     if (!c?.placeId) continue;
@@ -340,7 +402,7 @@ app.post("/api/diagnose/paid", async (req, res) => {
     compSvc = new CompetitorService();
 
     const locality = getLocalityToken(crawlResult.data.name, crawlResult.data.address);
-    const indWord = ind === "hairshop" ? "미용실" : ind === "cafe" ? "카페" : "맛집";
+    const indWord = industryKorean(ind);
 
     const queryCandidates = uniq(
       [
@@ -363,33 +425,36 @@ app.post("/api/diagnose/paid", async (req, res) => {
 
     console.log("[PAID] competitors:", competitors.length, "queries:", queryCandidates);
 
-    const localKw = buildRecommendedKeywordsLocal({
+    // ✅ 경쟁사 키워드(평탄화)
+    const competitorKeywordsFlat = competitors.flatMap((c: any) => (Array.isArray(c.keywords) ? c.keywords : []));
+
+    // ✅ 트래픽 우선형 대표키워드 5개 확정
+    const traffic = buildRecommendedKeywordsTrafficFirst({
       industry: ind,
       myName: crawlResult.data.name,
       myAddress: crawlResult.data.address,
-      myKeywords: crawlResult.data.keywords || [],
-      competitorKeywords: competitors.map((c: any) => c.keywords || [])
+      competitorKeywordsFlat
     });
 
+    const finalRecommendedKeywords = traffic.recommended;
+
+    // ✅ GPT 컨설팅(대표키워드는 서버가 강제한다)
     const gpt = await generatePaidConsultingGuaranteed({
       industry: ind,
       placeData: crawlResult.data,
       scoredNow: { totalScore: scored.totalScore, totalGrade: scored.totalGrade, scores: scored.scores },
-      competitorTopKeywords: competitors.flatMap((c: any) => c.keywords || []),
+      competitorTopKeywords: competitorKeywordsFlat,
       targetScore: 90
     });
 
-    const gptKw = Array.isArray((gpt as any)?.improvements?.keywords) ? (gpt as any).improvements.keywords.slice(0, 5) : [];
-    const gptRec = Array.isArray((gpt as any)?.recommendedKeywords) ? (gpt as any).recommendedKeywords.slice(0, 5) : [];
-
-    const recommendedKeywords = (gptKw.length ? gptKw : gptRec.length ? gptRec : localKw).slice(0, 5);
-    while (recommendedKeywords.length < 5) recommendedKeywords.push(...localKw);
-    const finalRecommendedKeywords = uniq(recommendedKeywords).slice(0, 5);
-
+    // ✅ 불일치 방지: improvements.keywords / recommendedKeywords를 서버 확정값으로 강제
     if ((gpt as any)?.improvements) (gpt as any).improvements.keywords = finalRecommendedKeywords;
     (gpt as any).recommendedKeywords = finalRecommendedKeywords;
 
-    // ✅ UI 없어도 네트워크 응답에서 경쟁사 키워드 확인 가능
+    // ✅ 서비스키워드는 대표키워드에 넣지 말고, 설명/리뷰요청/메뉴에서 자연삽입하도록 힌트 제공
+    const serviceInsertHints = buildServiceInsertHints(ind);
+
+    // ✅ UI 없어도 확인 가능한 디버그
     const competitorKeywordsDebug = competitors.map((c: any) => ({
       placeId: c.placeId,
       name: c.name,
@@ -397,9 +462,7 @@ app.post("/api/diagnose/paid", async (req, res) => {
       keywords: Array.isArray(c.keywords) ? c.keywords.slice(0, 10) : []
     }));
 
-    const competitorTopKeywordsDebug = competitors
-      .flatMap((c: any) => (Array.isArray(c.keywords) ? c.keywords : []))
-      .slice(0, 50);
+    const competitorTopKeywordsDebug = competitorKeywordsFlat.slice(0, 60);
 
     return res.json({
       success: true,
@@ -412,11 +475,14 @@ app.post("/api/diagnose/paid", async (req, res) => {
 
         improvements: (gpt as any).improvements,
         recommendedKeywords: finalRecommendedKeywords,
+
         competitors,
 
-        // ✅ 디버그 필드
+        // ✅ debug
         competitorKeywordsDebug,
         competitorTopKeywordsDebug,
+        keywordStrategyDebug: traffic.debug,
+        serviceInsertHints,
 
         predictedAfter: (gpt as any).predicted,
         attempts: (gpt as any).attempts,
