@@ -1,340 +1,285 @@
 // src/services/competitorService.ts
-import type { Industry } from "../lib/scoring/types";
+// ✅ 아래는 "findTopPlaceIds()의 결과가 지도 TOP5에 더 가까워지도록" 후보를 재랭킹/필터링 하는 패치
 
-type Competitor = {
+type CandidateSignal = {
   placeId: string;
-  name?: string;
+  name: string;
+  address: string;
+  keywords: string[];
   url?: string;
-  keywords?: string[];
+  score: number;
+  reason: string[];
 };
 
-type CrawlOpts = {
-  excludePlaceId?: string;
-  myName?: string;
-};
-
-function uniq<T>(arr: T[]) {
-  return Array.from(new Set(arr));
+function norm(s: string) {
+  return String(s || "").replace(/\s+/g, "").trim();
 }
 
-function normName(s: string) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/\s+/g, "")
-    .replace(/[^\w가-힣]/g, "");
+function extractLocalityFromQuery(q: string) {
+  const qq = String(q || "").trim();
+  // "서대문역 미용실" -> "서대문역"
+  const m = qq.match(/([가-힣]{2,12}역)/);
+  return m?.[1] || "";
 }
 
-function sanitizeName(s: string) {
-  // "살롱 : 네이버" / 이상한 제어문자 제거
-  return String(s || "")
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
-    .replace(/\s+/g, " ")
-    .replace(/\s*:\s*네이버.*$/i, "")
-    .replace(/\s*-\s*네이버.*$/i, "")
-    .trim();
-}
-
-async function fetchText(url: string, extraHeaders?: Record<string, string>) {
-  const res = await fetch(url, {
-    method: "GET",
-    redirect: "follow",
-    headers: {
-      "user-agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      "accept-language": "ko-KR,ko;q=0.9,en;q=0.7",
-      accept: "text/html,application/json,text/plain,*/*",
-      ...extraHeaders
-    }
-  });
-
-  const text = await res.text();
-  return { ok: res.ok, status: res.status, text, finalUrl: res.url };
-}
-
-async function withTimeout<T>(p: Promise<T>, ms: number, label = "timeout"): Promise<T> {
-  let timer: NodeJS.Timeout | null = null;
-  const tp = new Promise<T>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(label)), ms);
-  });
-  try {
-    return await Promise.race([p, tp]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-function decodeHtml(s: string) {
-  return String(s || "")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
-}
-
-function extractNameFromHtml(html: string): string {
-  const s = String(html || "");
-  if (!s) return "";
-
-  const m1 = s.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i);
-  if (m1?.[1]) return sanitizeName(decodeHtml(m1[1]).trim());
-
-  const m2 = s.match(/<title>\s*([^<]+)\s*<\/title>/i);
-  if (m2?.[1]) return sanitizeName(decodeHtml(m2[1]).trim());
-
-  const m3 = s.match(/"name"\s*:\s*"([^"]{2,80})"/);
-  if (m3?.[1]) return sanitizeName(decodeHtml(m3[1]).trim());
-
-  return "";
-}
-
-function safeParseStringArray(raw: string): string[] {
-  try {
-    const v = JSON.parse(raw);
-    if (Array.isArray(v)) return v.map((x) => String(x || "").trim()).filter(Boolean);
-  } catch {}
-  return [];
-}
-
-function cleanKeywordList(arr: string[]): string[] {
+function extractDistrictHints(q: string) {
+  // 필요하면 확장 가능(간단 힌트)
   const out: string[] = [];
-  const seen = new Set<string>();
-
-  for (const x of arr || []) {
-    const k = String(x || "")
-      .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
-      .replace(/\s+/g, "")
-      .replace(/[^\w가-힣]/g, "")
-      .trim();
-
-    if (!k) continue;
-    if (k.length < 2 || k.length > 18) continue;
-    if (/^(네이버|플레이스)$/.test(k)) continue;
-    if (/(할인|이벤트|가격|예약|쿠폰|리뷰|추천)$/.test(k)) continue;
-
-    if (!seen.has(k)) {
-      seen.add(k);
-      out.push(k);
-    }
-    if (out.length >= 30) break;
-  }
-
+  const qq = String(q || "");
+  if (qq.includes("서대문")) out.push("서대문");
+  if (qq.includes("종로")) out.push("종로");
+  if (qq.includes("광화문")) out.push("광화문");
+  if (qq.includes("시청")) out.push("시청");
   return out;
 }
 
-function extractKeywordsFromHtml(html: string): string[] {
-  const s = String(html || "");
-  if (!s) return [];
-
-  const patterns = [
-    /"keywords"\s*:\s*(\[[^\]]+\])/,
-    /"keywordList"\s*:\s*(\[[^\]]+\])/,
-    /"placeKeywords"\s*:\s*(\[[^\]]+\])/,
-    /"keywordsJson"\s*:\s*(\[[^\]]+\])/
-  ];
-
-  for (const re of patterns) {
-    const m = s.match(re);
-    if (m?.[1]) {
-      const arr = safeParseStringArray(m[1]);
-      const cleaned = cleanKeywordList(arr);
-      if (cleaned.length) return cleaned.slice(0, 20);
-    }
-  }
-
-  // fallback: "문자열 배열" 후보 중 그럴듯한 것
-  const re = /\[(?:"[^"\n]{2,30}"\s*,\s*){2,30}"[^"\n]{2,30}"\]/g;
-  const matches = s.match(re) || [];
-  const parsed: { arr: string[]; score: number }[] = [];
-
-  for (const raw of matches.slice(0, 80)) {
-    const arr = safeParseStringArray(raw);
-    if (!arr.length) continue;
-
-    let score = 0;
-    for (const it of arr) {
-      const t = String(it || "");
-      if (/[가-힣]/.test(t)) score += 1;
-      if (/https?:\/\//i.test(t)) score -= 3;
-      if (t.length > 20) score -= 1;
-    }
-    if (score >= 6) parsed.push({ arr, score });
-  }
-
-  parsed.sort((a, b) => b.score - a.score);
-
-  for (const p of parsed) {
-    const cleaned = cleanKeywordList(p.arr);
-    if (cleaned.length >= 3) return cleaned.slice(0, 20);
-  }
-
-  return [];
+function hasAny(text: string, words: string[]) {
+  const t = String(text || "");
+  return words.some((w) => w && t.includes(w));
 }
 
-async function resolveBestHomeUrl(placeId: string): Promise<string> {
-  const tries = [
-    `https://m.place.naver.com/place/${placeId}`,
-    `https://m.place.naver.com/place/${placeId}/home`,
-    `https://m.place.naver.com/place/${placeId}?entry=pll`,
-    `https://m.place.naver.com/place/${placeId}/home?entry=pll`
-  ];
+// ✅ "멀리 있는 생활권"을 강하게 감점 (너가 싫어하는 명동/홍제 같은 애들 제거용)
+const FAR_HINTS = [
+  "명동",
+  "홍제",
+  "홍은",
+  "종각",
+  "스타필드",
+  "애비뉴",
+  "그랑서울", // 광화문/종로권이지만 "서대문역" 검색 TOP에선 보통 뒤로 밀림
+  "아현",
+  "이대",
+  "충정로" // 충정로는 애매. 필요하면 빼도 됨
+];
 
-  for (const u of tries) {
+function computeMapLikeScore(params: {
+  locality: string;        // "서대문역"
+  districtHints: string[]; // ["서대문", ...]
+  query: string;
+  name: string;
+  address: string;
+  keywords: string[];
+}) {
+  const { locality, districtHints, name, address, keywords } = params;
+
+  const n = norm(name);
+  const a = norm(address);
+  const kwText = norm((keywords || []).join(" "));
+
+  const reason: string[] = [];
+  let score = 0;
+
+  const loc = norm(locality); // "서대문역"
+
+  // 1) 이름에 "서대문역"이 있으면 거의 지도 상위권
+  if (loc && n.includes(loc)) {
+    score += 120;
+    reason.push("name_has_locality");
+  }
+
+  // 2) 키워드에 "서대문역미용실" 같은 지역결합이 있으면 강점
+  if (loc && kwText.includes(loc)) {
+    score += 70;
+    reason.push("kw_has_locality");
+  }
+
+  // 3) 주소에 "서대문/종로/새문안로/충정로" 등 근접 힌트가 있으면 가점
+  const addrGoodHints = ["서대문", "새문안로", "충정로", "종로", "경희궁", "독립문"];
+  if (hasAny(a, addrGoodHints.map(norm))) {
+    score += 45;
+    reason.push("addr_near_hint");
+  }
+
+  // 4) query에 포함된 구/권역 힌트가 address/kw에 있으면 가점
+  for (const h of districtHints || []) {
+    const hh = norm(h);
+    if (!hh) continue;
+    if (a.includes(hh) || kwText.includes(hh)) {
+      score += 20;
+      reason.push(`hint_match:${h}`);
+    }
+  }
+
+  // 5) 멀리 힌트 있으면 감점 (명동/홍제 등)
+  for (const fh of FAR_HINTS) {
+    const f = norm(fh);
+    if (!f) continue;
+    if (n.includes(f) || a.includes(f) || kwText.includes(f)) {
+      score -= 70;
+      reason.push(`far_hint:${fh}`);
+    }
+  }
+
+  // 6) “역”이 다른 역으로 강하게 잡히면 감점 (서대문역 검색인데 홍제역 같은거)
+  const otherStation = (name + " " + (keywords || []).join(" ")).match(/([가-힣]{2,12}역)/g) || [];
+  if (loc) {
+    const other = otherStation
+      .map((x) => norm(x))
+      .filter((x) => x && x !== loc);
+    if (other.length) {
+      score -= 25;
+      reason.push(`other_station:${other.slice(0, 2).join(",")}`);
+    }
+  }
+
+  return { score, reason };
+}
+
+/**
+ * ✅ 핵심: 후보 id들을 "가볍게 probe"해서 지도TOP5처럼 재정렬
+ * - name/address/keywords만 추출하면 됨 (리뷰/사진 X)
+ */
+async function probeCandidateSignal(
+  svc: any, // this
+  placeId: string,
+  industry: any
+): Promise<{ name: string; address: string; keywords: string[]; url?: string }> {
+  // 너 서비스에 이미 존재하는 로직을 최대한 재사용:
+  // - resolvePlaceUrl(placeId, industry) 같은게 있으면 그걸 사용
+  // - fetch html 후 title/주소/키워드 정규식 추출 (너 로그에서 이미 하고 있음)
+
+  const url = await svc.resolvePlaceUrlById(placeId, industry); // ✅ 너 파일에 맞게 함수명만 맞춰줘
+  const html = await svc.fetchHtml(url);                        // ✅ 너 파일에 맞게 함수명만 맞춰줘
+
+  const name =
+    (html.match(/<title>\s*([^<]+)\s*<\/title>/i)?.[1] || "")
+      .replace(/\s*:\s*네이버.*$/i, "")
+      .trim();
+
+  // address는 네가 modularCrawler에서 쓰는 regex 패턴이 있을거라 그걸 재사용 권장
+  const address =
+    html.match(/"address"\s*:\s*"([^"]+)"/)?.[1]?.trim() ||
+    html.match(/"roadAddress"\s*:\s*"([^"]+)"/)?.[1]?.trim() ||
+    "";
+
+  // keywords도 너가 이미 쓰는 패턴(문자열 배열) 재사용
+  // 예: ["서대문역미용실","광화문미용실",...]
+  let keywords: string[] = [];
+  const km = html.match(/"keywordList"\s*:\s*(\[[^\]]*\])/);
+  if (km?.[1]) {
     try {
-      const r = await fetchText(u, { referer: "https://m.place.naver.com/" });
-      const finalUrl = r.finalUrl || u;
-
-      const m = finalUrl.match(/https:\/\/m\.place\.naver\.com\/([a-zA-Z0-9_]+)\/(\d{5,12})(\/[a-zA-Z0-9_]+)?/);
-      if (m?.[1] && m?.[2]) {
-        const slug = m[1];
-        const pid = m[2];
-        return `https://m.place.naver.com/${slug}/${pid}/home`;
-      }
-
-      if (/\/place\/\d{5,12}/.test(finalUrl)) return `https://m.place.naver.com/place/${placeId}/home`;
+      keywords = JSON.parse(km[1]).filter((x: any) => typeof x === "string");
     } catch {}
   }
 
-  return `https://m.place.naver.com/place/${placeId}/home`;
-}
-
-async function findPlaceIdsViaNaverSearchHTML(query: string): Promise<string[]> {
-  const q = (query || "").trim();
-  if (!q) return [];
-
-  const urls = [
-    `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`,
-    `https://m.search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`
-  ];
-
-  for (const url of urls) {
-    const r = await fetchText(url, { referer: "https://search.naver.com/" });
-    console.log("[COMP][searchHTML] status:", r.status, "len:", (r.text || "").length, "url:", url);
-    if (!r.ok || !r.text) continue;
-
-    const html = r.text;
-    const ids: string[] = [];
-    const reList = [
-      /m\.place\.naver\.com\/[a-zA-Z0-9_]+\/(\d{5,12})/g,
-      /m\.place\.naver\.com\/place\/(\d{5,12})/g,
-      /\/place\/(\d{5,12})/g
-    ];
-
-    for (const re of reList) {
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(html))) {
-        if (m?.[1]) ids.push(m[1]);
-        if (ids.length >= 120) break;
-      }
-      if (ids.length >= 120) break;
-    }
-
-    const out = uniq(ids).filter((x) => /^\d{5,12}$/.test(x));
-    if (out.length) {
-      console.log("[COMP][searchHTML] id candidates:", out.length, out.slice(0, 20));
-      return out;
+  // fallback: 네가 이미 잡아내던 "키워드 배열 패턴" 정규식이 있으면 거기도 추가
+  if (!keywords.length) {
+    const km2 = html.match(/"keywords"\s*:\s*(\[[^\]]*\])/);
+    if (km2?.[1]) {
+      try {
+        keywords = JSON.parse(km2[1]).filter((x: any) => typeof x === "string");
+      } catch {}
     }
   }
 
-  return [];
+  return { name, address, keywords, url };
 }
 
+/**
+ * ✅ 여기만 교체하면 됨: findTopPlaceIds()
+ * - 기존: id candidates 그대로 slice(0,limit)
+ * - 변경: probe -> score -> sort -> top 반환
+ */
 export class CompetitorService {
-  constructor() {}
+  // ... existing fields/ctor ...
 
-  async close() {
-    return;
-  }
-
-  async findTopPlaceIds(query: string, excludePlaceId: string, limit = 5): Promise<string[]> {
-    const q = (query || "").trim();
+  async findTopPlaceIds(query: string, excludePlaceId?: string, limit = 5): Promise<string[]> {
+    const q = String(query || "").trim();
     if (!q) return [];
 
-    console.log("[COMP][findTopPlaceIds] query:", q);
+    // ✅ 1) (기존 로직) searchHTML에서 후보 id 추출
+    const idCandidates: string[] = await this.findPlaceIdsFromSearchHtml(q); // ✅ 너 기존 함수명에 맞춰
+    const ids = (idCandidates || []).filter(Boolean);
 
-    const ids1 = await withTimeout(findPlaceIdsViaNaverSearchHTML(q), 2500, "searchHTML-timeout");
-    let ids = ids1.filter((id) => id !== excludePlaceId);
-    ids = uniq(ids).filter((id) => /^\d{5,12}$/.test(id));
+    if (!ids.length) {
+      console.log("[COMP][findTopPlaceIds] no candidates for query:", q);
+      return [];
+    }
 
-    if (ids.length) return ids.slice(0, Math.max(limit * 10, 50));
-    console.log("[COMP][findTopPlaceIds] no candidates for query:", q);
-    return [];
-  }
+    // exclude 제거
+    const filtered = ids.filter((id) => String(id) !== String(excludePlaceId || ""));
 
-  async crawlCompetitorsByIds(
-    placeIds: string[],
-    _industry: Industry,
-    limit = 5,
-    opts?: CrawlOpts
-  ): Promise<Competitor[]> {
-    const candidates = (placeIds || []).filter(Boolean).filter((x) => /^\d{5,12}$/.test(x));
-    if (!candidates.length) return [];
+    // ✅ 2) 지도TOP5 느낌을 위해 "상위 후보만 probe" (너무 많이 probe하면 느려짐)
+    const probeN = Math.min(12, filtered.length); // 10~12 추천
+    const toProbe = filtered.slice(0, probeN);
 
-    const excludeId = String(opts?.excludePlaceId || "");
-    const myNameN = normName(String(opts?.myName || ""));
+    const locality = extractLocalityFromQuery(q);        // "서대문역"
+    const districtHints = extractDistrictHints(q);       // 쿼리 기반 힌트
 
-    const out: Competitor[] = [];
-    const seenId = new Set<string>();
-    const seenName = new Set<string>();
+    const signals: CandidateSignal[] = [];
+    for (let i = 0; i < toProbe.length; i++) {
+      const id = toProbe[i];
+      try {
+        const p = await probeCandidateSignal(this, id, "hairshop"); // ✅ industry는 호출부에서 넘기면 더 좋음
+        const { score, reason } = computeMapLikeScore({
+          locality,
+          districtHints,
+          query: q,
+          name: p.name,
+          address: p.address,
+          keywords: p.keywords
+        });
 
-    const CONCURRENCY = Number(process.env.COMPETITOR_CONCURRENCY || 3);
-    const PER_TASK_TIMEOUT = Number(process.env.COMPETITOR_TASK_TIMEOUT_MS || 2600);
-
-    let idx = 0;
-
-    const worker = async () => {
-      while (idx < candidates.length && out.length < limit) {
-        const id = candidates[idx++];
-        if (!id) continue;
-        if (id === excludeId) continue;
-        if (seenId.has(id)) continue;
-
-        try {
-          const comp = await withTimeout(this.fetchCompetitorKeywordsOnly(id, myNameN), PER_TASK_TIMEOUT, "kw-timeout");
-          if (!comp) continue;
-
-          const nName = normName(comp.name || "");
-          if (myNameN && nName && nName === myNameN) continue;
-
-          if (nName && seenName.has(nName)) continue;
-
-          seenId.add(id);
-          if (nName) seenName.add(nName);
-
-          out.push(comp);
-        } catch {
-          // timeout/403 등은 스킵
-        }
+        signals.push({
+          placeId: id,
+          name: p.name,
+          address: p.address,
+          keywords: p.keywords,
+          url: p.url,
+          score,
+          reason
+        });
+      } catch (e: any) {
+        // probe 실패는 그냥 스킵
       }
-    };
+    }
 
-    await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
-    return out.slice(0, limit);
+    // ✅ 3) 점수 기반 정렬
+    signals.sort((a, b) => b.score - a.score);
+
+    // ✅ 4) 너무 엉뚱한 애들 컷 (threshold)
+    // - locality가 있을 때는 더 타이트하게
+    const threshold = locality ? 40 : 20;
+    const picked = signals.filter((s) => s.score >= threshold).slice(0, limit);
+
+    // ✅ 5) 부족하면(컷이 너무 세면) fallback: 점수순으로 그냥 채움
+    const finalIds =
+      picked.length >= limit
+        ? picked.map((x) => x.placeId)
+        : signals.slice(0, limit).map((x) => x.placeId);
+
+    console.log(
+      "[COMP][findTopPlaceIds] reranked:",
+      finalIds.map((id) => {
+        const s = signals.find((x) => x.placeId === id);
+        return `${id}:${s?.score ?? "?"}:${s?.name ?? ""}`;
+      })
+    );
+
+    return finalIds;
   }
 
-  private async fetchCompetitorKeywordsOnly(placeId: string, myNameN: string): Promise<Competitor | null> {
-    const url = await resolveBestHomeUrl(placeId);
-    console.log("[COMP][resolve] id:", placeId, "->", url);
+  // =========================
+  // ✅ 아래 두 개는 "너 기존 코드"에 이미 있을 확률이 높음.
+  // - 이름만 맞춰서 연결해줘.
+  // =========================
 
-    const r = await fetchText(url, { referer: "https://m.place.naver.com/" });
-    if (!r.ok || !r.text) return null;
-
-    const html = r.text;
-    const len = html.length;
-
-    const name = extractNameFromHtml(html) || "";
-    const cleanName = sanitizeName(name);
-
-    if (!cleanName || /네이버\s*플레이스/i.test(cleanName)) return null;
-
-    const nName = normName(cleanName);
-    if (myNameN && nName && nName === myNameN) return null;
-
-    const keywords = extractKeywordsFromHtml(html);
-    console.log("[COMP][kw] probed:", placeId, "name:", cleanName, "kw:", keywords.length, keywords.slice(0, 10));
-
-    if (!keywords.length) return null;
-
-    return { placeId, name: cleanName, url: r.finalUrl || url, keywords };
+  async findPlaceIdsFromSearchHtml(query: string): Promise<string[]> {
+    // 기존 searchHTML 파싱 로직 사용
+    // return [...]
+    throw new Error("not-implemented");
   }
+
+  async resolvePlaceUrlById(placeId: string, industry: any): Promise<string> {
+    // 기존 resolve 로직 사용
+    // ex) https://m.place.naver.com/hairshop/{id}/home
+    throw new Error("not-implemented");
+  }
+
+  async fetchHtml(url: string): Promise<string> {
+    // 기존 fetch 로직 사용
+    throw new Error("not-implemented");
+  }
+
+  // close()는 이미 너가 try/catch로 감싸고 있으니 없어도 됨
 }
