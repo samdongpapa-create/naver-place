@@ -195,11 +195,13 @@ async function getCompetitorsSafe(params: {
   compSvc: CompetitorService;
   industry: Industry;
   placeId: string;
+  myName: string;
+  myAddress: string;
   queries: string[];
   limit: number;
   totalTimeoutMs: number;
 }) {
-  const { compSvc, industry, placeId, queries, limit, totalTimeoutMs } = params;
+  const { compSvc, industry, placeId, myName, myAddress, queries, limit, totalTimeoutMs } = params;
 
   const started = Date.now();
   const competitors: any[] = [];
@@ -211,11 +213,20 @@ async function getCompetitorsSafe(params: {
     try {
       console.log("[PAID][COMP] try query:", q, "remainingMs:", remainingMs);
 
-      const ids = await withTimeout(compSvc.findTopPlaceIds(q, placeId, limit), Math.min(2500, remainingMs), "compIds-timeout");
+      const ids = await withTimeout(
+        compSvc.findTopPlaceIds(q, placeId, limit),
+        Math.min(2500, remainingMs),
+        "compIds-timeout"
+      );
       if (!ids?.length) continue;
 
       const comps = await withTimeout(
-        compSvc.crawlCompetitorsByIds(ids, industry, limit),
+        // ✅ 여기! 내 업체 제외 + 중복 제거 옵션 전달
+        compSvc.crawlCompetitorsByIds(ids, industry, limit, {
+          excludePlaceId: placeId,
+          myName,
+          myAddress
+        }),
         Math.min(3500, remainingMs),
         "compCrawl-timeout"
       );
@@ -229,6 +240,7 @@ async function getCompetitorsSafe(params: {
     }
   }
 
+  // ✅ placeId 기준 중복 제거(혹시나)
   const uniqById = new Map<string, any>();
   for (const c of competitors) {
     if (!c?.placeId) continue;
@@ -342,6 +354,8 @@ app.post("/api/diagnose/paid", async (req, res) => {
       compSvc,
       industry: ind,
       placeId,
+      myName: crawlResult.data.name,
+      myAddress: crawlResult.data.address,
       queries: queryCandidates,
       limit: 5,
       totalTimeoutMs: Number(process.env.COMPETITOR_TIMEOUT_MS || 6000)
