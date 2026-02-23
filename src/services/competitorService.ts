@@ -12,19 +12,13 @@ type Competitor = {
 function uniq<T>(arr: T[]) {
   return Array.from(new Set(arr));
 }
-
 function normSpace(s: string) {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
-function buildCompetitorUrl(placeId: string) {
-  return `https://m.place.naver.com/place/${placeId}/home`;
-}
-
-async function fetchText(url: string, extraHeaders?: Record<string, string>, timeoutMs = 6000) {
+async function fetchText(url: string, extraHeaders?: Record<string, string>, timeoutMs = 6500) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
-
   try {
     const res = await fetch(url, {
       method: "GET",
@@ -44,10 +38,9 @@ async function fetchText(url: string, extraHeaders?: Record<string, string>, tim
   }
 }
 
-async function fetchJson(url: string, extraHeaders?: Record<string, string>, timeoutMs = 6000) {
+async function fetchJson(url: string, extraHeaders?: Record<string, string>, timeoutMs = 4500) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
-
   try {
     const res = await fetch(url, {
       method: "GET",
@@ -60,7 +53,6 @@ async function fetchJson(url: string, extraHeaders?: Record<string, string>, tim
         ...extraHeaders
       }
     });
-
     const text = await res.text();
     let json: any = null;
     try {
@@ -75,10 +67,7 @@ async function fetchJson(url: string, extraHeaders?: Record<string, string>, tim
 }
 
 /**
- * ✅ Naver Search OpenAPI(Local)로 경쟁사 후보 찾기
- * - Railway에서 map.* 계열이 불안정하니 여기로 고정
- * - items[].link 에서 placeId 추출
- * - 혹시 link에 placeId가 없으면 JSON 전체에서 숫자 후보 추출(보조)
+ * ✅ OpenAPI 결과에서 placeId 후보 추출
  */
 function extractPlaceIdsFromOpenApi(json: any): string[] {
   if (!json) return [];
@@ -94,7 +83,7 @@ function extractPlaceIdsFromOpenApi(json: any): string[] {
     if (m2?.[1]) ids.push(m2[1]);
   }
 
-  // 보조: json 전체에서 5~12자리 숫자 후보 수집
+  // 보조: 전체에서 숫자 후보
   try {
     const s = JSON.stringify(json);
     const m = s.match(/\b\d{5,12}\b/g) || [];
@@ -105,17 +94,43 @@ function extractPlaceIdsFromOpenApi(json: any): string[] {
 }
 
 /**
- * ✅ 무료(ModularCrawler)에서 잡히던 "키워드 배열 패턴"을 경쟁사 HTML에서도 최대한 동일하게 적용
+ * ✅ 핵심: /place/{id} 로 한번 접속해서 slug 포함 최종 URL을 얻고 /home 을 보장한다.
+ * - 예: https://m.place.naver.com/place/144...  -> https://m.place.naver.com/hairshop/144.../home
+ */
+async function resolveHomeUrlByRedirect(placeId: string): Promise<string> {
+  const base = `https://m.place.naver.com/place/${placeId}`;
+  const r = await fetchText(base, { referer: "https://m.place.naver.com/" }, 6500);
+
+  // finalUrl이 slug 포함으로 바뀌는 게 정상
+  let u = String(r.finalUrl || base);
+
+  // query 제거
+  u = u.split("?")[0];
+
+  // 이미 /home이면 그대로
+  if (u.endsWith("/home")) return u;
+
+  // .../{slug}/{id} 형태면 /home 붙이기
+  if (new RegExp(`\\/\\d{5,12}$`).test(u)) return `${u}/home`;
+
+  // 혹시 .../place/{id} 그대로면, 안전하게 /home 붙이기
+  if (u.includes(`/place/${placeId}`)) return `https://m.place.naver.com/place/${placeId}/home`;
+
+  // 기타 케이스
+  return u.endsWith("/") ? `${u}home` : `${u}/home`;
+}
+
+/**
+ * ✅ 무료(ModularCrawler)와 유사한 키워드 배열 패턴
  */
 function extractKeywordsFromHtmlLikeFree(html: string): string[] {
   const s = String(html || "");
   if (!s) return [];
 
   const patterns: RegExp[] = [
-    /"keywordList"\s*:\s*(\[[^\]]{2,4000}\])/,
-    /"keywords"\s*:\s*(\[[^\]]{2,4000}\])/,
-    /"placeKeywords"\s*:\s*(\[[^\]]{2,4000}\])/,
-    /"keyword"\s*:\s*(\[[^\]]{2,4000}\])/
+    /"keywordList"\s*:\s*(\[[^\]]{2,6000}\])/,
+    /"keywords"\s*:\s*(\[[^\]]{2,6000}\])/,
+    /"placeKeywords"\s*:\s*(\[[^\]]{2,6000}\])/
   ];
 
   for (const re of patterns) {
@@ -123,7 +138,6 @@ function extractKeywordsFromHtmlLikeFree(html: string): string[] {
     if (!m?.[1]) continue;
 
     const arrText = m[1];
-
     try {
       const parsed = JSON.parse(arrText);
       if (Array.isArray(parsed)) {
@@ -135,25 +149,21 @@ function extractKeywordsFromHtmlLikeFree(html: string): string[] {
       if (words.length) return uniq(words).slice(0, 20);
     }
   }
-
   return [];
 }
 
 function extractNameFromHtml(html: string): string {
   const s = String(html || "");
   if (!s) return "";
-
   const mt = s.match(/<title[^>]*>([^<]{2,80})<\/title>/i);
   if (mt?.[1]) return mt[1].replace(/-.*$/g, "").trim();
-
   const m2 = s.match(/"name"\s*:\s*"([^"]{2,60})"/);
   if (m2?.[1]) return m2[1].trim();
-
   return "";
 }
 
 /**
- * ✅ 같은 업체가 서로 다른 placeId로 잡히는 케이스 제거(상호명 기준)
+ * ✅ 같은 업체 중복 제거 (상호명 기준)
  */
 function dedupeCompetitors(list: Competitor[], limit: number) {
   const byName = new Map<string, Competitor>();
@@ -191,8 +201,7 @@ export class CompetitorService {
   }
 
   /**
-   * ✅ 경쟁사 placeId 후보 찾기 (OpenAPI 고정)
-   * - NAVER_CLIENT_ID / NAVER_CLIENT_SECRET 필수
+   * ✅ 경쟁사 후보(placeId) 찾기: OpenAPI 고정
    */
   async findTopPlaceIds(query: string, excludePlaceId: string, limit = 5): Promise<string[]> {
     const q = normSpace(query);
@@ -207,31 +216,21 @@ export class CompetitorService {
     }
 
     const encoded = encodeURIComponent(q);
-    const url = `https://openapi.naver.com/v1/search/local.json?query=${encoded}&display=20&start=1&sort=random`;
+    const url = `https://openapi.naver.com/v1/search/local.json?query=${encoded}&display=25&start=1&sort=random`;
 
     console.log("[COMP][OpenAPI] query:", q);
 
     try {
-      const r = await fetchJson(
-        url,
-        {
-          "X-Naver-Client-Id": cid,
-          "X-Naver-Client-Secret": csec
-        },
-        4500
-      );
-
+      const r = await fetchJson(url, { "X-Naver-Client-Id": cid, "X-Naver-Client-Secret": csec }, 4500);
       console.log("[COMP][OpenAPI] status:", r.status);
-
       if (!r.ok || !r.json) return [];
 
-      let ids = extractPlaceIdsFromOpenApi(r.json);
+      let ids = extractPlaceIdsFromOpenApi(r.json)
+        .filter((id) => /^\d{5,12}$/.test(id))
+        .filter((id) => id !== String(excludePlaceId || "").trim());
 
-      const ex = String(excludePlaceId || "").trim();
-      if (ex) ids = ids.filter((id) => id !== ex);
-
-      // 후보가 너무 많으면 절제 (비용/시간 절감)
-      ids = ids.filter((id) => /^\d{5,12}$/.test(id)).slice(0, Math.max(limit * 6, 30));
+      // 비용 절감
+      ids = ids.slice(0, Math.max(limit * 8, 40));
 
       console.log("[COMP][OpenAPI] id candidates:", ids.length, ids.slice(0, 12));
       return ids;
@@ -242,16 +241,13 @@ export class CompetitorService {
   }
 
   /**
-   * ✅ 경쟁사 키워드만 추출
-   * - 1차: HTML에서 키워드 배열 패턴 추출(빠름)
-   * - 2차: 실패 시에만 crawler.crawlPlace(url)로 키워드 재시도(확실)
-   * - 내 업체 제외 + 중복 제거
+   * ✅ 경쟁사 키워드만 추출 (중요: slug redirect 해결 후 진행)
    */
   async crawlCompetitorsByIds(
     placeIds: string[],
     _industry: Industry,
     limit = 5,
-    opts?: { excludePlaceId?: string; myName?: string; myAddress?: string }
+    opts?: { excludePlaceId?: string; myName?: string }
   ): Promise<Competitor[]> {
     const candidates = uniq((placeIds || []).filter(Boolean));
     if (!candidates.length) return [];
@@ -262,12 +258,11 @@ export class CompetitorService {
     const out: Competitor[] = [];
     const tried = new Set<string>();
 
-    // Railway 안정성: 동시성 2 추천
     const CONCURRENCY = Number(process.env.COMPETITOR_CONCURRENCY || 2);
 
     let idx = 0;
     const worker = async () => {
-      while (idx < candidates.length && out.length < limit * 3) {
+      while (idx < candidates.length && out.length < limit * 4) {
         const id = candidates[idx++];
         if (!id) continue;
         if (tried.has(id)) continue;
@@ -276,13 +271,21 @@ export class CompetitorService {
         if (!/^\d{5,12}$/.test(id)) continue;
         if (excludeId && id === excludeId) continue;
 
-        const url = buildCompetitorUrl(id);
-
         try {
-          // 1) FAST: HTML fetch + keyword parse
-          const r = await fetchText(url, { referer: "https://m.place.naver.com/" }, 6500);
+          // ✅ 핵심: slug 포함 home URL로 resolve
+          const homeUrl = await resolveHomeUrlByRedirect(id);
+          console.log("[COMP][resolve] id:", id, "->", homeUrl);
+
+          // 1) FAST: HTML parse
+          const r = await fetchText(homeUrl, { referer: "https://m.place.naver.com/" }, 6500);
           const html = r.text || "";
           const name1 = extractNameFromHtml(html);
+
+          // 쉘 페이지(네이버 플레이스)면 바로 실패 처리 (시간 낭비 방지)
+          if (name1 === "네이버 플레이스") {
+            console.log("[COMP][shell] got Naver shell page:", id, "final:", r.finalUrl, "len:", html.length);
+            continue;
+          }
 
           if (myName && name1 && normSpace(name1) === myName) {
             console.log("[COMP][skip] same as myName:", id, name1);
@@ -292,14 +295,17 @@ export class CompetitorService {
           let keywords = extractKeywordsFromHtmlLikeFree(html);
           console.log("[COMP][kw] probed:", id, "name:", name1, "kw:", keywords.length, keywords);
 
-          // 2) fallback full crawl
+          // 2) fallback: full crawl (여기도 resolve된 homeUrl 사용!)
           if (!keywords.length) {
-            console.log("[COMP][kw] empty keywords:", id, "name:", name1, "htmlLen:", html.length);
-
             try {
-              const full = await this.crawler.crawlPlace(url);
+              const full = await this.crawler.crawlPlace(homeUrl);
               const nm2 = full?.data?.name ? String(full.data.name) : name1;
               const k2 = Array.isArray(full?.data?.keywords) ? full.data.keywords : [];
+
+              if (nm2 === "네이버 플레이스") {
+                console.log("[COMP][full] shell page:", id);
+                continue;
+              }
 
               if (myName && nm2 && normSpace(nm2) === myName) {
                 console.log("[COMP][skip] same as myName(full):", id, nm2);
@@ -317,7 +323,7 @@ export class CompetitorService {
 
           out.push({
             placeId: id,
-            url,
+            url: homeUrl,
             name: name1,
             keywords
           });
@@ -329,10 +335,8 @@ export class CompetitorService {
 
     await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
 
-    // 동일 상호명 중복 제거 + limit
     const cleaned = dedupeCompetitors(out, limit);
     console.log("[COMP][crawl-fast] final competitors:", cleaned.length);
-
     return cleaned;
   }
 }
