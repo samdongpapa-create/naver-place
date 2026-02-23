@@ -38,9 +38,9 @@ function normalizeName(name: string): string {
   let x = String(name || "").trim();
   if (!x) return "";
   x = stripHtml(x);
-  x = x.replace(/\([^)]*\)/g, ""); // (서대문역점) 같은 괄호 제거
+  x = x.replace(/\([^)]*\)/g, "");
   x = x.replace(/(서대문역점|교대역점|역점|본점|지점|점)$/g, "");
-  x = x.replace(/[^\w가-힣]/g, ""); // 특수문자 제거
+  x = x.replace(/[^\w가-힣]/g, "");
   x = x.replace(/\s+/g, "");
   return x.toLowerCase();
 }
@@ -48,7 +48,6 @@ function normalizeName(name: string): string {
 function addressPrefix(addr: string): string {
   const a = String(addr || "").replace(/\s+/g, " ").trim();
   if (!a) return "";
-  // "서울 서대문구" 정도까지만 비교
   return a.split(" ").slice(0, 2).join(" ");
 }
 
@@ -177,12 +176,13 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (x: T, idx: number)
 }
 
 export class CompetitorService {
-  // ✅ OpenAPI seed(이름/주소) 저장
   private seed = new Map<string, Partial<Competitor>>();
 
-  /**
-   * ✅ OpenAPI로 후보 placeId 뽑기 + seed 저장
-   */
+  // ✅ server.ts 호환용 (지금 구조에서는 리소스 보유 안 함)
+  async close() {
+    return;
+  }
+
   async findTopPlaceIds(query: string, excludePlaceId: string, limit = 5): Promise<string[]> {
     const q = (query || "").trim();
     if (!q) return [];
@@ -210,7 +210,6 @@ export class CompetitorService {
         if (id === excludePlaceId) continue;
         bag.push(id);
 
-        // seed
         const title = stripHtml(String(it?.title || ""));
         const address = String(it?.roadAddress || it?.address || "").trim();
         this.seed.set(id, {
@@ -222,14 +221,11 @@ export class CompetitorService {
       }
     }
 
-    const ids = uniq(bag).slice(0, Math.max(limit * 10, 40)); // 후보 넉넉히(중복 제거 대비)
+    const ids = uniq(bag).slice(0, Math.max(limit * 10, 40));
     console.log("[COMP][OpenAPI] id candidates:", ids.length, ids.slice(0, 15));
     return ids;
   }
 
-  /**
-   * ✅ 초경량 keyword 프로브 (fetch + __NEXT_DATA__)
-   */
   private async probeKeywordsFast(id: string): Promise<Competitor | null> {
     const url = buildCompetitorUrl(id);
 
@@ -242,17 +238,10 @@ export class CompetitorService {
 
     const r = await fetchWithTimeout(url, Number(process.env.COMPETITOR_PROBE_TIMEOUT_MS || 1200), headers);
 
-    // 실패하면 seed만
     if (!r.ok || !r.text) {
       const s = this.seed.get(id);
       if (!s?.name) return null;
-      return {
-        placeId: id,
-        url,
-        name: s.name,
-        address: s.address,
-        keywords: [] // seed는 키워드 없음
-      };
+      return { placeId: id, url, name: s.name, address: s.address, keywords: [] };
     }
 
     const next = parseNextData(r.text);
@@ -281,11 +270,6 @@ export class CompetitorService {
     };
   }
 
-  /**
-   * ✅ 후보들을 빠르게 프로브해서 Top5 확정
-   * - 중복 제거(같은 업체) + 내 업체 제거
-   * - 최종적으로 "키워드가 있는 경쟁사"를 우선
-   */
   async crawlCompetitorsByIds(
     placeIds: string[],
     industry: Industry,
@@ -303,13 +287,11 @@ export class CompetitorService {
     const myAddrPref = addressPrefix(opts?.myAddress || "");
     const excludePlaceId = String(opts?.excludePlaceId || "");
 
-    // ✅ 너무 많이 돌지 말기
     const slice = candidates.slice(0, Math.max(limit * 10, 40));
 
     const results = await mapLimit(slice, concurrency, async (id) => {
       if (Date.now() - started > hardMs) return null;
       if (excludePlaceId && id === excludePlaceId) return null;
-
       try {
         return await this.probeKeywordsFast(id);
       } catch {
@@ -317,10 +299,8 @@ export class CompetitorService {
       }
     });
 
-    // 1) 내 업체 제거 + 2) 중복 제거(같은 업체)
     const seenName = new Set<string>();
-    const seenAddr = new Set<string>();
-
+    const seenNameAddr = new Set<string>();
     const filtered: Competitor[] = [];
 
     for (const c of results) {
@@ -329,36 +309,35 @@ export class CompetitorService {
       const nNorm = normalizeName(c.name);
       const aPref = addressPrefix(c.address || "");
 
-      // ✅ 내 업체 제거(이름 기준)
+      // ✅ 내 업체 제거(이름)
       if (myNameNorm && nNorm && nNorm === myNameNorm) continue;
 
-      // ✅ 내 업체 제거(주소 prefix 기준) - 같은 생활권이면 오탐 가능해서 "myNameNorm 없는 경우"엔 적용 안 함
+      // ✅ 내 업체 제거(주소 prefix + 이름 유사)
       if (myNameNorm && myAddrPref && aPref && aPref === myAddrPref) {
-        // 이름이 비슷하거나(부분 포함) 같은 경우만 제거
         if (nNorm.includes(myNameNorm) || myNameNorm.includes(nNorm)) continue;
       }
 
-      // ✅ 같은 업체 중복 제거(이름 정규화 기준)
+      // ✅ 중복 제거(이름)
       if (nNorm && seenName.has(nNorm)) continue;
       if (nNorm) seenName.add(nNorm);
 
-      // ✅ 보조 중복 제거(주소 prefix도 똑같으면 중복으로 간주)
-      if (aPref && seenAddr.has(`${nNorm}|${aPref}`)) continue;
-      if (aPref) seenAddr.add(`${nNorm}|${aPref}`);
+      // ✅ 보조 중복(이름+주소prefix)
+      const key = `${nNorm}|${aPref}`;
+      if (aPref && seenNameAddr.has(key)) continue;
+      if (aPref) seenNameAddr.add(key);
 
       filtered.push(c);
       if (filtered.length >= limit) break;
       if (Date.now() - started > hardMs) break;
     }
 
-    // ✅ 키워드가 있는 애들 우선 정렬 (없으면 뒤로)
+    // 키워드 있는 애 우선
     filtered.sort((a, b) => (b.keywords?.length || 0) - (a.keywords?.length || 0));
 
     const out = filtered.slice(0, limit).map((x) => ({
       placeId: x.placeId,
       url: x.url,
       name: x.name,
-      // 너 요청대로: 리뷰/사진 다 빼고 키워드만
       keywords: Array.isArray(x.keywords) ? x.keywords : []
     }));
 
