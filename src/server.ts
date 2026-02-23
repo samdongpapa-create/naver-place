@@ -221,13 +221,13 @@ async function getCompetitorsSafe(params: {
       if (!ids?.length) continue;
 
       const comps = await withTimeout(
-        // ✅ 여기! 내 업체 제외 + 중복 제거 옵션 전달
+        // ✅ 내 업체 제외 + 중복 제거 옵션 전달
         compSvc.crawlCompetitorsByIds(ids, industry, limit, {
           excludePlaceId: placeId,
           myName,
           myAddress
         }),
-        Math.min(3500, remainingMs),
+        Math.min(3800, remainingMs),
         "compCrawl-timeout"
       );
 
@@ -389,6 +389,18 @@ app.post("/api/diagnose/paid", async (req, res) => {
     if ((gpt as any)?.improvements) (gpt as any).improvements.keywords = finalRecommendedKeywords;
     (gpt as any).recommendedKeywords = finalRecommendedKeywords;
 
+    // ✅ UI 없어도 네트워크 응답에서 경쟁사 키워드 확인 가능
+    const competitorKeywordsDebug = competitors.map((c: any) => ({
+      placeId: c.placeId,
+      name: c.name,
+      kwCount: Array.isArray(c.keywords) ? c.keywords.length : 0,
+      keywords: Array.isArray(c.keywords) ? c.keywords.slice(0, 10) : []
+    }));
+
+    const competitorTopKeywordsDebug = competitors
+      .flatMap((c: any) => (Array.isArray(c.keywords) ? c.keywords : []))
+      .slice(0, 50);
+
     return res.json({
       success: true,
       data: {
@@ -401,6 +413,10 @@ app.post("/api/diagnose/paid", async (req, res) => {
         improvements: (gpt as any).improvements,
         recommendedKeywords: finalRecommendedKeywords,
         competitors,
+
+        // ✅ 디버그 필드
+        competitorKeywordsDebug,
+        competitorTopKeywordsDebug,
 
         predictedAfter: (gpt as any).predicted,
         attempts: (gpt as any).attempts,
