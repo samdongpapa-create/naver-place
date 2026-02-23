@@ -274,8 +274,6 @@ function buildCompetitorKeywordTop(
 
 /**
  * ✅ 트래픽 우선형 대표키워드 5개
- * - 대표키워드엔 서비스(커트/펌/염색 등) 넣지 않음
- * - 지역+업종 / 생활권 확장 / 카테고리 강화 / 브랜드 방어
  */
 function buildRecommendedKeywordsTrafficFirst(params: {
   categoryK: string;
@@ -286,9 +284,9 @@ function buildRecommendedKeywordsTrafficFirst(params: {
 }): { recommended: string[]; debug: any } {
   const { categoryK, categoryBoost, myName, myAddress, competitorKeywordTop } = params;
 
-  const locality = getLocalityToken(myName, myAddress); // "서대문역"
-  const district = getDistrictToken(myAddress); // "종로"
-  const city = getCity(myAddress); // "서울"
+  const locality = getLocalityToken(myName, myAddress);
+  const district = getDistrictToken(myAddress);
+  const city = getCity(myAddress);
 
   const expansionPool = ["광화문", "종로", "시청", "서울역", "경복궁", "명동", "충정로", district].filter(Boolean);
 
@@ -303,12 +301,10 @@ function buildRecommendedKeywordsTrafficFirst(params: {
     out.push(x);
   };
 
-  // 1) 핵심 트래픽: 지역 + 업종
   if (locality) push(`${locality}${categoryK}`);
   else if (district) push(`${district}${categoryK}`);
   else push(`${categoryK}`);
 
-  // 2) 경쟁사 Top에서 생활권+업종 우선
   for (const kw of competitorKeywordTop || []) {
     if (out.length >= 3) break;
     if (!kw.includes(categoryK)) continue;
@@ -316,20 +312,15 @@ function buildRecommendedKeywordsTrafficFirst(params: {
     push(kw);
   }
 
-  // 3) 생활권 확장 1~2개
   for (const w of expansionPool) {
     if (out.length >= 3) break;
     if (!w) continue;
     push(`${w}${categoryK}`);
   }
 
-  // 4) 카테고리 강화 1개
   if (out.length < 4) push(categoryBoost?.[0] || categoryK);
-
-  // 5) 브랜드 방어 1개
   if (out.length < 5 && brand) push(brand);
 
-  // 부족 시 채움
   if (out.length < 5 && district) push(`${district}${categoryK}`);
   if (out.length < 5 && city && district) push(`${city}${district}${categoryK}`);
   if (out.length < 5 && (categoryBoost?.[1] || "")) push(categoryBoost[1]);
@@ -430,12 +421,18 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label = "timeout"): Pro
   }
 }
 
+/**
+ * ✅ 경쟁사 안전 호출 (부분성공 살리기)
+ * - ids 단계는 timeout 유지
+ * - crawlCompetitorsByIds는 "전체 timeout"으로 감싸지 않는다 (부분 성공을 0으로 날리지 않기 위함)
+ * - totalTimeoutMs는 query 반복을 멈출지 판단하는 용도로만 사용
+ */
 async function getCompetitorsSafe(params: {
   compSvc: CompetitorService;
   industry: Industry;
   placeId: string;
   myName: string;
-  myAddress: string; // (이건 server 내부 로직에서 쿼리 후보 만들 때만 사용)
+  myAddress: string; // server 내부에서만 사용(쿼리 후보/디버그)
   queries: string[];
   limit: number;
   totalTimeoutMs: number;
@@ -443,11 +440,14 @@ async function getCompetitorsSafe(params: {
   const { compSvc, industry, placeId, myName, myAddress, queries, limit, totalTimeoutMs } = params;
 
   const started = Date.now();
-  const competitors: any[] = [];
+  let best: any[] = [];
 
   for (const q of queries) {
-    const remainingMs = totalTimeoutMs - (Date.now() - started);
-    if (remainingMs <= 200) break;
+    const elapsed = Date.now() - started;
+    const remainingMs = totalTimeoutMs - elapsed;
+
+    // 남은 시간이 너무 없으면 더 시도하지 않음
+    if (remainingMs < 1200) break;
 
     try {
       console.log("[PAID][COMP] try query:", q, "remainingMs:", remainingMs);
@@ -459,18 +459,14 @@ async function getCompetitorsSafe(params: {
       );
       if (!ids?.length) continue;
 
-      // ✅ FIX: competitorService opts에는 myAddress 없음 -> 넘기지 말 것
-      const comps = await withTimeout(
-        compSvc.crawlCompetitorsByIds(ids, industry, limit, {
-          excludePlaceId: placeId,
-          myName
-        }),
-        Math.min(3800, remainingMs),
-        "compCrawl-timeout"
-      );
+      // ✅ FIX: 전체 timeout 래핑 제거 (부분 성공 살리기)
+      const comps = await compSvc.crawlCompetitorsByIds(ids, industry, limit, {
+        excludePlaceId: placeId,
+        myName
+      });
 
       if (Array.isArray(comps) && comps.length) {
-        competitors.push(...comps);
+        best = comps;
         break;
       }
     } catch (e: any) {
@@ -479,7 +475,7 @@ async function getCompetitorsSafe(params: {
   }
 
   const uniqById = new Map<string, any>();
-  for (const c of competitors) {
+  for (const c of best) {
     if (!c?.placeId) continue;
     if (!uniqById.has(c.placeId)) uniqById.set(c.placeId, c);
     if (uniqById.size >= limit) break;
@@ -615,13 +611,12 @@ app.post("/api/diagnose/paid", async (req, res) => {
       myAddress: crawlResult.data.address,
       queries: queryCandidates,
       limit: 5,
-      totalTimeoutMs: Number(process.env.COMPETITOR_TIMEOUT_MS || 6000)
+      totalTimeoutMs: Number(process.env.COMPETITOR_TIMEOUT_MS || 9000) // ✅ 9초 권장
     });
 
     console.log("[PAID] competitors:", competitors.length, "queries:", queryCandidates);
 
     const competitorKeywordsFlat = competitors.flatMap((c: any) => (Array.isArray(c.keywords) ? c.keywords : []));
-
     const compTop = buildCompetitorKeywordTop(competitorKeywordsFlat, 20);
 
     const traffic = buildRecommendedKeywordsTrafficFirst({
@@ -676,6 +671,7 @@ app.post("/api/diagnose/paid", async (req, res) => {
     imp.directions = dirInjected.text;
     imp.reviewRequestScripts = rr;
 
+    // ✅ 대표키워드는 서버 확정값으로 강제
     imp.keywords = finalRecommendedKeywords;
     (gpt as any).recommendedKeywords = finalRecommendedKeywords;
 
