@@ -14,6 +14,12 @@ type Competitor = {
   rank: number;
 };
 
+type FindTopCompetitorsOpts = {
+  excludePlaceId?: string;
+  limit?: number;
+  timeoutMs?: number; // 전체 예산(상한) - 내부에서 search/enrich로 분배
+};
+
 export class CompetitorService {
   private browser: Browser | null = null;
 
@@ -33,9 +39,9 @@ export class CompetitorService {
     this.browser = null;
   }
 
-  /**
-   * (옵션) 지도 TOP5 고도화용
-   */
+  // ==========================
+  // (옵션) 지도 TOP5 고도화용
+  // ==========================
   async findTopPlaceIdsFromMapRank(keyword: string, opts: FindTopIdsOptions = {}) {
     const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
     const exclude = String(opts.excludePlaceId || "").trim();
@@ -125,69 +131,114 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 핵심: where=place 검색 HTML 1회 + (필요시) place home 렌더 기반 보강
+  // ✅ 핵심: where=place 검색 → TOP placeId → 대표키워드(keywordList) 보강(안정형)
+  // - timeout 예산 분리 (a)
+  // - enrich 병렬 제한(세마포어, b)
   // ==========================
-  public async findTopCompetitorsByKeyword(
-    keyword: string,
-    opts: { excludePlaceId?: string; limit?: number; timeoutMs?: number } = {}
-  ): Promise<Competitor[]> {
+  public async findTopCompetitorsByKeyword(keyword: string, opts: FindTopCompetitorsOpts = {}): Promise<Competitor[]> {
     const q = String(keyword || "").trim();
     if (!q) return [];
 
     const limit = Math.max(1, Math.min(10, opts.limit ?? 5));
     const exclude = String(opts.excludePlaceId || "").trim();
-    const timeoutMs = Math.max(
-      1500,
-      Math.min(20000, opts.timeoutMs ?? Number(process.env.COMPETITOR_TIMEOUT_MS || 9000))
-    );
+
+    // ✅ 전체 예산(상한)
+    const totalTimeoutMs = Math.max(3000, Math.min(30000, opts.timeoutMs ?? Number(process.env.COMPETITOR_TIMEOUT_MS || 12000)));
+
+    // ✅ (a) 예산 분리: search는 짧고 고정, enrich는 조금 더 길게
+    // - search는 실패해도 다음 쿼리/로직으로 갈 수 있으니 “짧게”
+    // - enrich는 iframe/xhr 기다려야 하니 “조금 길게”
+    const searchTimeoutMs = Math.max(2500, Math.min(7000, Math.floor(totalTimeoutMs * 0.45)));
+    const enrichTimeoutMs = Math.max(6000, Math.min(12000, totalTimeoutMs)); // place 1개당 상한
 
     const url = `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`;
-    const html = await this.__fetchHtml(url, timeoutMs);
+
+    let html = "";
+    try {
+      html = await this.__fetchHtml(url, searchTimeoutMs);
+    } catch {
+      // search 자체 실패면 그대로 빈 결과
+      return [];
+    }
 
     const placeIds = this.__extractPlaceIdsInOrder(html);
 
-    // ✅ search html에서도 __NEXT_DATA__에 들어있으면 name/keywords 일부는 캐치 가능
+    // search html에서도 __NEXT_DATA__에 들어있으면 name/keywords 일부는 캐치 가능
     const searchNext = this.__parseNextData(html);
 
-    const out: Competitor[] = [];
-    const seen = new Set<string>();
+    // 너무 많이 잡아서 무한 시도 방지: limit*3 정도만 후보로
+    const maxCandidates = Math.min(30, Math.max(10, limit * 3));
+    const candidateIds: string[] = [];
+    const seenPid = new Set<string>();
 
     for (const pid of placeIds) {
       if (!pid) continue;
       if (exclude && pid === exclude) continue;
-      if (seen.has(pid)) continue;
-
-      let name = this.__findNameForPlaceId(searchNext, pid) || "";
-      let keywords = this.__findKeywordsForPlaceId(searchNext, pid).slice(0, 5);
-
-      // ✅ 부족하면 place home “렌더 기반”으로 보강 (여기서 키워드가 제대로 살아나야 함)
-      if (this.__needKeywordEnrich(keywords, name)) {
-        const enriched = await this.__fetchPlaceHomeAndExtract(pid, Math.min(12000, timeoutMs + 3000));
-        if (enriched.name && !name) name = enriched.name;
-        if (enriched.keywords?.length) keywords = enriched.keywords.slice(0, 5);
-
-        out.push({
-          placeId: pid,
-          name: this.__cleanText(name),
-          keywords: (keywords || []).map((k) => this.__cleanText(k)).filter(Boolean).slice(0, 5),
-          source: "place_home",
-          rank: out.length + 1
-        });
-      } else {
-        out.push({
-          placeId: pid,
-          name: this.__cleanText(name),
-          keywords: (keywords || []).map((k) => this.__cleanText(k)).filter(Boolean).slice(0, 5),
-          source: "search_html",
-          rank: out.length + 1
-        });
-      }
-
-      seen.add(pid);
-      if (out.length >= limit) break;
+      if (seenPid.has(pid)) continue;
+      seenPid.add(pid);
+      candidateIds.push(pid);
+      if (candidateIds.length >= maxCandidates) break;
     }
 
-    // ✅ 오염 방지
+    // ✅ (b) enrich 병렬 제한
+    const enrichConcurrency = Math.max(1, Math.min(4, Number(process.env.COMPETITOR_ENRICH_CONCURRENCY || 2)));
+    const runLimited = this.__createLimiter(enrichConcurrency);
+
+    // 후보별 기본값 + (필요시) enrich promise를 미리 만들어 둔다
+    const base = candidateIds.map((pid) => {
+      const name = this.__findNameForPlaceId(searchNext, pid) || "";
+      const keywords = this.__findKeywordsForPlaceId(searchNext, pid).slice(0, 5);
+      const need = this.__needKeywordEnrich(keywords, name);
+      return { pid, name, keywords, need };
+    });
+
+    const enrichPromises = new Map<string, Promise<{ name: string; keywords: string[] }>>();
+    for (const c of base) {
+      if (!c.need) continue;
+      // limiter를 통해 동시에 N개만 실행
+      enrichPromises.set(
+        c.pid,
+        runLimited(() => this.__fetchPlaceHomeAndExtract(c.pid, enrichTimeoutMs))
+      );
+    }
+
+    // ✅ 순서 유지하면서 결과 채우기 (TOP5)
+    const out: Competitor[] = [];
+    for (const c of base) {
+      if (out.length >= limit) break;
+
+      let name = c.name;
+      let keywords = c.keywords;
+
+      const p = enrichPromises.get(c.pid);
+      if (p) {
+        try {
+          const enriched = await p;
+          if (enriched?.name && !name) name = enriched.name;
+          if (enriched?.keywords?.length) keywords = enriched.keywords.slice(0, 5);
+        } catch {
+          // ignore
+        }
+      }
+
+      const cleanedName = this.__cleanText(name);
+      const cleanedKeywords = (keywords || [])
+        .map((k) => this.__cleanText(k))
+        .filter(Boolean)
+        .filter((k) => k && k.length >= 2 && k.length <= 25)
+        .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
+        .slice(0, 5);
+
+      out.push({
+        placeId: c.pid,
+        name: cleanedName,
+        keywords: cleanedKeywords,
+        source: p ? "place_home" : "search_html",
+        rank: out.length + 1
+      });
+    }
+
+    // ✅ 오염 방지(마지막 필터 한번 더)
     return out.map((c) => ({
       ...c,
       keywords: (c.keywords || [])
@@ -389,9 +440,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 핵심 개선: place home은 “렌더 기반”으로 대표키워드 추출
-  // - 업종별 경로(hairshop/cafe/restaurant/place) 순회
-  // - __NEXT_DATA__ → regex array fallback
+  // ✅ 핵심 개선: place home은 “iframe + 네트워크 응답 스니핑”으로 대표키워드 추출
   // ==========================
   private async __fetchPlaceHomeAndExtract(placeId: string, timeoutMs: number): Promise<{ name: string; keywords: string[] }> {
     const pid = String(placeId).trim();
@@ -406,11 +455,8 @@ export class CompetitorService {
 
     for (const url of candidates) {
       const r = await this.__renderAndExtractFromPlaceHome(url, Math.max(2500, Math.min(15000, timeoutMs)));
-      if (r.keywords.length || r.name) {
-        // keywords가 있는 케이스면 바로 채택
-        if (r.keywords.length) return r;
-        // name만 있고 keywords 없으면 다음 후보도 더 시도해본다
-      }
+      if (r.keywords.length) return r;
+      // name만 있고 keywords 없으면 다음 후보도 더 시도
     }
 
     return { name: "", keywords: [] };
@@ -440,49 +486,134 @@ export class CompetitorService {
 
     page.setDefaultTimeout(timeoutMs);
 
+    // ✅ 네트워크 응답에서 대표키워드/이름을 “가로채기”
+    const netState = {
+      name: "",
+      keywords: [] as string[]
+    };
+
+    const onResponse = async (res: any) => {
+      try {
+        const req = res.request();
+        const rt = req.resourceType();
+        if (rt !== "xhr" && rt !== "fetch") return;
+
+        const ct = (await res.headerValue("content-type")) || "";
+        if (!/json|javascript/i.test(ct)) return;
+
+        const txt = await res.text();
+        if (!txt || txt.length < 20) return;
+        if (!/(keywordList|representKeywordList|representKeywords|keywords)/.test(txt)) return;
+
+        let j: any = null;
+        try {
+          j = JSON.parse(txt);
+        } catch {
+          return;
+        }
+
+        if (!netState.name) {
+          const nm = this.__deepFindName(j);
+          if (nm) netState.name = nm;
+        }
+
+        if (!netState.keywords.length) {
+          const keys = ["keywordList", "representKeywordList", "representKeywords", "keywords"];
+          for (const k of keys) {
+            const arr = this.__deepFindStringArray(j, k);
+            if (arr.length) {
+              netState.keywords = arr;
+              break;
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    page.on("response", onResponse);
+
     try {
       await page.goto(url, { waitUntil: "domcontentloaded" });
 
-      // ✅ 키워드가 추가 로딩되는 경우가 많아서 짧게 대기
-      await page.waitForTimeout(900);
+      // ✅ 핵심: entryIframe 대기 → iframe 내부 HTML/NextData도 파싱
+      let frameHtml = "";
+      const iframeHandle = await page
+        .waitForSelector('iframe#entryIframe, iframe[name="entryIframe"]', { timeout: Math.min(7000, timeoutMs) })
+        .catch(() => null);
 
-      const html = await page.content();
-
-      // 1) __NEXT_DATA__에서 키워드 우선 추출
-      const next = this.__parseNextData(html);
-
-      let name = this.__deepFindName(next) || "";
-
-      const keys = ["keywordList", "representKeywordList", "representKeywords", "keywords"];
-      let keywords: string[] = [];
-      for (const k of keys) {
-        keywords = this.__deepFindStringArray(next, k);
-        if (keywords.length) break;
+      if (iframeHandle) {
+        const frame = await iframeHandle.contentFrame().catch(() => null);
+        if (frame) {
+          await frame.waitForLoadState("domcontentloaded").catch(() => {});
+          await frame.waitForTimeout(400).catch(() => {});
+          frameHtml = await frame.content().catch(() => "");
+        }
       }
 
-      // 2) 그래도 없으면 HTML 전체에서 배열을 regex로 직접 추출 (Next에 없고 HTML 어딘가에 박혀있는 케이스 대응)
-      if (!keywords.length) {
-        keywords = this.__extractKeywordArrayByRegex(html);
+      // ✅ 키워드가 “늦게” 오는 케이스 대응: 최대 timeout까지 폴링
+      const started = Date.now();
+      while (Date.now() - started < Math.min(timeoutMs, 12000)) {
+        if (netState.keywords.length) break;
+
+        if (frameHtml) {
+          const next = this.__parseNextData(frameHtml);
+
+          if (!netState.name) netState.name = this.__deepFindName(next) || netState.name;
+
+          if (!netState.keywords.length) {
+            const keys = ["keywordList", "representKeywordList", "representKeywords", "keywords"];
+            for (const k of keys) {
+              const arr = this.__deepFindStringArray(next, k);
+              if (arr.length) {
+                netState.keywords = arr;
+                break;
+              }
+            }
+          }
+
+          if (!netState.keywords.length) {
+            const fallback = this.__extractKeywordArrayByRegex(frameHtml);
+            if (fallback.length) netState.keywords = fallback;
+          }
+        }
+
+        if (netState.keywords.length) break;
+
+        // iframe html 갱신 시도 (가끔 늦게 hydration)
+        if (iframeHandle) {
+          const frame = await iframeHandle.contentFrame().catch(() => null);
+          if (frame) frameHtml = await frame.content().catch(() => frameHtml);
+        }
+
+        await page.waitForTimeout(250);
       }
 
-      // 3) og:title fallback
-      if (!name) {
-        const m1 = html.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
-        if (m1?.[1]) name = this.__cleanText(m1[1]);
+      // ✅ 마지막 name fallback (outer html에서도 og:title 등)
+      if (!netState.name) {
+        const outer = await page.content().catch(() => "");
+        const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
+        if (m1?.[1]) netState.name = this.__cleanText(m1[1]);
       }
+
+      const cleanedKeywords = (netState.keywords || [])
+        .map((k) => this.__cleanText(k))
+        .filter(Boolean)
+        .filter((k) => k.length >= 2 && k.length <= 25)
+        .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
+        .slice(0, 5);
 
       return {
-        name: this.__cleanText(name),
-        keywords: (keywords || [])
-          .map((k) => this.__cleanText(k))
-          .filter(Boolean)
-          .filter((k) => k.length >= 2 && k.length <= 25)
-          .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
-          .slice(0, 5)
+        name: this.__cleanText(netState.name),
+        keywords: cleanedKeywords
       };
     } catch {
       return { name: "", keywords: [] };
     } finally {
+      try {
+        page.off("response", onResponse);
+      } catch {}
       try {
         await page.close();
       } catch {}
@@ -504,7 +635,6 @@ export class CompetitorService {
     const re1 = /"(?:representKeywordList|keywordList|representKeywords|keywords)"\s*:\s*\[([^\]]{1,2000})\]/g;
     for (const m of text.matchAll(re1)) {
       const inside = m[1] || "";
-      // 문자열만 뽑기
       const strs = [...inside.matchAll(/"([^"]{2,40})"/g)]
         .map((x) => this.__cleanText(x[1]))
         .filter(Boolean);
@@ -512,5 +642,38 @@ export class CompetitorService {
     }
 
     return [];
+  }
+
+  // ==========================
+  // ✅ (b) 세마포어/리미터: 동시에 N개만 실행
+  // ==========================
+  private __createLimiter(concurrency: number) {
+    let active = 0;
+    const queue: Array<() => void> = [];
+
+    const next = () => {
+      if (active >= concurrency) return;
+      const job = queue.shift();
+      if (!job) return;
+      active++;
+      job();
+    };
+
+    return async <T>(fn: () => Promise<T>): Promise<T> => {
+      return await new Promise<T>((resolve, reject) => {
+        const run = () => {
+          fn()
+            .then(resolve)
+            .catch(reject)
+            .finally(() => {
+              active--;
+              next();
+            });
+        };
+
+        queue.push(run);
+        next();
+      });
+    };
   }
 }
