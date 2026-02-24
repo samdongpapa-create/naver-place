@@ -528,6 +528,17 @@ async function getCompetitorsSafe(params: {
 
     try {
       console.log("[PAID][COMP] try query:", q, "remainingMs:", remainingMs, "perTryTimeoutMs:", perTryTimeoutMs);
+          // ✅ DEBUG: 경쟁사별 키워드 상태 확인
+    try {
+      const snap = competitors.map((c: any, i: number) => ({
+        rank: i + 1,
+        placeId: c.placeId,
+        name: c.name,
+        kwCount: Array.isArray(c.keywords) ? c.keywords.length : 0,
+        keywords: Array.isArray(c.keywords) ? c.keywords.slice(0, 5) : []
+      }));
+      console.log("[PAID][COMP] keyword snapshot:", JSON.stringify(snap));
+    } catch {}
 
       const comps = await withTimeout(
         compSvc.findTopCompetitorsByKeyword(q, {
