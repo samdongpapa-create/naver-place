@@ -36,6 +36,7 @@ function clampText(s: string, max: number) {
   if (!t) return "";
   return t.length > max ? t.slice(0, max).trim() : t;
 }
+
 function buildScoreExplain(scores: any) {
   const explain: any = {};
   const obj = scores && typeof scores === "object" ? scores : {};
@@ -67,6 +68,7 @@ function buildScoreExplain(scores: any) {
 
   return explain;
 }
+
 function extractPlaceIdSafe(url: string): string {
   const m = String(url || "").match(/(\d{5,12})/);
   return m?.[1] || "";
@@ -484,10 +486,23 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label = "timeout"): Pro
 
 /**
  * ✅ 경쟁사 안전 호출 (부분성공 살리기)
- * - ids 단계는 timeout 유지
- * - crawlCompetitorsByIds는 "전체 timeout"으로 감싸지 않는다 (부분 성공을 0으로 날리지 않기 위함)
- * - totalTimeoutMs는 query 반복을 멈출지 판단하는 용도로만 사용
+ * - totalTimeoutMs는 query 반복을 멈출지 판단하는 용도
+ * - perTryTimeoutMs는 "한 번 시도"의 상한
+ *
+ * ✅ 환경변수
+ * - COMPETITOR_TOTAL_TIMEOUT_MS (전체 예산) 기본 18000
+ * - COMPETITOR_QUERY_TIMEOUT_MS (1회 시도 상한) 기본 12000
  */
+function getCompetitorTimeouts() {
+  const total = Number(process.env.COMPETITOR_TOTAL_TIMEOUT_MS || 18000);
+  const perTry = Number(process.env.COMPETITOR_QUERY_TIMEOUT_MS || 12000);
+
+  // 안전 범위
+  const safeTotal = Math.max(7000, Math.min(45000, isFinite(total) ? total : 18000));
+  const safePerTry = Math.max(3000, Math.min(20000, isFinite(perTry) ? perTry : 12000));
+
+  return { safeTotal, safePerTry };
+}
 
 async function getCompetitorsSafe(params: {
   compSvc: CompetitorService;
@@ -499,26 +514,32 @@ async function getCompetitorsSafe(params: {
   const { compSvc, placeId, queries, limit, totalTimeoutMs } = params;
 
   const started = Date.now();
+  const perTryCap = getCompetitorTimeouts().safePerTry;
 
   for (const q of queries) {
     const remainingMs = totalTimeoutMs - (Date.now() - started);
     if (remainingMs <= 200) break;
 
+    // ✅ 이번 시도에 쓸 timeout = remainingMs 안에서, perTryCap까지
+    const perTryTimeoutMs = Math.min(
+      remainingMs,
+      Math.max(3000, Math.min(perTryCap, remainingMs))
+    );
+
     try {
-      console.log("[PAID][COMP] try query:", q, "remainingMs:", remainingMs);
+      console.log("[PAID][COMP] try query:", q, "remainingMs:", remainingMs, "perTryTimeoutMs:", perTryTimeoutMs);
 
       const comps = await withTimeout(
         compSvc.findTopCompetitorsByKeyword(q, {
           excludePlaceId: placeId,
           limit,
-          timeoutMs: Math.min(remainingMs, 9000)
+          timeoutMs: perTryTimeoutMs
         }),
-        Math.min(remainingMs, 9000),
+        perTryTimeoutMs,
         "compTop-timeout"
       );
 
       if (Array.isArray(comps) && comps.length) {
-        // ✅ 여기서 바로 리턴: 이미 TOPN + keywords까지 포함
         return comps.slice(0, limit);
       }
     } catch (e: any) {
@@ -648,13 +669,15 @@ app.post("/api/diagnose/paid", async (req, res) => {
       ].filter(Boolean)
     ).slice(0, 3);
 
-const competitors = await getCompetitorsSafe({
-  compSvc,
-  placeId,
-  queries: queryCandidates,
-  limit: 5,
-  totalTimeoutMs: Number(process.env.COMPETITOR_TIMEOUT_MS || 9000)
-});
+    // ✅ timeout: 환경변수 기반(기본 18초)
+    const { safeTotal } = getCompetitorTimeouts();
+    const competitors = await getCompetitorsSafe({
+      compSvc,
+      placeId,
+      queries: queryCandidates,
+      limit: 5,
+      totalTimeoutMs: Number.isFinite(safeTotal) ? safeTotal : 18000
+    });
 
     console.log("[PAID] competitors:", competitors.length, "queries:", queryCandidates);
 
@@ -662,13 +685,13 @@ const competitors = await getCompetitorsSafe({
     const compTop = buildCompetitorKeywordTop(competitorKeywordsFlat, 20);
 
     const traffic = buildRecommendedKeywordsTrafficFirst({
-  categoryK: prof.categoryK,
-  categoryBoost: prof.categoryBoost,
-  myName: crawlResult.data.name,
-  myAddress: crawlResult.data.address,
-  competitorKeywordTop: compTop.top,
-  menuTerms: prof.serviceTokens
-});
+      categoryK: prof.categoryK,
+      categoryBoost: prof.categoryBoost,
+      myName: crawlResult.data.name,
+      myAddress: crawlResult.data.address,
+      competitorKeywordTop: compTop.top,
+      menuTerms: prof.serviceTokens
+    });
 
     const finalRecommendedKeywords = traffic.recommended;
 
@@ -752,14 +775,15 @@ const competitors = await getCompetitorsSafe({
         recommendedKeywords: finalRecommendedKeywords,
 
         // ✅ UI 단순 버전 (상호명 : 키워드)
-competitorsSimple: competitors.map((c: any, idx: number) => ({
-  rank: idx + 1,
-  name: c?.name || `경쟁사 ${idx + 1}`,
-  keywords: Array.isArray(c?.keywords) ? c.keywords.slice(0, 5) : []
-})),
+        competitorsSimple: competitors.map((c: any, idx: number) => ({
+          rank: idx + 1,
+          name: c?.name || `경쟁사 ${idx + 1}`,
+          keywords: Array.isArray(c?.keywords) ? c.keywords.slice(0, 5) : []
+        })),
 
-// ✅ 경쟁사 키워드 기반 추가 추천 5개 (대표키워드 5개와 별개로 참고용)
-additionalRecommendedKeywords: compTop.top.filter((k) => !finalRecommendedKeywords.includes(k)).slice(0, 5),
+        // ✅ 경쟁사 키워드 기반 추가 추천 5개 (대표키워드 5개와 별개로 참고용)
+        additionalRecommendedKeywords: compTop.top.filter((k) => !finalRecommendedKeywords.includes(k)).slice(0, 5),
+
         competitors,
         competitorKeywordsDebug,
 
