@@ -13,6 +13,7 @@ import { CompetitorService } from "./services/competitorService";
 import { UrlConverter } from "./services/modules/urlConverter";
 
 import { generatePaidConsultingGuaranteed } from "./services/gptConsulting";
+import { pickTopServiceKeywordsByTraffic } from "./services/searchadKeywordTool";
 
 const app = express();
 const port = process.env.PORT || 3000;
