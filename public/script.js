@@ -48,7 +48,6 @@ function normalizeScoreKey(rawKey) {
   const k = String(rawKey || "").trim();
   const low = k.toLowerCase();
 
-  // 포함 기반(photosScore, review_count 등도 잡힘)
   if (low.includes("desc")) return "상세설명";
   if (low.includes("description")) return "상세설명";
 
@@ -69,10 +68,9 @@ function normalizeScoreKey(rawKey) {
   if (low.includes("price")) return "가격/메뉴";
   if (low.includes("menu")) return "가격/메뉴";
 
-  // 이미 한글이면 그대로
   if (/[가-힣]/.test(k)) return k;
 
-  return k; // 마지막 fallback
+  return k;
 }
 
 function normalizeServerResponse(serverJson) {
@@ -97,14 +95,24 @@ function normalizeServerResponse(serverJson) {
   const scoring = {
     totalScore: toNumber(data.totalScore, 0),
     totalGrade: String(data.totalGrade || ""),
-    scores: data.scores || null
+    scores: data.scores || null,
+    // ✅ paid/free 둘 다 scoreExplain 내려주고 있어서 반영
+    scoreExplain: data.scoreExplain || null
   };
 
+  // ✅ paid 응답 구조 반영 (server.ts와 1:1로 매칭)
   const paid = {
     recommendedKeywords: asArray(data.recommendedKeywords || []).slice(0, 5),
-    competitors: Array.isArray(data.competitors) ? data.competitors : [],
+    improvements: data.improvements || null,
     unifiedText: String(data.unifiedText || ""),
-    improvements: data.improvements || null
+
+    // ✅ 경쟁사 표시용 (server.ts)
+    competitorsSimple: Array.isArray(data.competitorsSimple) ? data.competitorsSimple : [],
+    additionalRecommendedKeywords: asArray(data.additionalRecommendedKeywords || []).slice(0, 5),
+
+    // ✅ 디버그/고급용(있으면 활용)
+    competitors: Array.isArray(data.competitors) ? data.competitors : [],
+    competitorKeywordsDebug: Array.isArray(data.competitorKeywordsDebug) ? data.competitorKeywordsDebug : []
   };
 
   return { ok, message, logs, place, scoring, paid, raw: serverJson };
@@ -321,33 +329,42 @@ function renderPaidBlocks(paid) {
   return blocks.join("\n");
 }
 
+/**
+ * ✅ paid 객체를 통째로 받아서 경쟁사/추가키워드 렌더
+ */
 function renderCompetitors(paid) {
-  const list = Array.isArray(paid?.competitorsSimple) ? paid.competitorsSimple : (Array.isArray(paid?.competitors) ? paid.competitors : []);
+  const list =
+    Array.isArray(paid?.competitorsSimple) && paid.competitorsSimple.length
+      ? paid.competitorsSimple
+      : Array.isArray(paid?.competitors) && paid.competitors.length
+      ? paid.competitors
+      : [];
+
   const add5 = asArray(paid?.additionalRecommendedKeywords || []).slice(0, 5);
 
   const blocks = [];
 
-  // 경쟁사
   if (!list.length) {
     blocks.push(`
       <div class="upgrade-card" style="margin-top:12px;">
         <div class="upgrade-header">
           <h3>🏁 경쟁업체 TOP5</h3>
-          <p>경쟁사 데이터를 가져오지 못했습니다. (검색어/노출 구조 영향)</p>
+          <p>경쟁사 데이터를 가져오지 못했습니다. (검색어/노출 구조/일시적 제한 영향)</p>
         </div>
       </div>
     `);
   } else {
     const rows = list.slice(0, 5).map((c, idx) => {
       const name = c?.name ? String(c.name) : `경쟁사 ${idx + 1}`;
-      const kws = asArray(c?.keywords || []).slice(0, 5).join(", ");
-      return `<li><b>${escapeHtml(name)}</b> : ${escapeHtml(kws || "(키워드 없음)")}</li>`;
+      const kwArr = asArray(c?.keywords || []).slice(0, 5);
+      const kws = kwArr.length ? kwArr.join(", ") : "(대표키워드 미노출/추출실패)";
+      return `<li><b>${escapeHtml(name)}</b> : ${escapeHtml(kws)}</li>`;
     }).join("");
 
     blocks.push(`
       <div class="upgrade-card" style="margin-top:12px;">
         <div class="upgrade-header">
-          <h3>🏁 경쟁업체 TOP5 (심플)</h3>
+          <h3>🏁 경쟁업체 TOP5</h3>
           <p>“상호명 : 대표키워드” 형식</p>
         </div>
         <ul class="simple-list">${rows}</ul>
@@ -355,12 +372,11 @@ function renderCompetitors(paid) {
     `);
   }
 
-  // 추가 추천 키워드 5개
   if (add5.length) {
     blocks.push(`
       <div class="upgrade-card" style="margin-top:12px;">
         <div class="upgrade-header">
-          <h3>➕ 경쟁사 기반 추가 추천 키워드 (5개)</h3>
+          <h3>➕ 경쟁사 기반 추가 추천 키워드 (최대 5개)</h3>
           <p>대표키워드 5개와 별개로, 블로그/리뷰/본문에 자연스럽게 활용</p>
         </div>
         ${renderKeywordChips(add5)}
@@ -385,7 +401,7 @@ async function diagnose(mode) {
 
   try {
     if (mode === "paid") {
-      const q = ($("paidSearchQuery")?.value || "").trim(); // ✅ 모달 입력 사용
+      const q = ($("paidSearchQuery")?.value || "").trim();
       const payload = { placeUrl, industry, searchQuery: q };
 
       const { res, json } = await postJson("/api/diagnose/paid", payload);
@@ -411,7 +427,8 @@ async function diagnose(mode) {
       setHtml("improvementsSection", renderPaidBlocks(n.paid));
       setDisplay("improvementsSection", true);
 
-      setHtml("competitorsSection", renderCompetitors(n.paid.competitors));
+      // ✅ 핵심 수정: paid 객체를 통째로 전달
+      setHtml("competitorsSection", renderCompetitors(n.paid));
       setDisplay("competitorsSection", true);
 
       return;
@@ -454,7 +471,6 @@ window.diagnoseFree = function () {
 window.diagnosePaid = function () {
   window.closePaidModal();
 
-  // ✅ 입력 없으면 기본값 자동 세팅(서버도 한 번 더 보정함)
   const industry = ($("industrySelect")?.value || "hairshop").trim();
   const defaultQuery =
     industry === "hairshop" ? "서대문역 미용실" : industry === "cafe" ? "서대문역 카페" : "서대문역 맛집";
@@ -479,7 +495,6 @@ window.resetDiagnosis = function () {
 };
 
 window.showPaidModal = function () {
-  // 모달 열 때 기본 검색어 자동 넣기
   const industry = ($("industrySelect")?.value || "hairshop").trim();
   const defaultQuery =
     industry === "hairshop" ? "서대문역 미용실" : industry === "cafe" ? "서대문역 카페" : "서대문역 맛집";
