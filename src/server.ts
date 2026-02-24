@@ -308,13 +308,18 @@ function buildCompetitorKeywordTop(
 /**
  * ✅ 트래픽 우선형 대표키워드 5개
  */
+/**
+ * ✅ 트래픽 우선형 대표키워드 5개
+ * - 1~3: 지역 + 업종
+ * - 4~5: 메뉴/시술 (지역명 X)
+ */
 function buildRecommendedKeywordsTrafficFirst(params: {
   categoryK: string;
   categoryBoost: string[];
   myName: string;
   myAddress: string;
   competitorKeywordTop: string[];
-  menuTerms?: string[]; // ✅ 커트/펌 등 업종 대표 “메뉴/시술” 2개 뽑기용
+  menuTerms?: string[];
 }): { recommended: string[]; debug: any } {
   const { categoryK, categoryBoost, myName, myAddress, competitorKeywordTop } = params;
 
@@ -322,10 +327,8 @@ function buildRecommendedKeywordsTrafficFirst(params: {
   const district = getDistrictToken(myAddress);
   const city = getCity(myAddress);
 
-  // ✅ 지역 확장 풀(하드코딩 + 주소 기반)
   const expansionPool = ["광화문", "종로", "시청", "서울역", "경복궁", "명동", "충정로", district].filter(Boolean);
 
-  // ✅ 브랜드 방어 (상호명)
   const brand = normalizeKw(myName).replace(/[^\w가-힣]/g, "");
 
   const out: string[] = [];
@@ -348,8 +351,8 @@ function buildRecommendedKeywordsTrafficFirst(params: {
   for (const kw of competitorKeywordTop || []) {
     if (out.length >= 3) break;
     if (!kw.includes(categoryK)) continue;
-    // 메뉴/시술형은 지역 3개에서 제외
-    if (/(커트|컷|펌|염색|탈색|클리닉|다운펌|볼륨매직|매직|디저트|브런치|커피|라떼|아메리카노|세트|정식|국밥|고기|회|돈까스|파스타)/.test(kw)) continue;
+    if (/(커트|컷|펌|염색|탈색|클리닉|다운펌|볼륨매직|매직|디저트|브런치|커피|라떼|아메리카노|세트|정식|국밥|고기|회|돈까스|파스타)/.test(kw))
+      continue;
     push(kw);
   }
 
@@ -358,54 +361,50 @@ function buildRecommendedKeywordsTrafficFirst(params: {
     if (out.length >= 3) break;
     push(`${w}${categoryK}`);
   }
-    // =========================
-  // 2) 메뉴/시술 키워드 2개 (✅ 지역명 붙이지 않음 + 트래픽 우선)
-  // =========================
 
-  // 업종별 "트래픽 상위" 후보(고정 세트) — 외부 API 없이도 안정적으로 동작
+  // =========================
+  // 2) 메뉴/시술 키워드 2개 (지역명 X)
+  // =========================
   const trafficMenuPoolByCategoryK: Record<string, string[]> = {
-    "미용실": ["커트", "펌", "염색", "클리닉", "다운펌", "볼륨매직", "매직", "탈색", "두피클리닉", "레이어드컷"],
-    "카페": ["디저트", "브런치", "커피", "테이크아웃", "라떼", "아메리카노", "케이크", "베이커리"],
-    "맛집": ["점심", "저녁", "예약", "포장", "가성비", "혼밥", "데이트", "단체"]
+    미용실: ["커트", "펌", "염색", "클리닉", "다운펌", "볼륨매직", "매직", "탈색", "두피클리닉", "레이어드컷"],
+    카페: ["디저트", "브런치", "커피", "테이크아웃", "라떼", "아메리카노", "케이크", "베이커리"],
+    맛집: ["점심", "저녁", "예약", "포장", "가성비", "혼밥", "데이트", "단체"]
   };
 
-  // 경쟁사 상위 키워드에서도 “메뉴/시술형”은 보조로 사용
-  const menuRegex = /(커트|컷|펌|염색|탈색|클리닉|다운펌|볼륨매직|매직|두피|레이어드|남자|여자|복구)/;
+  const menuRegex = /(커트|컷|펌|염색|탈색|클리닉|다운펌|볼륨매직|매직|두피|레이어드|남자|여자|복구|디저트|브런치|커피|라떼|아메리카노|점심|저녁|예약|포장)/;
 
-  const menus = (params.menuTerms || [])
-    .map((s) => String(s || "").trim())
-    .filter(Boolean);
-
+  const menus = (params.menuTerms || []).map((s) => String(s || "").trim()).filter(Boolean);
   const basePool = trafficMenuPoolByCategoryK[categoryK] || ["커트", "펌", "예약", "문의"];
 
-  // 1) 우선: traffic 상위 pool에서 2개
   const menuPick: string[] = [];
+
+  // 1) 기본 pool에서 2개
   for (const t of basePool) {
     if (menuPick.length >= 2) break;
-    menuPick.push(t);
+    menuPick.push(String(t).replace(/\s+/g, ""));
   }
 
-  // 2) 보강: pool이 부족하면, serviceTokens/경쟁사 메뉴형 키워드에서 채우기
+  // 2) serviceTokens로 보강
   if (menuPick.length < 2) {
     for (const t of menus) {
       if (menuPick.length >= 2) break;
       if (/(추천|베스트|이벤트|할인|예약)/.test(t)) continue;
-      // "펌/염색" 같은 핵심만 추려서
       const core = t.replace(/\s+/g, "");
       if (!core) continue;
-      menuPick.push(core);
+      if (!menuPick.includes(core)) menuPick.push(core);
     }
   }
 
+  // 3) 경쟁사 키워드의 메뉴형에서 보강
   if (menuPick.length < 2) {
     for (const kw of competitorKeywordTop || []) {
       if (menuPick.length >= 2) break;
       if (!menuRegex.test(kw)) continue;
-      // 지역명 붙은 형태면 core만 남기기(예: 서대문역커트 -> 커트)
-      const core = kw.replace(/^[가-힣A-Za-z0-9]+?(역|동|구)?/,"").trim();
-      const cleaned = core && core.length <= 10 ? core : kw;
-      if (!cleaned) continue;
-      menuPick.push(cleaned);
+      const cleaned = String(kw).replace(/\s+/g, "");
+      // "서대문역커트" 같은 형태면 뒤쪽만 최대한 살림(과격하게 자르지 않음)
+      const maybeCore = cleaned.replace(/.*(커트|컷|펌|염색|탈색|클리닉|다운펌|볼륨매직|매직|두피클리닉|레이어드컷|디저트|브런치|커피|라떼|아메리카노|점심|저녁|예약|포장)$/, "$1");
+      const core = maybeCore && maybeCore.length <= 12 ? maybeCore : cleaned;
+      if (core && !menuPick.includes(core)) menuPick.push(core);
     }
   }
 
@@ -413,9 +412,28 @@ function buildRecommendedKeywordsTrafficFirst(params: {
     menuPick.push(menuPick.length === 0 ? "커트" : "펌");
   }
 
-  // ✅ 여기서 핵심: 메뉴/시술 2개는 "지역명 없이" 그대로 push
+  // ✅ 메뉴/시술은 지역명 없이 push
   push(menuPick[0]);
   push(menuPick[1]);
+
+  // ✅ 5개 강제
+  const recommended = out.slice(0, 5);
+  while (recommended.length < 5) recommended.push(categoryK);
+
+  return {
+    recommended: recommended.slice(0, 5),
+    debug: {
+      locality,
+      district,
+      city,
+      expansionPool,
+      brand,
+      categoryK,
+      categoryBoost,
+      competitorKeywordTopSample: (competitorKeywordTop || []).slice(0, 10),
+      menuPick
+    }
+  };
 }
 
 /**
@@ -705,10 +723,12 @@ app.post("/api/diagnose/paid", async (req, res) => {
     });
 
     console.log("[PAID] competitors:", competitors.length, "queries:", queryCandidates);
-
+    
+    const imp = (gpt as any)?.improvements || {};
     const competitorKeywordsFlat = competitors.flatMap((c: any) => (Array.isArray(c.keywords) ? c.keywords : []));
     const compTop = buildCompetitorKeywordTop(competitorKeywordsFlat, 20);
-        const traffic = buildRecommendedKeywordsTrafficFirst({
+
+    const traffic = buildRecommendedKeywordsTrafficFirst({
       categoryK: prof.categoryK,
       categoryBoost: prof.categoryBoost,
       myName: crawlResult.data.name,
@@ -754,12 +774,10 @@ app.post("/api/diagnose/paid", async (req, res) => {
         .filter(Boolean)
         .slice(0, 5);
     } else {
-      // fallback: 혹시 5개 미만이면 채우기
       while (finalRecommendedKeywords.length < 5) finalRecommendedKeywords.push(prof.categoryK);
       finalRecommendedKeywords = finalRecommendedKeywords.slice(0, 5);
     }
 
-    // ✅ (선택) 디버그 로그
     console.log("[PAID] finalRecommendedKeywords:", finalRecommendedKeywords);
 
     const menuGuidance = buildMenuGuidance({
@@ -773,30 +791,11 @@ app.post("/api/diagnose/paid", async (req, res) => {
       placeData: crawlResult.data,
       scoredNow: { totalScore: scored.totalScore, totalGrade: scored.totalGrade, scores: scored.scores },
       competitorTopKeywords: compTop.top,
-      targetScore: 90, // ✅ 여기 콤마가 TS1005 원인
-      forcedRecommendedKeywords: finalRecommendedKeywords
-    });
-
-
-    const finalRecommendedKeywords = traffic.recommended;
-
-    const menuGuidance = buildMenuGuidance({
-      menus: (crawlResult.data as any).menus,
-      mustHave: prof.menuMustHave,
-      suggestions: prof.menuSuggestions
-    });
-
-    const gpt = await generatePaidConsultingGuaranteed({
-      industry: prof.scoreIndustry,
-      placeData: crawlResult.data,
-      scoredNow: { totalScore: scored.totalScore, totalGrade: scored.totalGrade, scores: scored.scores },
-      competitorTopKeywords: compTop.top,
-      targetScore: 90
+      targetScore: 90,
       forcedRecommendedKeywords: finalRecommendedKeywords
     });
 
     const imp = (gpt as any)?.improvements || {};
-
     const descInjected = injectNaturalServiceTerms({
       text: String(imp.description || ""),
       serviceTokens: prof.serviceTokens,
