@@ -731,6 +731,7 @@ app.post("/api/diagnose/paid", async (req, res) => {
       scoredNow: { totalScore: scored.totalScore, totalGrade: scored.totalGrade, scores: scored.scores },
       competitorTopKeywords: compTop.top,
       targetScore: 90
+      forcedRecommendedKeywords: finalRecommendedKeywords
     });
 
     const imp = (gpt as any)?.improvements || {};
