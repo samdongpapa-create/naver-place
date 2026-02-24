@@ -365,61 +365,63 @@ export class CompetitorService {
     }
   }
 
-  // ✅ DOM 기반 대표키워드 추출(iframe 내부)
-  private async __extractKeywordsFromDom(frame: any): Promise<string[]> {
-    // “칩/태그”는 보통 a/button/span에 텍스트로 존재
-    const raw = await frame.evaluate(() => {
-      const texts: string[] = [];
-      const push = (t: any) => {
-        const s = String(t || "").trim();
-        if (!s) return;
-        texts.push(s);
-      };
+// ✅ DOM 기반 대표키워드 추출(iframe 내부) - Node TS(Non-DOM lib) 호환 버전
+private async __extractKeywordsFromDom(frame: any): Promise<string[]> {
+  const raw: string[] = await frame.evaluate(() => {
+    // ⚠️ 여기서는 DOM 타입을 절대 쓰지 말 것 (document/HTMLElement 타입 참조 금지)
+    const texts: string[] = [];
 
-      // 1) 링크/버튼/칩류를 넓게 수집
-      const candidates = Array.from(document.querySelectorAll("a, button, span, div"));
-      for (const el of candidates) {
-        const text = (el as HTMLElement).innerText || (el as HTMLElement).textContent || "";
-        const t = String(text).replace(/\s+/g, " ").trim();
-        if (!t) continue;
-        // 너무 긴 건 제외
-        if (t.length < 2 || t.length > 25) continue;
-        // “대표 키워드” 영역에선 보통 #은 안 붙지만, 붙는 케이스도 있어 제거
-        push(t.replace(/^#/, ""));
-      }
-      return texts;
-    });
-
-    // 필터: 한글/숫자/역/미용실 등 신호가 있는 텍스트만 우선
-    const cleaned = raw
-      .map((x: string) => this.__cleanText(x))
-      .filter(Boolean)
-      .filter((x: string) => x.length >= 2 && x.length <= 25)
-      .filter((x: string) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천|영업|휴무|길찾기|전화)/.test(x));
-
-    // 중복 제거 + “키워드 같아 보이는 것” 우선순위
-    const uniq: string[] = [];
-    const seen = new Set<string>();
-
-    const score = (s: string) => {
-      let sc = 0;
-      if (/(역|동|구|로|길)/.test(s)) sc += 2;
-      if (/(미용실|헤어|살롱|펌|염색|커트|컷|클리닉)/.test(s)) sc += 2;
-      if (/[가-힣]/.test(s)) sc += 1;
-      return sc;
+    const push = (t: unknown) => {
+      const s = String(t ?? "").replace(/\s+/g, " ").trim();
+      if (!s) return;
+      // 너무 긴 건 제외
+      if (s.length < 2 || s.length > 25) return;
+      texts.push(s.replace(/^#/, ""));
     };
 
-    cleaned
-      .sort((a: string, b: string) => score(b) - score(a))
-      .forEach((s: string) => {
-        const k = s.replace(/\s+/g, "");
-        if (seen.has(k)) return;
-        seen.add(k);
-        uniq.push(s);
-      });
+    // document를 쓰되 "타입"으로 참조하지 않도록 any로 우회
+    const doc: any = globalThis as any;
+    const d = doc.document;
+    if (!d || !d.querySelectorAll) return texts;
 
-    return uniq.slice(0, 5);
-  }
+    const nodes = Array.from(d.querySelectorAll("a, button, span, div"));
+    for (const el of nodes as any[]) {
+      const t = (el?.innerText ?? el?.textContent ?? "") as string;
+      push(t);
+    }
+
+    return texts;
+  });
+
+  // 이하 서버에서 정리 로직(기존 그대로)
+  const cleaned = raw
+    .map((x) => this.__cleanText(x))
+    .filter(Boolean)
+    .filter((x) => x.length >= 2 && x.length <= 25)
+    .filter((x) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천|영업|휴무|길찾기|전화)/.test(x));
+
+  const uniq: string[] = [];
+  const seen = new Set<string>();
+
+  const score = (s: string) => {
+    let sc = 0;
+    if (/(역|동|구|로|길)/.test(s)) sc += 2;
+    if (/(미용실|헤어|살롱|펌|염색|커트|컷|클리닉)/.test(s)) sc += 2;
+    if (/[가-힣]/.test(s)) sc += 1;
+    return sc;
+  };
+
+  cleaned
+    .sort((a, b) => score(b) - score(a))
+    .forEach((s) => {
+      const k = s.replace(/\s+/g, "");
+      if (seen.has(k)) return;
+      seen.add(k);
+      uniq.push(s);
+    });
+
+  return uniq.slice(0, 5);
+}
 
   // ==========================
   // generic helpers
