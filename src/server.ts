@@ -36,7 +36,37 @@ function clampText(s: string, max: number) {
   if (!t) return "";
   return t.length > max ? t.slice(0, max).trim() : t;
 }
+function buildScoreExplain(scores: any) {
+  const explain: any = {};
+  const obj = scores && typeof scores === "object" ? scores : {};
 
+  const classify = (s: string) => {
+    const t = String(s || "").trim();
+    if (!t) return null;
+    // ✅ 긍정/양호 신호
+    if (/양호|포함된|있습니다|보통|충분|우수|문단/.test(t)) return { type: "good", text: t };
+    // ⚠️ 개선/부족 신호
+    return { type: "bad", text: t };
+  };
+
+  for (const [k, v] of Object.entries(obj)) {
+    const score = typeof (v as any)?.score === "number" ? (v as any).score : 0;
+    const issues = Array.isArray((v as any)?.issues) ? (v as any).issues : [];
+    const good: string[] = [];
+    const bad: string[] = [];
+
+    for (const it of issues) {
+      const c = classify(String(it || ""));
+      if (!c) continue;
+      if (c.type === "good") good.push(c.text);
+      else bad.push(c.text);
+    }
+
+    explain[k] = { score, good: good.slice(0, 3), bad: bad.slice(0, 3) };
+  }
+
+  return explain;
+}
 function extractPlaceIdSafe(url: string): string {
   const m = String(url || "").match(/(\d{5,12})/);
   return m?.[1] || "";
@@ -281,6 +311,7 @@ function buildRecommendedKeywordsTrafficFirst(params: {
   myName: string;
   myAddress: string;
   competitorKeywordTop: string[];
+  menuTerms?: string[]; // ✅ 커트/펌 등 업종 대표 “메뉴/시술” 2개 뽑기용
 }): { recommended: string[]; debug: any } {
   const { categoryK, categoryBoost, myName, myAddress, competitorKeywordTop } = params;
 
@@ -288,42 +319,71 @@ function buildRecommendedKeywordsTrafficFirst(params: {
   const district = getDistrictToken(myAddress);
   const city = getCity(myAddress);
 
+  // ✅ 지역 확장 풀(하드코딩 + 주소 기반)
   const expansionPool = ["광화문", "종로", "시청", "서울역", "경복궁", "명동", "충정로", district].filter(Boolean);
 
+  // ✅ 브랜드 방어 (상호명)
   const brand = normalizeKw(myName).replace(/[^\w가-힣]/g, "");
 
   const out: string[] = [];
   const push = (k: string) => {
     const x = normalizeKw(k);
     if (!x) return;
-    if (x.length < 3) return;
+    if (x.length < 2) return;
     if (out.includes(x)) return;
     out.push(x);
   };
 
-  if (locality) push(`${locality}${categoryK}`);
-  else if (district) push(`${district}${categoryK}`);
+  // =========================
+  // 1) 지역 키워드 3개 (지역+업종)
+  // =========================
+  const regionBase = locality || district || "";
+  if (regionBase) push(`${regionBase}${categoryK}`);
   else push(`${categoryK}`);
 
+  // 경쟁사 상위 키워드 중 “지역+업종” 형태를 2개까지 보강
   for (const kw of competitorKeywordTop || []) {
     if (out.length >= 3) break;
     if (!kw.includes(categoryK)) continue;
-    if (/(커트|컷|펌|염색|탈색|클리닉|다운펌|볼륨매직|매직|PT|수업|진료|검진)/.test(kw)) continue;
+    // 메뉴/시술형은 지역 3개에서 제외
+    if (/(커트|컷|펌|염색|탈색|클리닉|다운펌|볼륨매직|매직|디저트|브런치|커피|라떼|아메리카노|세트|정식|국밥|고기|회|돈까스|파스타)/.test(kw)) continue;
     push(kw);
   }
 
+  // 생활권 확장으로 3개 채우기
   for (const w of expansionPool) {
     if (out.length >= 3) break;
-    if (!w) continue;
     push(`${w}${categoryK}`);
   }
 
-  if (out.length < 4) push(categoryBoost?.[0] || categoryK);
-  if (out.length < 5 && brand) push(brand);
+  // =========================
+  // 2) 메뉴/시술 키워드 2개 (지역+메뉴)
+  // =========================
+  const menuBase = locality || district || "";
+  const menus = (params.menuTerms || []).map((s) => String(s || "").trim()).filter(Boolean);
 
-  if (out.length < 5 && district) push(`${district}${categoryK}`);
-  if (out.length < 5 && city && district) push(`${city}${district}${categoryK}`);
-  if (out.length < 5 && (categoryBoost?.[1] || "")) push(categoryBoost[1]);
+  const menuPick: string[] = [];
+  for (const t of menus) {
+    if (menuPick.length >= 2) break;
+    if (/(추천|베스트|이벤트|할인|예약)/.test(t)) continue;
+    menuPick.push(t);
+  }
+  while (menuPick.length < 2) {
+    // 업종 공통 fallback
+    menuPick.push(menuPick.length === 0 ? "커트" : "펌");
+  }
+
+  if (menuBase) {
+    push(`${menuBase}${menuPick[0]}`);
+    push(`${menuBase}${menuPick[1]}`);
+  } else {
+    push(menuPick[0]);
+    push(menuPick[1]);
+  }
+
+  // 안전장치: 5개 못 채우면 브랜드/부스트로 보강
+  if (out.length < 5 && brand) push(brand);
+  if (out.length < 5 && (categoryBoost?.[0] || "")) push(categoryBoost[0]);
   while (out.length < 5) push(categoryK);
 
   return {
@@ -336,6 +396,7 @@ function buildRecommendedKeywordsTrafficFirst(params: {
       brand,
       categoryK,
       categoryBoost,
+      menuTerms: menus.slice(0, 8),
       competitorKeywordTopSample: (competitorKeywordTop || []).slice(0, 10)
     }
   };
@@ -601,12 +662,13 @@ const competitors = await getCompetitorsSafe({
     const compTop = buildCompetitorKeywordTop(competitorKeywordsFlat, 20);
 
     const traffic = buildRecommendedKeywordsTrafficFirst({
-      categoryK: prof.categoryK,
-      categoryBoost: prof.categoryBoost,
-      myName: crawlResult.data.name,
-      myAddress: crawlResult.data.address,
-      competitorKeywordTop: compTop.top
-    });
+  categoryK: prof.categoryK,
+  categoryBoost: prof.categoryBoost,
+  myName: crawlResult.data.name,
+  myAddress: crawlResult.data.address,
+  competitorKeywordTop: compTop.top,
+  menuTerms: prof.serviceTokens
+});
 
     const finalRecommendedKeywords = traffic.recommended;
 
@@ -689,6 +751,15 @@ const competitors = await getCompetitorsSafe({
         improvements: imp,
         recommendedKeywords: finalRecommendedKeywords,
 
+        // ✅ UI 단순 버전 (상호명 : 키워드)
+competitorsSimple: competitors.map((c: any, idx: number) => ({
+  rank: idx + 1,
+  name: c?.name || `경쟁사 ${idx + 1}`,
+  keywords: Array.isArray(c?.keywords) ? c.keywords.slice(0, 5) : []
+})),
+
+// ✅ 경쟁사 키워드 기반 추가 추천 5개 (대표키워드 5개와 별개로 참고용)
+additionalRecommendedKeywords: compTop.top.filter((k) => !finalRecommendedKeywords.includes(k)).slice(0, 5),
         competitors,
         competitorKeywordsDebug,
 
