@@ -787,3 +787,12 @@ body {
   width: 100%;
   box-sizing: border-box;
 }
+
+/* --- added: score explain + simple competitor list --- */
+.mini-list { margin: 6px 0 0 18px; padding: 0; }
+.mini-list li { margin: 2px 0; }
+.score-explain { display: flex; gap: 12px; margin-top: 8px; }
+.score-explain .label { font-weight: 700; font-size: 12px; opacity: .8; margin-bottom: 2px; }
+.score-explain .good, .score-explain .bad { flex: 1; padding: 8px; border-radius: 10px; background: rgba(0,0,0,.03); }
+.simple-list { margin: 8px 0 0 18px; }
+.simple-list li { margin: 6px 0; }
