@@ -38,14 +38,13 @@ export type GuaranteedConsultingResult = {
   attempts: number;
 };
 
-export async function generatePaidConsultingByGPT(args: {
+export async function generatePaidConsultingGuaranteed(args: {
   industry: Industry;
   placeData: PlaceData;
   scoredNow: { totalScore: number; totalGrade: string; scores: any };
   competitorTopKeywords?: string[];
   targetScore?: number;
-  // ✅ NEW: 서버에서 확정한 추천 대표키워드(5개) 강제 주입
-  forcedRecommendedKeywords?: string[];
+  forcedRecommendedKeywords?: string[]; // ✅ 추가
 }): Promise<GuaranteedConsultingResult> {
   return generatePaidConsultingGuaranteed(args);
 }
