@@ -44,6 +44,8 @@ export async function generatePaidConsultingByGPT(args: {
   scoredNow: { totalScore: number; totalGrade: string; scores: any };
   competitorTopKeywords?: string[];
   targetScore?: number;
+  // ✅ NEW: 서버에서 확정한 추천 대표키워드(5개) 강제 주입
+  forcedRecommendedKeywords?: string[];
 }): Promise<GuaranteedConsultingResult> {
   return generatePaidConsultingGuaranteed(args);
 }
@@ -113,7 +115,6 @@ function serviceTokens(industry: Industry): string[] {
 function makeBrandKeyword(placeName: string): string {
   const name = (placeName || "").trim();
   if (!name) return "";
-  // 괄호/지점/특수문자 제거 + 공백 제거
   const cleaned = name
     .replace(/\([^)]*\)/g, "")
     .replace(/(서대문역점|교대역점|본점|지점|점)$/g, "")
@@ -121,7 +122,6 @@ function makeBrandKeyword(placeName: string): string {
     .replace(/\s+/g, "")
     .trim();
 
-  // 너무 길면 앞부분만 (브랜드 방어는 6~12자 정도가 보통 안정)
   if (cleaned.length > 14) return cleaned.slice(0, 14);
   return cleaned;
 }
@@ -179,14 +179,8 @@ function buildConstraints(industry: Industry) {
 }
 
 /**
- * ✅ 너가 원한 대표키워드 전략 “강제”
- * 1) 메인지역+업종 (트래픽)
- * 2) 확장지역(광화문)+업종 (확장)
- * 3) 생활권(종로)+업종 (생활권 확장)
- * 4) 카테고리 강화 (헤어살롱/카페/맛집 등)
- * 5) 브랜드 방어 (상호명)
- *
- * ⚠️ 지역 중복/이상 조합(서대문역+광화문미용실) 절대 금지
+ * ✅ 기본 대표키워드 전략(기존 유지)
+ * - 다만 서버에서 forcedRecommendedKeywords(=확정값)를 주면 그걸 100% 사용
  */
 function buildKeywordStrategy5(args: {
   industry: Industry;
@@ -198,21 +192,16 @@ function buildKeywordStrategy5(args: {
   const indK = industryKorean(args.industry);
   const station = args.station && args.station !== "근처" ? args.station : "";
 
-  // 확장/생활권 후보: nearby에서 지역성 있는 것만 골라 사용
   const areaCandidates = uniq((args.nearby || []).filter(Boolean))
     .map((x) => x.replace(/\s+/g, "").trim())
     .filter((x) => x.length >= 2 && x.length <= 10)
-    // "역세권/주차" 같은 건 지역이 아니라서 제외(미용실 기준)
     .filter((x) => !/(역세권|주차|회식|데이트|가족모임|작업|조용한|테이크아웃)/.test(x));
 
-  // 미용실이면 광화문/종로 우선 (없으면 후보에서)
   const secondary = areaCandidates.find((x) => x === "광화문") || areaCandidates[0] || "";
   const tertiary = areaCandidates.find((x) => x === "종로") || areaCandidates.find((x) => x !== secondary) || "";
 
   const brand = makeBrandKeyword(args.placeName);
-
-  const category =
-    args.industry === "hairshop" ? "헤어살롱" : args.industry === "cafe" ? "카페" : "맛집";
+  const category = args.industry === "hairshop" ? "헤어살롱" : args.industry === "cafe" ? "카페" : "맛집";
 
   const out: string[] = [];
   const push = (k: string) => {
@@ -222,23 +211,14 @@ function buildKeywordStrategy5(args: {
     out.push(t);
   };
 
-  // 1) 메인지역+업종
   if (station) push(`${station}${indK}`);
   else push(`${extractRegionHint(args.address)}${indK}`);
 
-  // 2) 확장지역+업종 (광화문미용실)
   if (secondary) push(`${secondary}${indK}`);
-
-  // 3) 생활권+업종 (종로미용실)
   if (tertiary) push(`${tertiary}${indK}`);
 
-  // 4) 카테고리 강화
   push(category);
-
-  // 5) 브랜드 방어
   if (brand) push(brand);
-
-  // 부족하면 업종 키워드로 채움
   while (out.length < 5) push(indK);
 
   return out.slice(0, 5);
@@ -247,10 +227,8 @@ function buildKeywordStrategy5(args: {
 function buildReviewBundle(industry: Industry, placeName: string, station: string, landmarks: string[]) {
   const indK = industryKorean(industry);
   const lm = landmarks?.[0] ? landmarks[0] : station;
-
   const svc = serviceTokens(industry);
 
-  // ✅ 리뷰요청 문구에 서비스 키워드 자연 포함(염색 만족 등)
   const short = [`${placeName} 방문 후`, "후기 한 줄만 남겨주시면 큰 힘이 됩니다 🙏", "사진 1장도 함께 부탁드려요!"].join(" ");
   const friendly = [
     `${placeName} (${lm} 근처 ${indK}) 이용하셨다면`,
@@ -322,10 +300,30 @@ function buildUnifiedText(name: string, out: UnifiedPaidImprovements, predictedS
   return lines.join("\n");
 }
 
+/**
+ * ✅ 대표키워드 5개가 본문(상세설명/오시는길)에 반드시 포함되도록
+ * - GPT가 빼먹어도 최종 단계에서 누락 키워드를 1문장으로 자연 삽입
+ */
+function forceIncludeKeywords(text: string, keywords: string[], maxLen: number, label: "description" | "directions") {
+  const base = (text || "").trim();
+  if (!base) return base;
+
+  const ks = (keywords || []).map((k) => (k || "").trim()).filter(Boolean).slice(0, 5);
+  const missing = ks.filter((k) => !base.replace(/\s+/g, "").includes(k.replace(/\s+/g, "")));
+
+  if (!missing.length) return clampText(base, maxLen);
+
+  const tail =
+    label === "description"
+      ? ` (${missing.join(", ")} 관련 문의/예약도 가능합니다.)`
+      : ` (${missing.join(", ")} 검색으로도 찾기 쉽습니다.)`;
+
+  return clampText(`${base}${tail}`, maxLen);
+}
+
 async function callGptJSON(prompt: string): Promise<any> {
   const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
-  // response_format 지원되면 JSON 강제
   try {
     const res = await client.chat.completions.create({
       model,
@@ -370,6 +368,8 @@ export async function generatePaidConsultingGuaranteed(args: {
   scoredNow: { totalScore: number; totalGrade: string; scores: any };
   competitorTopKeywords?: string[];
   targetScore?: number;
+  // ✅ NEW
+  forcedRecommendedKeywords?: string[];
 }): Promise<GuaranteedConsultingResult> {
   const industry = normalizeIndustry(args.industry);
   const constraints = buildConstraints(industry);
@@ -378,14 +378,22 @@ export async function generatePaidConsultingGuaranteed(args: {
   const station = inferStation(args.placeData.name, args.placeData.address);
   const nearby = buildNearbyLandmarks(industry, args.placeData.address, args.placeData.name);
 
-  // ✅ 대표키워드 5개는 “전략대로 강제”
-  const strategy5 = buildKeywordStrategy5({
-    industry,
-    placeName: args.placeData.name,
-    address: args.placeData.address,
-    station,
-    nearby
-  });
+  // ✅ 1) 서버가 “확정 대표키워드 5개”를 주면 그걸 100% 사용
+  const forced5 = Array.isArray(args.forcedRecommendedKeywords)
+    ? uniq(args.forcedRecommendedKeywords).slice(0, 5)
+    : [];
+
+  // ✅ 2) 없으면 기존 전략으로 생성
+  const strategy5 =
+    forced5.length === 5
+      ? forced5
+      : buildKeywordStrategy5({
+          industry,
+          placeName: args.placeData.name,
+          address: args.placeData.address,
+          station,
+          nearby
+        });
 
   const reviewBundle = buildReviewBundle(industry, args.placeData.name, station, nearby);
 
@@ -404,8 +412,8 @@ export async function generatePaidConsultingGuaranteed(args: {
 너는 네이버 플레이스 상위노출(검색 유입) + 전환(예약/문의)을 동시에 올리는 컨설팅 전문가다.
 
 [대표키워드 정책(매우 중요)]
-- 대표키워드는 5개 "고정 전략"이다. (검색량 높은 키워드 중심)
-- 아래 5개를 그대로 사용하라. 절대 다른 조합(서대문역+광화문미용실 등)을 만들지 말 것.
+- 대표키워드는 아래 5개를 그대로 사용한다. 다른 조합을 만들지 말 것.
+- 아래 5개는 (1)상세설명, (2)오시는길에 각각 최소 1회 이상 '자연스럽게' 포함한다. (나열 금지)
 - 대표키워드 5개:
 ${strategy5.map((k) => `- ${k}`).join("\n")}
 
@@ -473,6 +481,10 @@ ${feedback ? feedback : "(없음)"}
       } 상담이 더 정확합니다.`;
     }
 
+    // ✅ (핵심) 대표키워드 5개 본문 강제 포함(누락 시 후처리 삽입)
+    description = forceIncludeKeywords(description, strategy5, constraints.descriptionMax, "description");
+    directions = forceIncludeKeywords(directions, strategy5, constraints.directionsMax, "directions");
+
     description = clampText(description, constraints.descriptionMax);
     directions = clampText(directions, constraints.directionsMax);
 
@@ -488,7 +500,7 @@ ${feedback ? feedback : "(없음)"}
       address: args.placeData.address,
       description,
       directions,
-      keywords: strategy5, // ✅ 대표키워드 5개는 전략 고정
+      keywords: strategy5,
       reviewCount: args.placeData.reviewCount,
       recentReviewCount30d: (args.placeData as any).recentReviewCount30d,
       photoCount: args.placeData.photoCount,
@@ -526,7 +538,7 @@ ${feedback ? feedback : "(없음)"}
     if (sim.totalScore >= target) {
       return {
         improvements,
-        recommendedKeywords: strategy5, // ✅ recommendedKeywords도 100% 동일
+        recommendedKeywords: strategy5,
         unifiedText,
         predicted: bestSim,
         attempts: attempt
@@ -538,8 +550,14 @@ ${feedback ? feedback : "(없음)"}
 
   // 3회 실패해도 반환
   const imp = lastRaw?.improvements || {};
-  const description = clampText(safeStr(imp.description) || "", constraints.descriptionMax) || `${args.placeData.name}은(는) ${regionHint}에 위치한 ${industryKorean(industry)}입니다. ${nearby.slice(0, 2).join(", ")} 생활권에서 방문이 편하고, 예약 후 상담을 통해 ${svc.slice(0, 3).join(", ")} 등을 안내합니다.`;
-  const directions = clampText(safeStr(imp.directions) || "", constraints.directionsMax) || `${regionHint} ${args.placeData.address}에 위치해 있습니다. ${station !== "근처" ? `${station} 기준` : "주변"}으로 도보 이동이 가능하며, 건물 입구/층수는 지도와 사진을 함께 확인하시면 더 빠릅니다.`;
+  let description = clampText(safeStr(imp.description) || "", constraints.descriptionMax) ||
+    `${args.placeData.name}은(는) ${regionHint}에 위치한 ${industryKorean(industry)}입니다. ${nearby.slice(0, 2).join(", ")} 생활권에서 방문이 편하고, 예약 후 상담을 통해 ${svc.slice(0, 3).join(", ")} 등을 안내합니다.`;
+  let directions = clampText(safeStr(imp.directions) || "", constraints.directionsMax) ||
+    `${regionHint} ${args.placeData.address}에 위치해 있습니다. ${station !== "근처" ? `${station} 기준` : "주변"}으로 도보 이동이 가능하며, 건물 입구/층수는 지도와 사진을 함께 확인하시면 더 빠릅니다.`;
+
+  // ✅ 최종 방어: 누락 키워드 있으면 강제 삽입
+  description = forceIncludeKeywords(description, strategy5, constraints.descriptionMax, "description");
+  directions = forceIncludeKeywords(directions, strategy5, constraints.directionsMax, "directions");
 
   const competitorKeywordInsights =
     safeStr((imp as any).competitorKeywordInsights) ||
