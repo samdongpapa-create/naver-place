@@ -204,7 +204,9 @@ public async findTopCompetitorsByKeyword(
     if (out.length >= limit) break;
   }
 
-  return out;
+    // ✅ 키워드가 카드에 없을 수 있어, m.place 홈으로 한 번 더 보강(Playwright 없이 fetch)
+  const enriched = await this.__enrichFromPlaceHome(out, timeoutMs);
+  return enriched;
 }
 
 /** ============ 아래는 위 메서드 전용 private 유틸들 (클래스 내부에 함께 추가) ============ */
@@ -309,7 +311,69 @@ private __parseStringArrayLoose(inner: string): string[] {
   }
   return Array.from(new Set(out));
 }
+  // ✅ m.place 홈 HTML에서 대표키워드 보강 (search_html 카드에 keywordList가 없을 때 대비)
+  private async __enrichFromPlaceHome(
+    competitors: Array<{ placeId: string; name: string; keywords: string[]; source: "search_html"; rank: number }>,
+    timeoutMs: number
+  ) {
+    const out = [...competitors];
 
+    // 간단한 순차 fetch (TOP5만) — 네이버 차단/부하 리스크 낮춤
+    for (let i = 0; i < out.length; i++) {
+      const c = out[i];
+      const needKw = !Array.isArray(c.keywords) || c.keywords.length === 0;
+      const needName = !c.name || c.name.startsWith("경쟁") || c.name.length < 2;
+      if (!needKw && !needName) continue;
+
+      try {
+        const url = `https://m.place.naver.com/place/${c.placeId}/home`;
+        const html = await this.__fetchHtml(url, Math.max(1500, Math.min(12000, timeoutMs)));
+
+        const kw = needKw ? this.__extractKeywordListFromPlaceHome(html) : c.keywords;
+        const nm = needName ? (this.__extractNameFromPlaceHome(html) || c.name) : c.name;
+
+        out[i] = {
+          ...c,
+          name: this.__cleanText(nm),
+          keywords: (kw || []).map((k) => this.__cleanText(k)).filter(Boolean).slice(0, 5)
+        };
+      } catch {
+        // ignore (기본 값 유지)
+      }
+    }
+
+    return out;
+  }
+
+  private __extractKeywordListFromPlaceHome(html: string): string[] {
+    // 1) __NEXT_DATA__ 내 keywordList
+    const m1 = html.match(/"keywordList"\s*:\s*\[([\s\S]{1,3000}?)\]/);
+    if (m1?.[1]) {
+      const arr = this.__parseStringArrayLoose(m1[1]);
+      if (arr.length) return arr;
+    }
+
+    // 2) fallback: #해시태그 형태
+    const tags = [...html.matchAll(/#([가-힣A-Za-z0-9]{2,25})/g)].map((m) => m[1]);
+    if (tags.length) return Array.from(new Set(tags));
+
+    return [];
+  }
+
+  private __extractNameFromPlaceHome(html: string): string {
+    // og:title
+    const m1 = html.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
+    if (m1?.[1]) return m1[1];
+
+    // JSON 내부 name/title
+    const m2 = html.match(/"name"\s*:\s*"([^"]{2,80})"/);
+    if (m2?.[1]) return m2[1];
+
+    const m3 = html.match(/"title"\s*:\s*"([^"]{2,80})"/);
+    if (m3?.[1]) return m3[1];
+
+    return "";
+  }
 private __cleanText(s: string) {
   return String(s || "")
     .replace(/\\u003c/g, "<")
