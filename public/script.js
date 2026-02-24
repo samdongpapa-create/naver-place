@@ -168,11 +168,18 @@ function gradeBadgeClass(grade) {
   return "grade-d";
 }
 
-function renderCategoryScores(scoresObj) {
+function renderCategoryScores(scoresObj, explainObj) {
   const scores = scoresObj && typeof scoresObj === "object" ? scoresObj : {};
+  const explain = explainObj && typeof explainObj === "object" ? explainObj : {};
   const entries = Object.entries(scores);
 
   if (!entries.length) return "";
+
+  const renderList = (items) => {
+    const arr = asArray(items);
+    if (!arr.length) return "";
+    return `<ul class="mini-list">${arr.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>`;
+  };
 
   return entries
     .map(([key, val]) => {
@@ -186,6 +193,10 @@ function renderCategoryScores(scoresObj) {
         comment = String(val.message ?? val.comment ?? "");
       }
 
+      const ex = explain[key] || null;
+      const good = ex?.good || [];
+      const bad = ex?.bad || [];
+
       return `
         <div class="category-card">
           <div class="category-top">
@@ -193,6 +204,16 @@ function renderCategoryScores(scoresObj) {
             <div class="category-score">${escapeHtml(score)}</div>
           </div>
           ${comment ? `<div class="category-comment">${escapeHtml(comment)}</div>` : ""}
+          ${
+            ex
+              ? `
+            <div class="score-explain">
+              ${good.length ? `<div class="good"><div class="label">잘하고 있음</div>${renderList(good.slice(0,3))}</div>` : ""}
+              ${bad.length ? `<div class="bad"><div class="label">부족한 점</div>${renderList(bad.slice(0,3))}</div>` : ""}
+            </div>
+          `
+              : ""
+          }
         </div>
       `;
     })
@@ -239,7 +260,7 @@ function fillCommonReport(n) {
   const badge = $("totalGradeBadge");
   if (badge) badge.className = "grade-badge " + gradeBadgeClass(n.scoring.totalGrade);
 
-  setHtml("categoryScores", renderCategoryScores(n.scoring.scores));
+  setHtml("categoryScores", renderCategoryScores(n.scoring.scores, n.scoring.scoreExplain));
 
   setHtml("debugLogs", renderDebugLogs(n.logs));
   setDisplay("debugSection", true);
@@ -300,39 +321,54 @@ function renderPaidBlocks(paid) {
   return blocks.join("\n");
 }
 
-function renderCompetitors(competitors) {
-  const list = Array.isArray(competitors) ? competitors : [];
+function renderCompetitors(paid) {
+  const list = Array.isArray(paid?.competitorsSimple) ? paid.competitorsSimple : (Array.isArray(paid?.competitors) ? paid.competitors : []);
+  const add5 = asArray(paid?.additionalRecommendedKeywords || []).slice(0, 5);
+
+  const blocks = [];
+
+  // 경쟁사
   if (!list.length) {
-    return `
+    blocks.push(`
       <div class="upgrade-card" style="margin-top:12px;">
         <div class="upgrade-header">
-          <h3>🏁 경쟁사 Top 5</h3>
-          <p>경쟁사 데이터를 가져오지 못했습니다. (검색어가 가장 큰 원인입니다)</p>
+          <h3>🏁 경쟁업체 TOP5</h3>
+          <p>경쟁사 데이터를 가져오지 못했습니다. (검색어/노출 구조 영향)</p>
         </div>
       </div>
-    `;
+    `);
+  } else {
+    const rows = list.slice(0, 5).map((c, idx) => {
+      const name = c?.name ? String(c.name) : `경쟁사 ${idx + 1}`;
+      const kws = asArray(c?.keywords || []).slice(0, 5).join(", ");
+      return `<li><b>${escapeHtml(name)}</b> : ${escapeHtml(kws || "(키워드 없음)")}</li>`;
+    }).join("");
+
+    blocks.push(`
+      <div class="upgrade-card" style="margin-top:12px;">
+        <div class="upgrade-header">
+          <h3>🏁 경쟁업체 TOP5 (심플)</h3>
+          <p>“상호명 : 대표키워드” 형식</p>
+        </div>
+        <ul class="simple-list">${rows}</ul>
+      </div>
+    `);
   }
 
-  return list.slice(0, 5)
-    .map((c, idx) => {
-      const name = c?.name ? String(c.name) : `경쟁사 ${idx + 1}`;
-      const address = c?.address ? String(c.address) : "";
-      const reviewCount = toNumber(c?.reviewCount, 0);
-      const photoCount = toNumber(c?.photoCount, 0);
-      const kws = asArray(c?.keywords || []).slice(0, 5);
-
-      return `
-        <div class="upgrade-card" style="margin-top:12px;">
-          <div class="upgrade-header">
-            <h3>${escapeHtml(`경쟁사 ${idx + 1}: ${name}`)}</h3>
-            <p>${escapeHtml(address)}</p>
-          </div>
-          <div style="opacity:.85; margin-top:6px;">리뷰 ${escapeHtml(reviewCount)} · 사진 ${escapeHtml(photoCount)}</div>
-          ${renderKeywordChips(kws)}
+  // 추가 추천 키워드 5개
+  if (add5.length) {
+    blocks.push(`
+      <div class="upgrade-card" style="margin-top:12px;">
+        <div class="upgrade-header">
+          <h3>➕ 경쟁사 기반 추가 추천 키워드 (5개)</h3>
+          <p>대표키워드 5개와 별개로, 블로그/리뷰/본문에 자연스럽게 활용</p>
         </div>
-      `;
-    })
-    .join("\n");
+        ${renderKeywordChips(add5)}
+      </div>
+    `);
+  }
+
+  return blocks.join("\n");
 }
 
 async function diagnose(mode) {
