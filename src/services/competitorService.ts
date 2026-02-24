@@ -1,5 +1,5 @@
 // src/services/competitorService.ts
-import { chromium, type Browser, type Page } from "playwright";
+import { chromium, type Browser } from "playwright";
 
 type FindTopIdsOptions = {
   excludePlaceId?: string;
@@ -10,7 +10,7 @@ type Competitor = {
   placeId: string;
   name: string;
   keywords: string[];
-  source: "map_rank" | "search_html" | "place_home";
+  source: "map_rank" | "place_home";
   rank: number;
 };
 
@@ -23,6 +23,9 @@ type FindTopCompetitorsOpts = {
 export class CompetitorService {
   private browser: Browser | null = null;
 
+  // ==========================
+  // Browser lifecycle
+  // ==========================
   private async getBrowser() {
     if (this.browser) return this.browser;
     this.browser = await chromium.launch({
@@ -41,8 +44,7 @@ export class CompetitorService {
 
   // ==========================
   // ✅ 1) 지도(=실제 노출) TOP placeId 추출
-  // - 응답 URL 필터링 + (JSON 파싱 시도) + (텍스트 regex)
-  // - "엉뚱한 placeId 섞임" 줄이기
+  // - 응답(JSON/텍스트) 스니핑 + HTML 보조
   // ==========================
   async findTopPlaceIdsFromMapRank(keyword: string, opts: FindTopIdsOptions = {}) {
     const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
@@ -62,6 +64,7 @@ export class CompetitorService {
 
     const page = await context.newPage();
 
+    // 리소스 절약: 문서/스크립트/xhr/fetch만
     await page.route("**/*", (route) => {
       const req = route.request();
       const rtype = req.resourceType();
@@ -69,81 +72,29 @@ export class CompetitorService {
       return route.abort();
     });
 
-    const timeoutMs = Number(process.env.MAP_GOTO_TIMEOUT_MS || 25000);
-    page.setDefaultTimeout(timeoutMs);
+    const gotoTimeoutMs = Number(process.env.MAP_GOTO_TIMEOUT_MS || 25000);
+    page.setDefaultTimeout(gotoTimeoutMs);
 
-    // ✅ map 응답 버퍼(텍스트) + placeId 버퍼(확정)
-    const textBuf: string[] = [];
-    const foundIds: string[] = [];
-    const foundSet = new Set<string>();
-
+    // ✅ 응답 스니핑 버퍼
+    const buf: string[] = [];
     const onResponse = async (res: any) => {
       try {
         const req = res.request();
         const rt = req.resourceType();
         if (rt !== "xhr" && rt !== "fetch") return;
 
-        const resUrl = String(res.url?.() || "");
-        // ✅ 지도 검색 관련 응답만 최대한
-        const looksLikeMapSearch =
-          /m\.map\.naver\.com/i.test(resUrl) &&
-          /(search2\/|search\/|api\/|graphql|query=|placeId)/i.test(resUrl);
-
-        if (!looksLikeMapSearch) return;
-
         const ct = (await res.headerValue("content-type")) || "";
-        if (!/json|javascript/i.test(ct)) return;
+        // 지도는 json 뿐 아니라 text/javascript 로 내려오는 경우도 있음
+        if (!/json|javascript|text/i.test(ct)) return;
 
         const text = await res.text().catch(() => "");
-        if (!text || text.length < 20) return;
-        if (!/placeId|\/place\/\d{5,12}|"id"\s*:\s*"\d{5,12}"/.test(text)) return;
+        if (!text) return;
 
-        textBuf.push(text);
-        if (textBuf.length > 30) textBuf.shift();
+        // placeId or /place/123
+        if (!/placeId|\/place\/\d{5,12}/.test(text)) return;
 
-        // ✅ 1) JSON 파싱이 되면 placeId/id를 딥서치해서 즉시 축적
-        let j: any = null;
-        try {
-          j = JSON.parse(text);
-        } catch {
-          j = null;
-        }
-
-        if (j) {
-          // placeId/id를 찾는 딥서치
-          const hits = this.__deepCollect(
-            j,
-            (x) =>
-              x &&
-              typeof x === "object" &&
-              (typeof (x as any).placeId === "string" ||
-                typeof (x as any).placeId === "number" ||
-                typeof (x as any).id === "string" ||
-                typeof (x as any).id === "number"),
-            []
-          );
-
-          for (const h of hits) {
-            const cand = String((h as any).placeId || (h as any).id || "").trim();
-            if (!/^\d{5,12}$/.test(cand)) continue;
-            if (foundSet.has(cand)) continue;
-            foundSet.add(cand);
-            foundIds.push(cand);
-            if (foundIds.length >= 20) break;
-          }
-        }
-
-        // ✅ 2) JSON 파싱이 안돼도 텍스트 regex로 보조(등장 순 유지)
-        if (foundIds.length < 10) {
-          const ids = this.__extractPlaceIdsFromAnyTextInOrder(text);
-          for (const id of ids) {
-            if (!id) continue;
-            if (foundSet.has(id)) continue;
-            foundSet.add(id);
-            foundIds.push(id);
-            if (foundIds.length >= 20) break;
-          }
-        }
+        buf.push(text);
+        if (buf.length > 40) buf.shift();
       } catch {}
     };
 
@@ -152,17 +103,13 @@ export class CompetitorService {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded" });
 
-      // 지도 검색 로딩 여유
-      await page.waitForTimeout(1200);
+      // 지도 검색 로딩 대기
+      await page.waitForTimeout(1100);
 
-      // ✅ 최종 후보 ids: foundIds 우선, 부족하면 버퍼 텍스트에서 추출
-      let ids = [...foundIds];
+      const mergedText = buf.join("\n");
+      let ids = this.__extractPlaceIdsFromAnyTextInOrder(mergedText);
 
-      if (ids.length < 5) {
-        const mergedText = textBuf.join("\n");
-        ids = this.__mergeInOrder(ids, this.__extractPlaceIdsFromAnyTextInOrder(mergedText));
-      }
-
+      // 부족하면 html 보조
       if (ids.length < 5) {
         const html = await page.content().catch(() => "");
         ids = this.__mergeInOrder(ids, this.__extractPlaceIdsFromAnyTextInOrder(html));
@@ -170,7 +117,6 @@ export class CompetitorService {
 
       const out: string[] = [];
       const seen = new Set<string>();
-
       for (const id of ids) {
         if (!id) continue;
         if (exclude && id === exclude) continue;
@@ -181,6 +127,8 @@ export class CompetitorService {
       }
 
       return out;
+    } catch {
+      return [];
     } finally {
       try {
         page.off("response", onResponse);
@@ -195,7 +143,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 2) 메인: “지도팩 TOP5” 기반 경쟁사 추출 + 대표키워드 크롤링
+  // ✅ 2) 메인: “지도 TOP5” 기반 경쟁사 추출 + 대표키워드 크롤링
   // ==========================
   public async findTopCompetitorsByKeyword(keyword: string, opts: FindTopCompetitorsOpts = {}): Promise<Competitor[]> {
     const q = String(keyword || "").trim();
@@ -205,46 +153,45 @@ export class CompetitorService {
     const exclude = String(opts.excludePlaceId || "").trim();
 
     const totalTimeoutMs = Math.max(
-      5000,
-      Math.min(30000, opts.timeoutMs ?? Number(process.env.COMPETITOR_TIMEOUT_MS || 12000))
+      7000,
+      Math.min(45000, opts.timeoutMs ?? Number(process.env.COMPETITOR_TIMEOUT_MS || 12000))
     );
+    const deadline = Date.now() + totalTimeoutMs - 250;
 
-    const deadline = Date.now() + totalTimeoutMs - 300;
-
-    // ✅ TOP5는 무조건 지도에서
+    // ✅ TOP5는 “지도”에서만
     const mapIds = await this.findTopPlaceIdsFromMapRank(q, { excludePlaceId: exclude, limit }).catch(() => []);
-    const candidateIds = mapIds.length ? mapIds : [];
 
-    if (!candidateIds.length) return [];
+    if (!mapIds.length) return [];
 
     // ✅ enrich 병렬 제한
     const enrichConcurrency = Math.max(1, Math.min(4, Number(process.env.COMPETITOR_ENRICH_CONCURRENCY || 2)));
     const runLimited = this.__createLimiter(enrichConcurrency);
 
-    // ✅ TOP5만 enrich
-    const enrichPromises = candidateIds.map((pid) =>
-      runLimited(() => this.__fetchPlaceHomeAndExtract(pid, Math.min(12000, Math.max(6000, deadline - Date.now()))))
-        .catch(() => ({ name: "", keywords: [] }))
+    // ✅ 병렬로 돌리되, 전체 예산 내에서 끊기게
+    const tasks = mapIds.slice(0, limit).map((pid) =>
+      runLimited(async () => {
+        const remaining = Math.max(2500, Math.min(15000, deadline - Date.now()));
+        return await this.__fetchPlaceHomeAndExtract(pid, remaining);
+      }).catch(() => ({ name: "", keywords: [] }))
     );
 
-    const out: Competitor[] = [];
-
-    for (let i = 0; i < candidateIds.length && out.length < limit; i++) {
+    const results: Array<{ placeId: string; name: string; keywords: string[] }> = [];
+    for (let i = 0; i < tasks.length; i++) {
       if (Date.now() > deadline) break;
-
-      const pid = candidateIds[i];
       const remaining = Math.max(1, deadline - Date.now());
-      const enriched = await this.__withTimeout(enrichPromises[i], remaining).catch(() => ({ name: "", keywords: [] }));
+      const r = await this.__withTimeout(tasks[i], remaining).catch(() => ({ name: "", keywords: [] }));
+      results.push({ placeId: mapIds[i], name: r?.name || "", keywords: Array.isArray(r?.keywords) ? r.keywords : [] });
+    }
+
+    const out: Competitor[] = [];
+    for (let i = 0; i < results.length && out.length < limit; i++) {
+      const pid = mapIds[i];
+      const r = results[i];
 
       out.push({
         placeId: pid,
-        name: this.__cleanText(enriched?.name || ""),
-        keywords: (enriched?.keywords || [])
-          .map((k) => this.__cleanText(k))
-          .filter(Boolean)
-          .filter((k) => k.length >= 2 && k.length <= 25)
-          .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
-          .slice(0, 5),
+        name: this.__cleanText(r?.name || "") || "",
+        keywords: this.__cleanKeywords(r?.keywords || []).slice(0, 5),
         source: "place_home",
         rank: out.length + 1
       });
@@ -254,7 +201,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ place home: 업종 경로 후보 → iframe + 데이터 + DOM fallback
+  // ✅ place home: 업종 경로 후보 → iframe + (네트워크 스니핑) + DOM fallback
   // ==========================
   private async __fetchPlaceHomeAndExtract(placeId: string, timeoutMs: number): Promise<{ name: string; keywords: string[] }> {
     const pid = String(placeId).trim();
@@ -267,12 +214,20 @@ export class CompetitorService {
       `https://m.place.naver.com/place/${pid}/home`
     ];
 
+    // 각 후보는 너무 오래 끌지 않게 분할 예산
+    const perTry = Math.max(2500, Math.min(12000, Math.floor(timeoutMs / Math.max(1, candidates.length)) + 1500));
+
+    let best: { name: string; keywords: string[] } = { name: "", keywords: [] };
+
     for (const url of candidates) {
-      const r = await this.__renderAndExtractFromPlaceHome(url, Math.max(2500, Math.min(15000, timeoutMs)));
+      const r = await this.__renderAndExtractFromPlaceHome(url, perTry);
+      // keywords 있으면 확정
       if (r.keywords.length) return r;
+      // name만이라도 확보해두기
+      if (r.name && !best.name) best.name = r.name;
     }
 
-    return { name: "", keywords: [] };
+    return best;
   }
 
   private async __renderAndExtractFromPlaceHome(
@@ -282,7 +237,9 @@ export class CompetitorService {
     let context: any = null;
     let page: any = null;
 
+    // 네트워크에서 키워드가 오는 케이스(그래프QL / apollo state / json)
     const netState = { name: "", keywords: [] as string[] };
+    const responseSnippets: string[] = []; // (최후) 문자열 fallback용
 
     const onResponse = async (res: any) => {
       try {
@@ -291,16 +248,23 @@ export class CompetitorService {
         if (rt !== "xhr" && rt !== "fetch") return;
 
         const ct = (await res.headerValue("content-type")) || "";
-        if (!/json|javascript/i.test(ct)) return;
+        if (!/json|javascript|text/i.test(ct)) return;
 
         const txt = await res.text().catch(() => "");
         if (!txt || txt.length < 20) return;
-        if (!/(keywordList|representKeywordList|representKeywords|keywords)/.test(txt)) return;
 
+        // 스니펫 저장(최후 문자열 regex)
+        if (/keywordList|representKeywordList|representKeywords|keywords|__APOLLO_STATE__|placeId/.test(txt)) {
+          responseSnippets.push(txt);
+          if (responseSnippets.length > 25) responseSnippets.shift();
+        }
+
+        // JSON parse 가능한 경우만 우선 처리
         let j: any = null;
         try {
           j = JSON.parse(txt);
         } catch {
+          // graphql 응답이 JSON이 아닐 수도 있어서 그냥 패스(스니펫은 저장됨)
           return;
         }
 
@@ -344,80 +308,76 @@ export class CompetitorService {
 
       await page.goto(url, { waitUntil: "domcontentloaded" });
 
-      // ✅ entryIframe 확보
+      // 약간 대기(iframe + xhr 채움)
+      await page.waitForTimeout(900);
+
+      // 1) entryIframe 확보 (없을 수도 있음)
       const iframeHandle = await page
-        .waitForSelector('iframe#entryIframe, iframe[name="entryIframe"]', { timeout: Math.min(8000, timeoutMs) })
+        .waitForSelector('iframe#entryIframe, iframe[name="entryIframe"]', { timeout: Math.min(6500, timeoutMs) })
         .catch(() => null);
 
       let frame: any = null;
       if (iframeHandle) frame = await iframeHandle.contentFrame().catch(() => null);
 
-      // ✅ iframe 내부가 "진짜" 올라올 때까지 더 확실히 대기
-      // - __NEXT_DATA__가 없는 케이스도 있으니 짧게 반복
+      // 2) iframe 내부에서 __NEXT_DATA__ 먼저
       let frameHtml = "";
       if (frame) {
         await frame.waitForLoadState("domcontentloaded").catch(() => {});
-
-        const started = Date.now();
-        while (Date.now() - started < Math.min(6500, timeoutMs)) {
-          // script#__NEXT_DATA__ 있으면 빠르게
-          const hasNext = await frame
-            .waitForSelector('script#__NEXT_DATA__', { timeout: 600 })
-            .then(() => true)
-            .catch(() => false);
-
-          frameHtml = await frame.content().catch(() => frameHtml);
-
-          if (hasNext && frameHtml && frameHtml.includes("__NEXT_DATA__")) break;
-          // next 없더라도 HTML이 충분히 길어지면(렌더 완료 신호) 탈출
-          if (frameHtml && frameHtml.length > 200000) break;
-
-          await frame.waitForTimeout(250).catch(() => {});
-        }
+        // next data script가 늦게 생기는 케이스
+        await frame.waitForSelector('script#__NEXT_DATA__', { timeout: Math.min(5500, timeoutMs) }).catch(() => {});
+        frameHtml = await frame.content().catch(() => "");
       }
 
-      // 1) iframe HTML에서 NextData 파싱
-      if (frameHtml) {
-        const next = this.__parseNextData(frameHtml);
-        if (!netState.name) netState.name = this.__deepFindName(next) || netState.name;
+      let name = "";
+      let keywords: string[] = [];
 
-        if (!netState.keywords.length) {
+      // ✅ 우선순위 A: 네트워크 스니핑 (가장 자주 살아남음)
+      if (netState.name) name = netState.name;
+      if (netState.keywords.length) keywords = netState.keywords;
+
+      // ✅ 우선순위 B: iframe __NEXT_DATA__
+      if ((!name || !keywords.length) && frameHtml) {
+        const next = this.__parseNextData(frameHtml);
+        if (!name) name = this.__deepFindName(next) || name;
+
+        if (!keywords.length) {
           for (const k of ["keywordList", "representKeywordList", "representKeywords", "keywords"]) {
             const arr = this.__deepFindStringArray(next, k);
             if (arr.length) {
-              netState.keywords = arr;
+              keywords = arr;
               break;
             }
           }
         }
 
-        if (!netState.keywords.length) {
+        // next에 없으면 regex fallback
+        if (!keywords.length) {
           const fallback = this.__extractKeywordArrayByRegex(frameHtml);
-          if (fallback.length) netState.keywords = fallback;
+          if (fallback.length) keywords = fallback;
         }
       }
 
-      // 2) 그래도 없으면: DOM에서 키워드처럼 보이는 것만 먼저 추출 → 마지막에 넓게
-      if (frame && !netState.keywords.length) {
+      // ✅ 우선순위 C: response snippets regex (graphql/apollo 등)
+      if (!keywords.length && responseSnippets.length) {
+        const merged = responseSnippets.join("\n");
+        const fallback = this.__extractKeywordArrayByRegex(merged);
+        if (fallback.length) keywords = fallback;
+      }
+
+      // ✅ 우선순위 D: DOM 직접 긁기(칩/태그)
+      if (frame && !keywords.length) {
         const domKeywords = await this.__extractKeywordsFromDom(frame).catch(() => []);
-        if (domKeywords.length) netState.keywords = domKeywords;
+        if (domKeywords.length) keywords = domKeywords;
       }
 
-      // name fallback (og:title)
-      if (!netState.name) {
+      // name fallback: og:title
+      if (!name) {
         const outer = await page.content().catch(() => "");
-        const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
-        if (m1?.[1]) netState.name = this.__cleanText(m1[1]);
+        const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,120})["']/);
+        if (m1?.[1]) name = this.__cleanText(m1[1]);
       }
 
-      const cleanedKeywords = (netState.keywords || [])
-        .map((k) => this.__cleanText(k))
-        .filter(Boolean)
-        .filter((k) => k.length >= 2 && k.length <= 25)
-        .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
-        .slice(0, 5);
-
-      return { name: this.__cleanText(netState.name), keywords: cleanedKeywords };
+      return { name: this.__cleanText(name), keywords: this.__cleanKeywords(keywords).slice(0, 5) };
     } catch {
       return { name: "", keywords: [] };
     } finally {
@@ -433,83 +393,52 @@ export class CompetitorService {
     }
   }
 
-// ✅ DOM 기반 대표키워드 추출(iframe 내부) - 서버 TS(Non-DOM lib) 안전 버전
-private async __extractKeywordsFromDom(frame: any): Promise<string[]> {
-  const raw: string[] = await frame.evaluate(() => {
-    const texts: string[] = [];
+  // ==========================
+  // ✅ DOM 기반 대표키워드 추출(iframe 내부) - 서버 TS(Non-DOM lib) 안전
+  // ==========================
+  private async __extractKeywordsFromDom(frame: any): Promise<string[]> {
+    const raw: string[] = await frame.evaluate(() => {
+      const texts: string[] = [];
 
-    const push = (t: unknown) => {
-      const s = String(t ?? "").replace(/\s+/g, " ").trim();
-      if (!s) return;
-      if (s.length < 2 || s.length > 25) return;
-      texts.push(s.replace(/^#/, ""));
-    };
+      const push = (t: unknown) => {
+        const s = String(t ?? "").replace(/\s+/g, " ").trim();
+        if (!s) return;
+        if (s.length < 2 || s.length > 25) return;
+        texts.push(s.replace(/^#/, ""));
+      };
 
-    // ✅ 여기서 document는 "타입"이 아니라 런타임 전역이므로 TS DOM lib 없이도 안전하게 접근 가능
-    const d: any = (globalThis as any).document;
-    if (!d || !d.querySelectorAll) return texts;
+      const d: any = (globalThis as any).document;
+      if (!d || !d.querySelectorAll) return texts;
 
-    // 대표키워드는 보통 칩/태그/링크/버튼 형태
-    const selectors = [
-      'a[role="button"]',
-      "a",
-      "button",
-      "span",
-      "div"
-    ];
+      // 대표키워드 “칩”은 a/button/span/div에 박히는 경우가 많음
+      const selectors = [
+        'a[role="button"]',
+        'a[href*="query="]',
+        'button',
+        'span',
+        'div'
+      ];
 
-    // 너무 과하게 긁지 않도록 상한
-    const LIMIT = 600;
+      const LIMIT = 700;
+      const nodeSet: any[] = [];
+      for (const sel of selectors) {
+        try {
+          const nodes = Array.from(d.querySelectorAll(sel));
+          for (const n of nodes) {
+            nodeSet.push(n);
+            if (nodeSet.length >= LIMIT) break;
+          }
+        } catch {}
+        if (nodeSet.length >= LIMIT) break;
+      }
 
-    const nodeSet: any[] = [];
-    for (const sel of selectors) {
-      try {
-        const nodes = Array.from(d.querySelectorAll(sel));
-        for (const n of nodes) {
-          nodeSet.push(n);
-          if (nodeSet.length >= LIMIT) break;
-        }
-      } catch {}
-      if (nodeSet.length >= LIMIT) break;
-    }
+      for (const el of nodeSet) {
+        const t = (el?.innerText ?? el?.textContent ?? "") as any;
+        push(t);
+      }
 
-    for (const el of nodeSet) {
-      const t = (el?.innerText ?? el?.textContent ?? "") as any;
-      push(t);
-    }
-
-    return texts;
-  });
-
-  // 서버에서 정리 로직
-  const cleaned = raw
-    .map((x) => this.__cleanText(x))
-    .filter(Boolean)
-    .filter((x) => x.length >= 2 && x.length <= 25)
-    .filter((x) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천|영업|휴무|길찾기|전화)/.test(x));
-
-  const uniq: string[] = [];
-  const seen = new Set<string>();
-
-  const score = (s: string) => {
-    let sc = 0;
-    if (/(역|동|구|로|길)/.test(s)) sc += 2;
-    if (/(미용실|헤어|살롱|펌|염색|커트|컷|클리닉|카페|맛집|식당|디저트|브런치)/.test(s)) sc += 2;
-    if (/[가-힣]/.test(s)) sc += 1;
-    return sc;
-  };
-
-  cleaned
-    .sort((a, b) => score(b) - score(a))
-    .forEach((s) => {
-      const k = s.replace(/\s+/g, "");
-      if (seen.has(k)) return;
-      seen.add(k);
-      uniq.push(s);
+      return texts;
     });
-
-  return uniq.slice(0, 5);
-}
 
     const cleaned = raw
       .map((x) => this.__cleanText(x))
@@ -523,10 +452,8 @@ private async __extractKeywordsFromDom(frame: any): Promise<string[]> {
     const score = (s: string) => {
       let sc = 0;
       if (/(역|동|구|로|길)/.test(s)) sc += 2;
-      if (/(미용실|헤어|살롱|펌|염색|커트|컷|클리닉|카페|맛집|식당|요리|커피|디저트)/.test(s)) sc += 2;
+      if (/(미용실|헤어|살롱|펌|염색|커트|컷|클리닉|카페|맛집|식당|디저트|브런치)/.test(s)) sc += 2;
       if (/[가-힣]/.test(s)) sc += 1;
-      // 너무 일반 단어 패널티
-      if (/(주차|화장실|예약|문의|영업|휴무)/.test(s)) sc -= 2;
       return sc;
     };
 
@@ -543,8 +470,17 @@ private async __extractKeywordsFromDom(frame: any): Promise<string[]> {
   }
 
   // ==========================
-  // generic helpers
+  // helpers
   // ==========================
+  private __cleanKeywords(list: string[]): string[] {
+    return (Array.isArray(list) ? list : [])
+      .map((k) => this.__cleanText(k))
+      .filter(Boolean)
+      .filter((k) => k.length >= 2 && k.length <= 25)
+      .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
+      .slice(0, 10);
+  }
+
   private async __withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
     const t = new Promise<T>((_, reject) => {
       const id = setTimeout(() => {
@@ -621,7 +557,7 @@ private async __extractKeywordsFromDom(frame: any): Promise<string[]> {
   }
 
   private __deepFindName(obj: any): string {
-    const keyCandidates = ["name", "placeName", "businessName", "title"];
+    const keyCandidates = ["name", "placeName", "businessName", "title", "storeName"];
     const hits = this.__deepCollect(
       obj,
       (x) => x && typeof x === "object" && keyCandidates.some((k) => typeof (x as any)[k] === "string"),
@@ -633,7 +569,7 @@ private async __extractKeywordsFromDom(frame: any): Promise<string[]> {
         const v = (h as any)[k];
         if (typeof v === "string") {
           const t = this.__cleanText(v);
-          if (t && t.length >= 2 && t.length <= 60) return t;
+          if (t && t.length >= 2 && t.length <= 80) return t;
         }
       }
     }
@@ -651,50 +587,50 @@ private async __extractKeywordsFromDom(frame: any): Promise<string[]> {
       .trim();
   }
 
-  private __extractKeywordArrayByRegex(html: string): string[] {
-    const text = String(html || "");
-    const re1 = /"(?:representKeywordList|keywordList|representKeywords|keywords)"\s*:\s*\[([^\]]{1,2000})\]/g;
+  /**
+   * ✅ 문자열에서 대표키워드 배열 추출 (Next/GraphQL/HTML/스니펫 공용)
+   */
+  private __extractKeywordArrayByRegex(text: string): string[] {
+    const src = String(text || "");
 
-    for (const m of text.matchAll(re1)) {
+    // 1) "representKeywordList":["a","b"] 형태
+    const re1 = /"(?:representKeywordList|keywordList|representKeywords|keywords)"\s*:\s*\[([^\]]{1,5000})\]/g;
+    for (const m of src.matchAll(re1)) {
       const inside = m[1] || "";
       const strs = [...inside.matchAll(/"([^"]{2,40})"/g)]
         .map((x) => this.__cleanText(x[1]))
         .filter(Boolean);
-      if (strs.length) return Array.from(new Set(strs));
+
+      const cleaned = this.__cleanKeywords(strs);
+      if (cleaned.length) return Array.from(new Set(cleaned));
     }
+
     return [];
   }
 
+  /**
+   * ✅ 어떤 텍스트든 placeId를 “등장 순서대로” 뽑기 (map 응답/HTML 공용)
+   */
   private __extractPlaceIdsFromAnyTextInOrder(text: string): string[] {
     const ids: string[] = [];
     const seen = new Set<string>();
+    const src = String(text || "");
 
-    for (const m of String(text || "").matchAll(/\/place\/(\d{5,12})/g)) {
+    for (const m of src.matchAll(/\/place\/(\d{5,12})/g)) {
       const id = m[1];
       if (!id || seen.has(id)) continue;
       seen.add(id);
       ids.push(id);
-      if (ids.length >= 80) break;
+      if (ids.length >= 120) break;
     }
 
     if (ids.length < 10) {
-      for (const m of String(text || "").matchAll(/placeId["']?\s*[:=]\s*["'](\d{5,12})["']/g)) {
+      for (const m of src.matchAll(/placeId["']?\s*[:=]\s*["'](\d{5,12})["']/g)) {
         const id = m[1];
         if (!id || seen.has(id)) continue;
         seen.add(id);
         ids.push(id);
-        if (ids.length >= 80) break;
-      }
-    }
-
-    // id:"12345" (map 쪽 응답에서 placeId 대신 id만 있는 케이스 보조)
-    if (ids.length < 10) {
-      for (const m of String(text || "").matchAll(/"id"\s*:\s*"(\d{5,12})"/g)) {
-        const id = m[1];
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
-        ids.push(id);
-        if (ids.length >= 80) break;
+        if (ids.length >= 120) break;
       }
     }
 
