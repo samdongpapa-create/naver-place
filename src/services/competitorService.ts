@@ -34,8 +34,7 @@ export class CompetitorService {
   }
 
   /**
-   * ✅ (옵션) m.map TOP 노출 순서 placeId 추출 (playwright)
-   * - 지금은 search_html 방식 쓰지만, 나중에 "지도 TOP5 동일" 고도화할 때 유용
+   * (옵션) 지도 TOP5 고도화용
    */
   async findTopPlaceIdsFromMapRank(keyword: string, opts: FindTopIdsOptions = {}) {
     const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
@@ -58,9 +57,7 @@ export class CompetitorService {
     await page.route("**/*", (route) => {
       const req = route.request();
       const rtype = req.resourceType();
-      if (rtype === "document" || rtype === "script" || rtype === "xhr" || rtype === "fetch") {
-        return route.continue();
-      }
+      if (rtype === "document" || rtype === "script" || rtype === "xhr" || rtype === "fetch") return route.continue();
       return route.abort();
     });
 
@@ -139,7 +136,10 @@ export class CompetitorService {
 
     const limit = Math.max(1, Math.min(10, opts.limit ?? 5));
     const exclude = String(opts.excludePlaceId || "").trim();
-    const timeoutMs = Math.max(1500, Math.min(20000, opts.timeoutMs ?? Number(process.env.COMPETITOR_TIMEOUT_MS || 9000)));
+    const timeoutMs = Math.max(
+      1500,
+      Math.min(20000, opts.timeoutMs ?? Number(process.env.COMPETITOR_TIMEOUT_MS || 9000))
+    );
 
     const url = `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`;
     const html = await this.__fetchHtml(url, timeoutMs);
@@ -154,33 +154,25 @@ export class CompetitorService {
       if (exclude && pid === exclude) continue;
       if (seen.has(pid)) continue;
 
-      const block = this.__sliceAround(html, pid, 14000);
-      let name = this.__extractNameFromBlock(block) || "";
-      let keywords = this.__extractKeywordListFromBlock(block).slice(0, 5);
+      // ✅ search HTML에서는 "대표키워드"를 정적 텍스트로 주워오지 않는다(오염 방지)
+      // 대신 __NEXT_DATA__에서만 추출 시도
+      const searchNext = this.__parseNextData(html);
+      let name = this.__findNameForPlaceId(searchNext, pid) || "";
+      let keywords = this.__findKeywordsForPlaceId(searchNext, pid).slice(0, 5);
 
-      // ✅ 1차에서 keywordList 못 잡거나, "브랜드명만" 있는 경우 -> place home에서 보강
+      // ✅ 부족하면 place home에서 __NEXT_DATA__로 보강
       if (this.__needKeywordEnrich(keywords, name)) {
-        try {
-          const enriched = await this.__fetchPlaceHomeAndExtract(pid, Math.min(6000, timeoutMs));
-          if (enriched.name && !name) name = enriched.name;
-          if (enriched.keywords?.length) keywords = enriched.keywords.slice(0, 5);
+        const enriched = await this.__fetchPlaceHomeAndExtract(pid, Math.min(7000, timeoutMs));
+        if (enriched.name && !name) name = enriched.name;
+        if (enriched.keywords?.length) keywords = enriched.keywords.slice(0, 5);
 
-          out.push({
-            placeId: pid,
-            name: this.__cleanText(name),
-            keywords: keywords.map((k) => this.__cleanText(k)).filter(Boolean).slice(0, 5),
-            source: "place_home",
-            rank: out.length + 1
-          });
-        } catch {
-          out.push({
-            placeId: pid,
-            name: this.__cleanText(name),
-            keywords: keywords.map((k) => this.__cleanText(k)).filter(Boolean).slice(0, 5),
-            source: "search_html",
-            rank: out.length + 1
-          });
-        }
+        out.push({
+          placeId: pid,
+          name: this.__cleanText(name),
+          keywords: keywords.map((k) => this.__cleanText(k)).filter(Boolean).slice(0, 5),
+          source: "place_home",
+          rank: out.length + 1
+        });
       } else {
         out.push({
           placeId: pid,
@@ -195,10 +187,14 @@ export class CompetitorService {
       if (out.length >= limit) break;
     }
 
-    // ✅ 마지막 안전장치: keywords 비면 name이라도 넣지 말고 빈 배열 유지 (브랜드명=키워드 같은 오염 방지)
+    // ✅ 오염 방지: 키워드가 '네이버/예약/문의/할인'류면 제거
     return out.map((c) => ({
       ...c,
-      keywords: Array.isArray(c.keywords) ? c.keywords.filter((k) => k && k.length >= 2).slice(0, 5) : []
+      keywords: (c.keywords || [])
+        .map((k) => this.__cleanText(k))
+        .filter((k) => k && k.length >= 2 && k.length <= 25)
+        .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
+        .slice(0, 5)
     }));
   }
 
@@ -217,7 +213,8 @@ export class CompetitorService {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
           "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
-          Accept: "text/html,application/xhtml+xml"
+          Accept: "text/html,application/xhtml+xml",
+          Referer: "https://search.naver.com/"
         },
         redirect: "follow",
         signal: ctrl.signal
@@ -239,7 +236,7 @@ export class CompetitorService {
       if (!id || seen.has(id)) continue;
       seen.add(id);
       ids.push(id);
-      if (ids.length >= 60) break;
+      if (ids.length >= 80) break;
     }
 
     if (ids.length < 10) {
@@ -248,72 +245,11 @@ export class CompetitorService {
         if (!id || seen.has(id)) continue;
         seen.add(id);
         ids.push(id);
-        if (ids.length >= 60) break;
+        if (ids.length >= 80) break;
       }
     }
 
     return ids;
-  }
-
-  private __sliceAround(html: string, token: string, windowSize: number) {
-    const idx = html.indexOf(token);
-    if (idx < 0) return html.slice(0, Math.min(html.length, windowSize));
-    const start = Math.max(0, idx - Math.floor(windowSize / 2));
-    const end = Math.min(html.length, idx + Math.floor(windowSize / 2));
-    return html.slice(start, end);
-  }
-
-  // ✅ 대표키워드 배열 패턴만 “강하게” 파싱 (텍스트 주워오기 fallback은 오염 위험이라 제거/축소)
-  private __extractKeywordListFromBlock(block: string): string[] {
-    const patterns = [
-      /"keywordList"\s*:\s*\[(.*?)\]/s,
-      /"representKeywordList"\s*:\s*\[(.*?)\]/s,
-      /"representKeywords"\s*:\s*\[(.*?)\]/s,
-      /"keywords"\s*:\s*\[(.*?)\]/s
-    ];
-
-    for (const p of patterns) {
-      const m = block.match(p);
-      if (!m?.[1]) continue;
-      const arr = this.__parseStringArrayLoose(m[1]);
-      if (arr.length) return arr;
-    }
-
-    // ✅ fallback(약하게): "대표키워드"처럼 보이는 짧은 토큰만
-    // (브랜드명/네이버 같은 오염 방지)
-    const cand = [...block.matchAll(/>([^<>]{2,25})</g)]
-      .map((x) => this.__cleanText(x[1]))
-      .filter(Boolean);
-
-    const filtered = cand.filter((s) => /(역|동|구|미용실|카페|맛집|헤어|살롱|클리닉)/.test(s));
-    // 너무 적으면 그냥 빈 배열로 둔다 (오염 방지)
-    return filtered.slice(0, 5);
-  }
-
-  private __extractNameFromBlock(block: string): string {
-    const m1 = block.match(/title["']?\s*:\s*["']([^"']{2,60})["']/);
-    if (m1?.[1]) return m1[1];
-
-    const m2 = block.match(/name["']?\s*:\s*["']([^"']{2,60})["']/);
-    if (m2?.[1]) return m2[1];
-
-    const m3 = block.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
-    if (m3?.[1]) return m3[1];
-
-    const m4 = block.match(/([가-힣A-Za-z0-9\s]{2,40})\s*:\s*네이버/);
-    if (m4?.[1]) return m4[1].trim();
-
-    return "";
-  }
-
-  private __parseStringArrayLoose(inner: string): string[] {
-    const out: string[] = [];
-    for (const m of inner.matchAll(/["']([^"']{1,40})["']/g)) {
-      const v = this.__cleanText(m[1]);
-      if (!v) continue;
-      out.push(v);
-    }
-    return Array.from(new Set(out));
   }
 
   private __cleanText(s: string) {
@@ -327,7 +263,7 @@ export class CompetitorService {
       .trim();
   }
 
-  // ✅ 키워드가 “브랜드명 1개”거나, 지역/업종 시그널이 아예 없으면 보강 필요
+  // ✅ 키워드가 아예 없거나, 브랜드명만 있으면 보강 필요
   private __needKeywordEnrich(keywords: string[], name: string) {
     const ks = Array.isArray(keywords) ? keywords.filter(Boolean) : [];
     if (ks.length >= 3) return false;
@@ -338,8 +274,8 @@ export class CompetitorService {
       const kk = this.__cleanText(k).replace(/\s+/g, "");
       if (!kk) return true;
       if (nm && (kk === nm || nm.includes(kk) || kk.includes(nm))) return true;
-      if (/(네이버|플레이스|예약|문의|할인|이벤트)/.test(kk)) return true;
-      // 지역/업종/서비스 신호가 전혀 없으면 브랜드로 간주
+      if (/(네이버|플레이스|예약|문의|할인|이벤트|가격)/.test(kk)) return true;
+      // 지역/업종/서비스 신호가 하나도 없으면 브랜드로 간주
       const hasSignal = /(역|동|구|미용실|카페|맛집|헤어|살롱|클리닉|펌|염색|커트|컷)/.test(kk);
       return !hasSignal;
     });
@@ -347,45 +283,142 @@ export class CompetitorService {
     return allBrandLike;
   }
 
-  // ✅ placeId의 모바일 플레이스 home을 fetch해서 대표키워드 파싱
-  private async __fetchPlaceHomeAndExtract(placeId: string, timeoutMs: number): Promise<{ name: string; keywords: string[] }> {
-    // /place/{id}/home 는 업종별로 리다이렉트됨 (hairshop/restaurant 등)
-    const url = `https://m.place.naver.com/place/${placeId}/home`;
-    const html = await this.__fetchHtml(url, timeoutMs);
-
-    const name = this.__extractNameFromPlaceHome(html);
-    const keywords = this.__extractKeywordsFromPlaceHome(html);
-
-    return { name, keywords };
+  // ==========================
+  // ✅ __NEXT_DATA__ 파싱 + 딥서치
+  // ==========================
+  private __parseNextData(html: string): any | null {
+    const m = html.match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+    if (!m?.[1]) return null;
+    try {
+      return JSON.parse(m[1]);
+    } catch {
+      return null;
+    }
   }
 
-  private __extractNameFromPlaceHome(html: string): string {
-    // og:title이 제일 안정적
-    const m1 = html.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
-    if (m1?.[1]) return this.__cleanText(m1[1]);
+  private __deepCollect(obj: any, predicate: (x: any) => boolean, out: any[] = []) {
+    if (!obj || typeof obj !== "object") return out;
+    if (predicate(obj)) out.push(obj);
+    if (Array.isArray(obj)) {
+      for (const it of obj) this.__deepCollect(it, predicate, out);
+      return out;
+    }
+    for (const k of Object.keys(obj)) this.__deepCollect(obj[k], predicate, out);
+    return out;
+  }
 
-    // title tag fallback
-    const m2 = html.match(/<title>\s*([^<]{2,80})\s*<\/title>/i);
-    if (m2?.[1]) return this.__cleanText(m2[1]).replace(/\s*:\s*네이버.*$/i, "");
+  private __deepFindStringArray(obj: any, keyName: string): string[] {
+    const hits = this.__deepCollect(
+      obj,
+      (x) => x && typeof x === "object" && Array.isArray((x as any)[keyName]),
+      []
+    );
 
+    for (const h of hits) {
+      const arr = (h as any)[keyName];
+      const strs = arr
+        .map((v: any) => this.__cleanText(String(v ?? "")))
+        .filter(Boolean);
+      if (strs.length) return Array.from(new Set(strs));
+    }
+    return [];
+  }
+
+  private __deepFindName(obj: any): string {
+    const keyCandidates = ["name", "placeName", "businessName", "title"];
+    const hits = this.__deepCollect(
+      obj,
+      (x) => x && typeof x === "object" && keyCandidates.some((k) => typeof (x as any)[k] === "string"),
+      []
+    );
+
+    for (const h of hits) {
+      for (const k of keyCandidates) {
+        const v = (h as any)[k];
+        if (typeof v === "string") {
+          const t = this.__cleanText(v);
+          if (t && t.length >= 2 && t.length <= 60) return t;
+        }
+      }
+    }
     return "";
   }
 
-  private __extractKeywordsFromPlaceHome(html: string): string[] {
-    const patterns = [
-      /"keywordList"\s*:\s*\[(.*?)\]/s,
-      /"representKeywordList"\s*:\s*\[(.*?)\]/s,
-      /"representKeywords"\s*:\s*\[(.*?)\]/s,
-      /"keywords"\s*:\s*\[(.*?)\]/s
-    ];
+  // ✅ search next data에서 특정 placeId에 매칭되는 name/keywords를 최대한 찾는다
+  private __findNameForPlaceId(next: any, placeId: string): string {
+    if (!next) return "";
+    const pid = String(placeId);
 
-    for (const p of patterns) {
-      const m = html.match(p);
-      if (!m?.[1]) continue;
-      const arr = this.__parseStringArrayLoose(m[1]);
-      if (arr.length) return arr.slice(0, 5);
+    const hits = this.__deepCollect(
+      next,
+      (x) =>
+        x &&
+        typeof x === "object" &&
+        (String((x as any).id || (x as any).placeId || (x as any).businessId || "") === pid ||
+          String((x as any).placeId || "") === pid),
+      []
+    );
+
+    for (const h of hits) {
+      const nm = this.__deepFindName(h);
+      if (nm) return nm;
+    }
+
+    // 마지막 fallback: 전체에서 name 하나라도
+    return "";
+  }
+
+  private __findKeywordsForPlaceId(next: any, placeId: string): string[] {
+    if (!next) return [];
+    const pid = String(placeId);
+
+    const hits = this.__deepCollect(
+      next,
+      (x) =>
+        x &&
+        typeof x === "object" &&
+        (String((x as any).id || (x as any).placeId || (x as any).businessId || "") === pid ||
+          String((x as any).placeId || "") === pid),
+      []
+    );
+
+    for (const h of hits) {
+      const keys = ["keywordList", "representKeywordList", "representKeywords", "keywords"];
+      for (const k of keys) {
+        const arr = this.__deepFindStringArray(h, k);
+        if (arr.length) return arr;
+      }
     }
 
     return [];
+  }
+
+  // ==========================
+  // ✅ place home fetch -> __NEXT_DATA__에서 대표키워드 추출
+  // ==========================
+  private async __fetchPlaceHomeAndExtract(placeId: string, timeoutMs: number): Promise<{ name: string; keywords: string[] }> {
+    const url = `https://m.place.naver.com/place/${placeId}/home`;
+    const html = await this.__fetchHtml(url, timeoutMs);
+
+    const next = this.__parseNextData(html);
+
+    // name은 next에서 우선
+    let name = this.__deepFindName(next) || "";
+
+    // keywords도 next에서 우선
+    const keys = ["keywordList", "representKeywordList", "representKeywords", "keywords"];
+    let keywords: string[] = [];
+    for (const k of keys) {
+      keywords = this.__deepFindStringArray(next, k);
+      if (keywords.length) break;
+    }
+
+    // og:title fallback
+    if (!name) {
+      const m1 = html.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
+      if (m1?.[1]) name = this.__cleanText(m1[1]);
+    }
+
+    return { name, keywords: (keywords || []).slice(0, 5) };
   }
 }
