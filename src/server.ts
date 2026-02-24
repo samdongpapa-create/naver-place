@@ -354,7 +354,22 @@ function buildRecommendedKeywordsTrafficFirst(params: {
   push(basePool[1]);
 
   const recommended = out.slice(0, 5);
-  while (recommended.length < 5) recommended.push(categoryK);
+    // ✅ 부족분은 categoryK(미용실)로 채우지 말고 "시술/전환" 토큰으로 채움
+  const fillerPool =
+    categoryK === "미용실"
+      ? ["펌", "염색", "다운펌", "클리닉", "볼륨매직", "탈색"]
+      : ["예약", "문의", "후기", "추천", "인기"];
+
+  let i = 0;
+  while (recommended.length < 5 && i < fillerPool.length) {
+    const f = fillerPool[i++];
+    if (!recommended.includes(f)) recommended.push(f);
+  }
+  while (recommended.length < 5) {
+    if (!recommended.includes("예약")) recommended.push("예약");
+    else if (!recommended.includes("상담")) recommended.push("상담");
+    else recommended.push("문의");
+  }
 
   return {
     recommended: recommended.slice(0, 5),
@@ -690,6 +705,44 @@ app.post("/api/diagnose/paid", async (req, res) => {
       while (finalRecommendedKeywords.length < 5) finalRecommendedKeywords.push(prof.categoryK);
       finalRecommendedKeywords = finalRecommendedKeywords.slice(0, 5);
     }
+    // ✅ 대표키워드 정책 보정: 단독 업종키워드("미용실") 금지 + 중복 제거 + (지역3 + 시술2) 유지
+(function normalizeFinalKeywords() {
+  const category = String(prof.categoryK || "").replace(/\s+/g, ""); // "미용실"
+  const bannedSingles = new Set([category]); // 단독 업종 키워드 금지
+
+  // 1) 공백제거 + 중복제거
+  const uniqed: string[] = [];
+  for (const k of finalRecommendedKeywords || []) {
+    const x = String(k || "").replace(/\s+/g, "");
+    if (!x) continue;
+    if (uniqed.includes(x)) continue;
+    uniqed.push(x);
+  }
+
+  // 2) 단독 업종키워드 제거
+  let cleaned = uniqed.filter((k) => !bannedSingles.has(k));
+
+  // 3) 길이 5 맞추기: "시술" 우선으로 채우고(지역명 X), 그래도 부족하면 안전 토큰으로 채움
+  const serviceFallbackPool =
+    prof.scoreIndustry === "hairshop"
+      ? ["펌", "염색", "다운펌", "클리닉", "볼륨매직", "탈색", "두피클리닉", "레이어드컷", "남자펌"]
+      : ["예약", "문의", "후기", "추천", "인기"];
+
+  while (cleaned.length < 5) {
+    const cand = serviceFallbackPool.find((t) => !cleaned.includes(t) && !bannedSingles.has(t));
+    if (!cand) break;
+    cleaned.push(cand);
+  }
+
+  // 4) 그래도 5개가 안되면, 마지막 수단(중복 방지용 안전 키워드)
+  while (cleaned.length < 5) {
+    const safe = "예약";
+    if (!cleaned.includes(safe)) cleaned.push(safe);
+    else cleaned.push("상담");
+  }
+
+  finalRecommendedKeywords = cleaned.slice(0, 5);
+})();
 
     console.log("[PAID] finalRecommendedKeywords:", finalRecommendedKeywords);
 
