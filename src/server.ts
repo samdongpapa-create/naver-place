@@ -27,6 +27,17 @@ app.use(express.static(publicDir));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 app.get("/", (_req, res) => res.sendFile(path.join(publicDir, "index.html")));
 
+/**
+ * ✅ Railway에서 간헐적으로 Playwright/timeout류가 언핸들로 튀면 프로세스가 죽을 수 있어서 안전망
+ * - 절대 throw로 프로세스 죽이지 말고 로그만 남김
+ */
+process.on("unhandledRejection", (reason: any) => {
+  console.error("[FATAL-GUARD] unhandledRejection:", reason?.message || reason);
+});
+process.on("uncaughtException", (err: any) => {
+  console.error("[FATAL-GUARD] uncaughtException:", err?.message || err);
+});
+
 /** utils */
 function uniq<T>(arr: T[]) {
   return Array.from(new Set(arr));
@@ -295,9 +306,6 @@ function buildCompetitorKeywordTop(
 
 /**
  * ✅ 트래픽 우선형 대표키워드 5개
- * - 지역 3개: 지역+업종
- * - 메뉴/시술 2개: 지역명 없이(커트, 펌) + 트래픽 상위
- * - "미용실" 같은 일반 단독키워드가 끼는거 방지
  */
 function buildRecommendedKeywordsTrafficFirst(params: {
   categoryK: string;
@@ -325,7 +333,6 @@ function buildRecommendedKeywordsTrafficFirst(params: {
     out.push(x);
   };
 
-  // 1) 지역 3개
   const regionBase = locality || district || "";
   if (regionBase) push(`${regionBase}${categoryK}`);
   else push(`${categoryK}`);
@@ -342,7 +349,6 @@ function buildRecommendedKeywordsTrafficFirst(params: {
     push(`${w}${categoryK}`);
   }
 
-  // 2) 메뉴/시술 2개 (지역명 X, 트래픽 상위 pool 우선)
   const trafficMenuPoolByCategoryK: Record<string, string[]> = {
     미용실: ["커트", "펌", "염색", "클리닉", "다운펌", "볼륨매직", "매직", "탈색", "두피클리닉", "레이어드컷"],
     카페: ["디저트", "브런치", "커피", "테이크아웃", "라떼", "아메리카노", "케이크", "베이커리"],
@@ -354,16 +360,13 @@ function buildRecommendedKeywordsTrafficFirst(params: {
   push(menuPick[0]);
   push(menuPick[1]);
 
-  // 🔥 중복/일반키워드 정리: "미용실" 같은 단독이 끼면 제거
-  const hasRegionCategory =
-    out.filter((x) => x.endsWith(categoryK) && x !== categoryK).length >= 2;
+  const hasRegionCategory = out.filter((x) => x.endsWith(categoryK) && x !== categoryK).length >= 2;
 
   const cleaned = out.filter((x) => {
-    if (x === categoryK && hasRegionCategory) return false; // "미용실" 단독 제거
+    if (x === categoryK && hasRegionCategory) return false;
     return true;
   });
 
-  // 부족하면 categoryBoost/brand로 채우되, categoryK 단독은 마지막까지도 넣지 않음
   const fill: string[] = [];
   if (brand) fill.push(brand);
   for (const b of params.categoryBoost || []) fill.push(b);
@@ -378,7 +381,6 @@ function buildRecommendedKeywordsTrafficFirst(params: {
     if (!final.includes(k)) final.push(k);
   }
   while (final.length < 5) {
-    // 최후에도 categoryK 단독은 넣지 말고 "추천" 같은 것보다 그냥 브랜드로
     if (brand && !final.includes(brand)) final.push(brand);
     else break;
   }
@@ -398,9 +400,6 @@ function buildRecommendedKeywordsTrafficFirst(params: {
   };
 }
 
-/**
- * ✅ 자연삽입
- */
 function injectNaturalServiceTerms(params: {
   text: string;
   serviceTokens: string[];
@@ -459,14 +458,23 @@ function buildMenuGuidance(params: {
   return { missing, suggestionExamples, note };
 }
 
-/** timeouts */
-async function withTimeout<T>(p: Promise<T>, ms: number, label = "timeout"): Promise<T> {
+/**
+ * ✅ HARD timeout 제거(중요)
+ * - Promise.race로 reject하면, 내부 Playwright 작업은 취소되지 않고 계속 돌아서
+ *   finally에서 browser close 이후 백그라운드 에러가 터질 수 있음
+ *
+ * ✅ 대신 SOFT timeout 사용: 시간 지나면 fallback 반환 (절대 throw X)
+ */
+async function withSoftTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
   let timer: NodeJS.Timeout | null = null;
-  const timeoutPromise = new Promise<T>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(label)), ms);
+  const timeoutPromise = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(fallback), ms);
   });
+
   try {
     return await Promise.race([p, timeoutPromise]);
+  } catch {
+    return fallback;
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -501,37 +509,39 @@ async function getCompetitorsSafe(params: {
     const remainingMs = totalTimeoutMs - (Date.now() - started);
     if (remainingMs <= 200) break;
 
+    // ✅ perTry는 "서비스에 전달할 예산"이고, 바깥에서 kill하지 않는다
     const perTryTimeoutMs = Math.min(remainingMs, Math.max(3000, Math.min(perTryCap, remainingMs)));
 
-    try {
-      console.log("[PAID][COMP] try query:", q, "remainingMs:", remainingMs, "perTryTimeoutMs:", perTryTimeoutMs);
+    console.log("[PAID][COMP] try query:", q, "remainingMs:", remainingMs, "perTryTimeoutMs:", perTryTimeoutMs);
 
-      const comps = await withTimeout(
-        compSvc.findTopCompetitorsByKeyword(q, {
-          excludePlaceId: placeId,
-          limit,
-          timeoutMs: perTryTimeoutMs
-        }),
-        perTryTimeoutMs,
-        "compTop-timeout"
-      );
+    // ✅ 핵심 변경:
+    // - 기존: withTimeout(..., "compTop-timeout") -> reject 발생
+    // - 변경: withSoftTimeout(..., []) -> 시간 지나면 그냥 [] 반환(throw 없음)
+    const comps = await withSoftTimeout(
+      compSvc.findTopCompetitorsByKeyword(q, {
+        excludePlaceId: placeId,
+        limit,
+        timeoutMs: perTryTimeoutMs
+      }),
+      perTryTimeoutMs + 300, // 네트워크 상황 감안해 약간 여유
+      [] as any[]
+    );
 
-      if (Array.isArray(comps) && comps.length) {
-        try {
-          const snap = comps.map((c: any, i: number) => ({
-            rank: i + 1,
-            placeId: c.placeId,
-            name: c.name,
-            kwCount: Array.isArray(c.keywords) ? c.keywords.length : 0,
-            keywords: Array.isArray(c.keywords) ? c.keywords.slice(0, 5) : []
-          }));
-          console.log("[PAID][COMP] keyword snapshot:", JSON.stringify(snap));
-        } catch {}
+    if (Array.isArray(comps) && comps.length) {
+      try {
+        const snap = comps.map((c: any, i: number) => ({
+          rank: i + 1,
+          placeId: c.placeId,
+          name: c.name,
+          kwCount: Array.isArray(c.keywords) ? c.keywords.length : 0,
+          keywords: Array.isArray(c.keywords) ? c.keywords.slice(0, 5) : []
+        }));
+        console.log("[PAID][COMP] keyword snapshot:", JSON.stringify(snap));
+      } catch {}
 
-        return comps.slice(0, limit);
-      }
-    } catch (e: any) {
-      console.log("[PAID][COMP] query failed:", q, e?.message || String(e));
+      return comps.slice(0, limit);
+    } else {
+      console.log("[PAID][COMP] no competitors from query:", q);
     }
   }
 
@@ -616,7 +626,9 @@ app.post("/api/diagnose/paid", async (req, res) => {
     const crawlResult = await crawler.crawlPlace(mobileUrl);
 
     if (!crawlResult.success || !crawlResult.data) {
-      return res.status(500).json({ success: false, message: crawlResult.error || "크롤링 실패", logs: crawlResult.logs || [] });
+      return res
+        .status(500)
+        .json({ success: false, message: crawlResult.error || "크롤링 실패", logs: crawlResult.logs || [] });
     }
 
     const prof = detectBusinessProfile({
@@ -679,7 +691,6 @@ app.post("/api/diagnose/paid", async (req, res) => {
       menuTerms: prof.serviceTokens
     });
 
-    // ✅ SearchAd(검색광고) 기반: 시술 TOP2를 트래픽 순으로 (지역명 X)
     let top2ServiceByTraffic: string[] = [];
     try {
       if (prof.scoreIndustry === "hairshop") {
@@ -690,7 +701,6 @@ app.post("/api/diagnose/paid", async (req, res) => {
       console.log("[PAID][SearchAd] keyword tool failed:", e?.message || String(e));
     }
 
-    // ✅ 대표키워드 최종 확정: (지역3 + 시술2(트래픽 TOP2, 지역명 X))
     let finalRecommendedKeywords = traffic.recommended.slice(0, 5);
 
     if (Array.isArray(top2ServiceByTraffic) && top2ServiceByTraffic.length === 2) {
@@ -750,7 +760,6 @@ app.post("/api/diagnose/paid", async (req, res) => {
     imp.directions = dirInjected.text;
     imp.reviewRequestScripts = rr;
 
-    // ✅ 대표키워드는 서버 확정값으로 강제(= GPT 출력과 100% 일치)
     imp.keywords = finalRecommendedKeywords;
     (gpt as any).recommendedKeywords = finalRecommendedKeywords;
 
