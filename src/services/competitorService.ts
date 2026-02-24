@@ -433,49 +433,83 @@ export class CompetitorService {
     }
   }
 
-  // ✅ DOM 기반 대표키워드 추출(iframe 내부) - Node TS(Non-DOM lib) 호환 버전
-  // - 1차: 링크/칩처럼 보이는 요소(짧은 텍스트, query 포함 링크) 위주
-  // - 2차: 그래도 없을 때만 넓게 수집
-  private async __extractKeywordsFromDom(frame: any): Promise<string[]> {
-    const raw: string[] = await frame.evaluate(() => {
-      const texts: string[] = [];
-      const push = (t: unknown) => {
-        const s = String(t ?? "").replace(/\s+/g, " ").trim();
-        if (!s) return;
-        if (s.length < 2 || s.length > 25) return;
-        texts.push(s.replace(/^#/, ""));
-      };
+// ✅ DOM 기반 대표키워드 추출(iframe 내부) - 서버 TS(Non-DOM lib) 안전 버전
+private async __extractKeywordsFromDom(frame: any): Promise<string[]> {
+  const raw: string[] = await frame.evaluate(() => {
+    const texts: string[] = [];
 
-      const g: any = globalThis as any;
-      const d = g.document;
-      if (!d || !d.querySelectorAll) return texts;
+    const push = (t: unknown) => {
+      const s = String(t ?? "").replace(/\s+/g, " ").trim();
+      if (!s) return;
+      if (s.length < 2 || s.length > 25) return;
+      texts.push(s.replace(/^#/, ""));
+    };
 
-      // 1) query가 들어간 링크(키워드일 확률 높음)
-      const links = Array.from(d.querySelectorAll('a[href*="query="], a[href*="search"], a[href*="place"]'));
-      for (const el of links as any[]) {
-        const t = (el?.innerText ?? el?.textContent ?? "") as string;
-        push(t);
-      }
+    // ✅ 여기서 document는 "타입"이 아니라 런타임 전역이므로 TS DOM lib 없이도 안전하게 접근 가능
+    const d: any = (globalThis as any).document;
+    if (!d || !d.querySelectorAll) return texts;
 
-      // 2) 칩/태그류로 보이는 role/button/span (짧은 텍스트 위주)
-      const chips = Array.from(d.querySelectorAll('button, [role="button"], span, a'));
-      for (const el of chips as any[]) {
-        const t = (el?.innerText ?? el?.textContent ?? "") as string;
-        push(t);
-      }
+    // 대표키워드는 보통 칩/태그/링크/버튼 형태
+    const selectors = [
+      'a[role="button"]',
+      "a",
+      "button",
+      "span",
+      "div"
+    ];
 
-      // 3) 최후: 넓게(너무 많으면 노이즈)
-      if (texts.length < 5) {
-        const nodes = Array.from(d.querySelectorAll("div"));
-        for (const el of nodes as any[]) {
-          const t = (el?.innerText ?? el?.textContent ?? "") as string;
-          push(t);
-          if (texts.length > 2000) break;
+    // 너무 과하게 긁지 않도록 상한
+    const LIMIT = 600;
+
+    const nodeSet: any[] = [];
+    for (const sel of selectors) {
+      try {
+        const nodes = Array.from(d.querySelectorAll(sel));
+        for (const n of nodes) {
+          nodeSet.push(n);
+          if (nodeSet.length >= LIMIT) break;
         }
-      }
+      } catch {}
+      if (nodeSet.length >= LIMIT) break;
+    }
 
-      return texts;
+    for (const el of nodeSet) {
+      const t = (el?.innerText ?? el?.textContent ?? "") as any;
+      push(t);
+    }
+
+    return texts;
+  });
+
+  // 서버에서 정리 로직
+  const cleaned = raw
+    .map((x) => this.__cleanText(x))
+    .filter(Boolean)
+    .filter((x) => x.length >= 2 && x.length <= 25)
+    .filter((x) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천|영업|휴무|길찾기|전화)/.test(x));
+
+  const uniq: string[] = [];
+  const seen = new Set<string>();
+
+  const score = (s: string) => {
+    let sc = 0;
+    if (/(역|동|구|로|길)/.test(s)) sc += 2;
+    if (/(미용실|헤어|살롱|펌|염색|커트|컷|클리닉|카페|맛집|식당|디저트|브런치)/.test(s)) sc += 2;
+    if (/[가-힣]/.test(s)) sc += 1;
+    return sc;
+  };
+
+  cleaned
+    .sort((a, b) => score(b) - score(a))
+    .forEach((s) => {
+      const k = s.replace(/\s+/g, "");
+      if (seen.has(k)) return;
+      seen.add(k);
+      uniq.push(s);
     });
+
+  return uniq.slice(0, 5);
+}
 
     const cleaned = raw
       .map((x) => this.__cleanText(x))
