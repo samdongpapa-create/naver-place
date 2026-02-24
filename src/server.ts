@@ -133,7 +133,7 @@ function getCity(address: string): string {
 }
 
 /**
- * ✅ E) 업종군 추정 (확장형)
+ * ✅ 업종군 추정
  */
 type BusinessProfile = {
   scoreIndustry: Industry;
@@ -158,7 +158,6 @@ function detectBusinessProfile(params: {
   const kw = Array.isArray(params.keywords) ? params.keywords.join(" ") : "";
   const menus = Array.isArray(params.menus) ? params.menus : [];
   const menuText = menus.map((m) => String(m?.name || "")).join(" ");
-
   const text = `${name} ${address} ${kw} ${menuText}`.toLowerCase();
 
   if (req === "hairshop" || req === "cafe" || req === "restaurant") {
@@ -269,7 +268,7 @@ function detectBusinessProfile(params: {
 }
 
 /**
- * ✅ D) 경쟁사 키워드 TopN(빈도)
+ * ✅ 경쟁사 키워드 TopN(빈도)
  */
 function normalizeKw(k: string) {
   return String(k || "").replace(/\s+/g, "").trim();
@@ -284,7 +283,7 @@ function buildCompetitorKeywordTop(
     const nk = normalizeKw(k);
     if (!nk) continue;
     if (nk.length < 2 || nk.length > 25) continue;
-    if (/(추천|베스트|할인|가격|이벤트|예약)/.test(nk)) continue;
+    if (/(추천|베스트|할인|가격|이벤트|예약|문의|네이버)/.test(nk)) continue;
     freq.set(nk, (freq.get(nk) || 0) + 1);
   }
   const sorted = Array.from(freq.entries()).sort((a, b) => b[1] - a[1]);
@@ -296,8 +295,9 @@ function buildCompetitorKeywordTop(
 
 /**
  * ✅ 트래픽 우선형 대표키워드 5개
- * - 1~3: 지역+업종
- * - 4~5: 메뉴/시술 (지역명 X)
+ * - 지역 3개: 지역+업종
+ * - 메뉴/시술 2개: 지역명 없이(커트, 펌) + 트래픽 상위
+ * - "미용실" 같은 일반 단독키워드가 끼는거 방지
  */
 function buildRecommendedKeywordsTrafficFirst(params: {
   categoryK: string;
@@ -314,6 +314,7 @@ function buildRecommendedKeywordsTrafficFirst(params: {
   const city = getCity(myAddress);
 
   const expansionPool = ["광화문", "종로", "시청", "서울역", "경복궁", "명동", "충정로", district].filter(Boolean);
+  const brand = normalizeKw(myName).replace(/[^\w가-힣]/g, "");
 
   const out: string[] = [];
   const push = (k: string) => {
@@ -332,8 +333,7 @@ function buildRecommendedKeywordsTrafficFirst(params: {
   for (const kw of competitorKeywordTop || []) {
     if (out.length >= 3) break;
     if (!kw.includes(categoryK)) continue;
-    if (/(커트|컷|펌|염색|탈색|클리닉|다운펌|볼륨매직|매직|디저트|브런치|커피|라떼|아메리카노|세트|정식|국밥|고기|회|돈까스|파스타)/.test(kw))
-      continue;
+    if (/(커트|컷|펌|염색|탈색|클리닉|다운펌|볼륨매직|매직|두피|레이어드|남자펌|여자펌|복구)/.test(kw)) continue;
     push(kw);
   }
 
@@ -342,7 +342,7 @@ function buildRecommendedKeywordsTrafficFirst(params: {
     push(`${w}${categoryK}`);
   }
 
-  // 2) 시술/메뉴 2개(지역명 X)
+  // 2) 메뉴/시술 2개 (지역명 X, 트래픽 상위 pool 우선)
   const trafficMenuPoolByCategoryK: Record<string, string[]> = {
     미용실: ["커트", "펌", "염색", "클리닉", "다운펌", "볼륨매직", "매직", "탈색", "두피클리닉", "레이어드컷"],
     카페: ["디저트", "브런치", "커피", "테이크아웃", "라떼", "아메리카노", "케이크", "베이커리"],
@@ -350,41 +350,56 @@ function buildRecommendedKeywordsTrafficFirst(params: {
   };
   const basePool = trafficMenuPoolByCategoryK[categoryK] || ["커트", "펌", "예약", "문의"];
 
-  push(basePool[0]);
-  push(basePool[1]);
+  const menuPick = basePool.slice(0, 2);
+  push(menuPick[0]);
+  push(menuPick[1]);
 
-  const recommended = out.slice(0, 5);
-    // ✅ 부족분은 categoryK(미용실)로 채우지 말고 "시술/전환" 토큰으로 채움
-  const fillerPool =
-    categoryK === "미용실"
-      ? ["펌", "염색", "다운펌", "클리닉", "볼륨매직", "탈색"]
-      : ["예약", "문의", "후기", "추천", "인기"];
+  // 🔥 중복/일반키워드 정리: "미용실" 같은 단독이 끼면 제거
+  const hasRegionCategory =
+    out.filter((x) => x.endsWith(categoryK) && x !== categoryK).length >= 2;
 
-  let i = 0;
-  while (recommended.length < 5 && i < fillerPool.length) {
-    const f = fillerPool[i++];
-    if (!recommended.includes(f)) recommended.push(f);
+  const cleaned = out.filter((x) => {
+    if (x === categoryK && hasRegionCategory) return false; // "미용실" 단독 제거
+    return true;
+  });
+
+  // 부족하면 categoryBoost/brand로 채우되, categoryK 단독은 마지막까지도 넣지 않음
+  const fill: string[] = [];
+  if (brand) fill.push(brand);
+  for (const b of params.categoryBoost || []) fill.push(b);
+
+  const final: string[] = [];
+  for (const k of cleaned) {
+    if (final.length >= 5) break;
+    final.push(k);
   }
-  while (recommended.length < 5) {
-    if (!recommended.includes("예약")) recommended.push("예약");
-    else if (!recommended.includes("상담")) recommended.push("상담");
-    else recommended.push("문의");
+  for (const k of fill) {
+    if (final.length >= 5) break;
+    if (!final.includes(k)) final.push(k);
+  }
+  while (final.length < 5) {
+    // 최후에도 categoryK 단독은 넣지 말고 "추천" 같은 것보다 그냥 브랜드로
+    if (brand && !final.includes(brand)) final.push(brand);
+    else break;
   }
 
   return {
-    recommended: recommended.slice(0, 5),
+    recommended: final.slice(0, 5),
     debug: {
       locality,
       district,
       city,
       expansionPool,
+      brand,
+      categoryK,
+      categoryBoost: params.categoryBoost,
       competitorKeywordTopSample: (competitorKeywordTop || []).slice(0, 10)
     }
   };
 }
 
 /**
- * ✅ A) 상세설명/오시는길 자연삽입 강제
+ * ✅ 자연삽입
  */
 function injectNaturalServiceTerms(params: {
   text: string;
@@ -417,9 +432,6 @@ function injectNaturalServiceTerms(params: {
   return { text: merged, inserted };
 }
 
-/**
- * ✅ C) 리뷰요청 문구 서비스 힌트 1문장
- */
 function injectReviewScriptServiceHint(s: string, token: string): string {
   const base = String(s || "").trim();
   if (!base) return "";
@@ -428,9 +440,6 @@ function injectReviewScriptServiceHint(s: string, token: string): string {
   return `${base} 가능하시다면 "${token}" 만족도도 한 줄만 적어주시면 다음 고객분들께 큰 도움이 됩니다 😊`;
 }
 
-/**
- * ✅ B) 메뉴 점검 + 메뉴명 추천 가이드
- */
 function buildMenuGuidance(params: {
   menus?: any[];
   mustHave: string[];
@@ -463,6 +472,9 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label = "timeout"): Pro
   }
 }
 
+/**
+ * ✅ 경쟁사 안전 호출 (부분성공 살리기)
+ */
 function getCompetitorTimeouts() {
   const total = Number(process.env.COMPETITOR_TOTAL_TIMEOUT_MS || 18000);
   const perTry = Number(process.env.COMPETITOR_QUERY_TIMEOUT_MS || 12000);
@@ -667,30 +679,20 @@ app.post("/api/diagnose/paid", async (req, res) => {
       menuTerms: prof.serviceTokens
     });
 
-    // ✅ SearchAd로 시술 TOP2 뽑아서 (지역3 + 시술2(지역명X))로 고정
+    // ✅ SearchAd(검색광고) 기반: 시술 TOP2를 트래픽 순으로 (지역명 X)
     let top2ServiceByTraffic: string[] = [];
     try {
       if (prof.scoreIndustry === "hairshop") {
-        const candidates = [
-          "커트",
-          "펌",
-          "염색",
-          "클리닉",
-          "다운펌",
-          "볼륨매직",
-          "매직",
-          "탈색",
-          "두피클리닉",
-          "레이어드컷",
-          "남자펌"
-        ];
+        const candidates = ["커트", "펌", "염색", "클리닉", "다운펌", "볼륨매직", "매직", "탈색", "두피클리닉", "레이어드컷", "남자펌"];
         top2ServiceByTraffic = await pickTopServiceKeywordsByTraffic(candidates);
       }
     } catch (e: any) {
       console.log("[PAID][SearchAd] keyword tool failed:", e?.message || String(e));
     }
 
-    let finalRecommendedKeywords = traffic.recommended;
+    // ✅ 대표키워드 최종 확정: (지역3 + 시술2(트래픽 TOP2, 지역명 X))
+    let finalRecommendedKeywords = traffic.recommended.slice(0, 5);
+
     if (Array.isArray(top2ServiceByTraffic) && top2ServiceByTraffic.length === 2) {
       finalRecommendedKeywords = [
         finalRecommendedKeywords[0],
@@ -701,48 +703,7 @@ app.post("/api/diagnose/paid", async (req, res) => {
       ]
         .filter(Boolean)
         .slice(0, 5);
-    } else {
-      while (finalRecommendedKeywords.length < 5) finalRecommendedKeywords.push(prof.categoryK);
-      finalRecommendedKeywords = finalRecommendedKeywords.slice(0, 5);
     }
-    // ✅ 대표키워드 정책 보정: 단독 업종키워드("미용실") 금지 + 중복 제거 + (지역3 + 시술2) 유지
-(function normalizeFinalKeywords() {
-  const category = String(prof.categoryK || "").replace(/\s+/g, ""); // "미용실"
-  const bannedSingles = new Set([category]); // 단독 업종 키워드 금지
-
-  // 1) 공백제거 + 중복제거
-  const uniqed: string[] = [];
-  for (const k of finalRecommendedKeywords || []) {
-    const x = String(k || "").replace(/\s+/g, "");
-    if (!x) continue;
-    if (uniqed.includes(x)) continue;
-    uniqed.push(x);
-  }
-
-  // 2) 단독 업종키워드 제거
-  let cleaned = uniqed.filter((k) => !bannedSingles.has(k));
-
-  // 3) 길이 5 맞추기: "시술" 우선으로 채우고(지역명 X), 그래도 부족하면 안전 토큰으로 채움
-  const serviceFallbackPool =
-    prof.scoreIndustry === "hairshop"
-      ? ["펌", "염색", "다운펌", "클리닉", "볼륨매직", "탈색", "두피클리닉", "레이어드컷", "남자펌"]
-      : ["예약", "문의", "후기", "추천", "인기"];
-
-  while (cleaned.length < 5) {
-    const cand = serviceFallbackPool.find((t) => !cleaned.includes(t) && !bannedSingles.has(t));
-    if (!cand) break;
-    cleaned.push(cand);
-  }
-
-  // 4) 그래도 5개가 안되면, 마지막 수단(중복 방지용 안전 키워드)
-  while (cleaned.length < 5) {
-    const safe = "예약";
-    if (!cleaned.includes(safe)) cleaned.push(safe);
-    else cleaned.push("상담");
-  }
-
-  finalRecommendedKeywords = cleaned.slice(0, 5);
-})();
 
     console.log("[PAID] finalRecommendedKeywords:", finalRecommendedKeywords);
 
@@ -752,8 +713,7 @@ app.post("/api/diagnose/paid", async (req, res) => {
       suggestions: prof.menuSuggestions
     });
 
-    // ✅ gptConsulting.ts에 forcedRecommendedKeywords 타입이 아직 없으면 TS 에러가 날 수 있어서 any 캐스팅
-    const gpt = await (generatePaidConsultingGuaranteed as any)({
+    const gpt = await generatePaidConsultingGuaranteed({
       industry: prof.scoreIndustry,
       placeData: crawlResult.data,
       scoredNow: { totalScore: scored.totalScore, totalGrade: scored.totalGrade, scores: scored.scores },
@@ -790,7 +750,7 @@ app.post("/api/diagnose/paid", async (req, res) => {
     imp.directions = dirInjected.text;
     imp.reviewRequestScripts = rr;
 
-    // ✅ 대표키워드는 서버 확정값으로 강제
+    // ✅ 대표키워드는 서버 확정값으로 강제(= GPT 출력과 100% 일치)
     imp.keywords = finalRecommendedKeywords;
     (gpt as any).recommendedKeywords = finalRecommendedKeywords;
 
@@ -828,14 +788,12 @@ app.post("/api/diagnose/paid", async (req, res) => {
         improvements: imp,
         recommendedKeywords: finalRecommendedKeywords,
 
-        // ✅ UI 단순 버전 (상호명 : 키워드)
         competitorsSimple: competitors.map((c: any, idx: number) => ({
           rank: idx + 1,
           name: c?.name || `경쟁사 ${idx + 1}`,
           keywords: Array.isArray(c?.keywords) ? c.keywords.slice(0, 5) : []
         })),
 
-        // ✅ 경쟁사 키워드 기반 추가 추천 5개
         additionalRecommendedKeywords: compTop.top.filter((k) => !finalRecommendedKeywords.includes(k)).slice(0, 5),
 
         competitors,
