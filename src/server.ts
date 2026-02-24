@@ -517,7 +517,6 @@ function getCompetitorTimeouts() {
 
   return { safeTotal, safePerTry };
 }
-
 async function getCompetitorsSafe(params: {
   compSvc: CompetitorService;
   placeId: string;
@@ -534,7 +533,6 @@ async function getCompetitorsSafe(params: {
     const remainingMs = totalTimeoutMs - (Date.now() - started);
     if (remainingMs <= 200) break;
 
-    // ✅ 이번 시도에 쓸 timeout = remainingMs 안에서, perTryCap까지
     const perTryTimeoutMs = Math.min(
       remainingMs,
       Math.max(3000, Math.min(perTryCap, remainingMs))
@@ -542,17 +540,6 @@ async function getCompetitorsSafe(params: {
 
     try {
       console.log("[PAID][COMP] try query:", q, "remainingMs:", remainingMs, "perTryTimeoutMs:", perTryTimeoutMs);
-          // ✅ DEBUG: 경쟁사별 키워드 상태 확인
-    try {
-      const snap = competitors.map((c: any, i: number) => ({
-        rank: i + 1,
-        placeId: c.placeId,
-        name: c.name,
-        kwCount: Array.isArray(c.keywords) ? c.keywords.length : 0,
-        keywords: Array.isArray(c.keywords) ? c.keywords.slice(0, 5) : []
-      }));
-      console.log("[PAID][COMP] keyword snapshot:", JSON.stringify(snap));
-    } catch {}
 
       const comps = await withTimeout(
         compSvc.findTopCompetitorsByKeyword(q, {
@@ -565,6 +552,18 @@ async function getCompetitorsSafe(params: {
       );
 
       if (Array.isArray(comps) && comps.length) {
+        // ✅ DEBUG: 경쟁사별 키워드 상태 확인 (여기에서만 comps를 쓸 수 있음)
+        try {
+          const snap = comps.map((c: any, i: number) => ({
+            rank: i + 1,
+            placeId: c.placeId,
+            name: c.name,
+            kwCount: Array.isArray(c.keywords) ? c.keywords.length : 0,
+            keywords: Array.isArray(c.keywords) ? c.keywords.slice(0, 5) : []
+          }));
+          console.log("[PAID][COMP] keyword snapshot:", JSON.stringify(snap));
+        } catch {}
+
         return comps.slice(0, limit);
       }
     } catch (e: any) {
@@ -574,6 +573,7 @@ async function getCompetitorsSafe(params: {
 
   return [];
 }
+
 
 /** FREE */
 app.post("/api/diagnose/free", async (req, res) => {
@@ -708,8 +708,7 @@ app.post("/api/diagnose/paid", async (req, res) => {
 
     const competitorKeywordsFlat = competitors.flatMap((c: any) => (Array.isArray(c.keywords) ? c.keywords : []));
     const compTop = buildCompetitorKeywordTop(competitorKeywordsFlat, 20);
-
-    const traffic = buildRecommendedKeywordsTrafficFirst({
+        const traffic = buildRecommendedKeywordsTrafficFirst({
       categoryK: prof.categoryK,
       categoryBoost: prof.categoryBoost,
       myName: crawlResult.data.name,
@@ -717,6 +716,67 @@ app.post("/api/diagnose/paid", async (req, res) => {
       competitorKeywordTop: compTop.top,
       menuTerms: prof.serviceTokens
     });
+
+    // ✅ SearchAd(검색광고) 기반: 미용실이면 시술/대표메뉴 TOP2를 트래픽 순으로 교체
+    let top2ServiceByTraffic: string[] = [];
+    try {
+      if (prof.scoreIndustry === "hairshop") {
+        const candidates = [
+          "커트",
+          "펌",
+          "염색",
+          "클리닉",
+          "다운펌",
+          "볼륨매직",
+          "매직",
+          "탈색",
+          "두피클리닉",
+          "레이어드컷",
+          "남자펌"
+        ];
+        top2ServiceByTraffic = await pickTopServiceKeywordsByTraffic(candidates);
+      }
+    } catch (e: any) {
+      console.log("[PAID][SearchAd] keyword tool failed:", e?.message || String(e));
+    }
+
+    // ✅ 대표키워드 최종 확정: (지역3 + 시술2(트래픽 TOP2, 지역명 X))
+    let finalRecommendedKeywords = traffic.recommended;
+
+    if (Array.isArray(top2ServiceByTraffic) && top2ServiceByTraffic.length === 2) {
+      finalRecommendedKeywords = [
+        finalRecommendedKeywords[0],
+        finalRecommendedKeywords[1],
+        finalRecommendedKeywords[2],
+        String(top2ServiceByTraffic[0] || "").replace(/\s+/g, ""),
+        String(top2ServiceByTraffic[1] || "").replace(/\s+/g, "")
+      ]
+        .filter(Boolean)
+        .slice(0, 5);
+    } else {
+      // fallback: 혹시 5개 미만이면 채우기
+      while (finalRecommendedKeywords.length < 5) finalRecommendedKeywords.push(prof.categoryK);
+      finalRecommendedKeywords = finalRecommendedKeywords.slice(0, 5);
+    }
+
+    // ✅ (선택) 디버그 로그
+    console.log("[PAID] finalRecommendedKeywords:", finalRecommendedKeywords);
+
+    const menuGuidance = buildMenuGuidance({
+      menus: (crawlResult.data as any).menus,
+      mustHave: prof.menuMustHave,
+      suggestions: prof.menuSuggestions
+    });
+
+    const gpt = await generatePaidConsultingGuaranteed({
+      industry: prof.scoreIndustry,
+      placeData: crawlResult.data,
+      scoredNow: { totalScore: scored.totalScore, totalGrade: scored.totalGrade, scores: scored.scores },
+      competitorTopKeywords: compTop.top,
+      targetScore: 90, // ✅ 여기 콤마가 TS1005 원인
+      forcedRecommendedKeywords: finalRecommendedKeywords
+    });
+
 
     const finalRecommendedKeywords = traffic.recommended;
 
