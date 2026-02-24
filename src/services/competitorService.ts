@@ -161,4 +161,163 @@ export class CompetitorService {
 
     return [];
   }
+  // ✅ (2번 방식) 네이버 where=place 검색 HTML 1회 fetch로
+// "노출 TOP + 대표키워드(카드에 보이는)"만 뽑는다
+public async findTopCompetitorsByKeyword(
+  keyword: string,
+  opts: { excludePlaceId?: string; limit?: number; timeoutMs?: number } = {}
+): Promise<Array<{ placeId: string; name: string; keywords: string[]; source: "search_html"; rank: number }>> {
+  const q = String(keyword || "").trim();
+  if (!q) return [];
+
+  const limit = Math.max(1, Math.min(10, opts.limit ?? 5));
+  const exclude = String(opts.excludePlaceId || "").trim();
+  const timeoutMs = Math.max(1500, Math.min(15000, opts.timeoutMs ?? Number(process.env.COMPETITOR_TIMEOUT_MS || 9000)));
+
+  const url = `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`;
+
+  const html = await this.__fetchHtml(url, timeoutMs);
+
+  const placeIds = this.__extractPlaceIdsInOrder(html);
+
+  const out: Array<{ placeId: string; name: string; keywords: string[]; source: "search_html"; rank: number }> = [];
+  const seen = new Set<string>();
+
+  for (const pid of placeIds) {
+    if (!pid) continue;
+    if (exclude && pid === exclude) continue;
+    if (seen.has(pid)) continue;
+
+    const block = this.__sliceAround(html, pid, 12000);
+    const name = this.__extractNameFromBlock(block) || "";
+    const keywords = this.__extractKeywordListFromBlock(block).slice(0, 5);
+
+    seen.add(pid);
+    out.push({
+      placeId: pid,
+      name: this.__cleanText(name),
+      keywords: keywords.map((k) => this.__cleanText(k)).filter(Boolean),
+      source: "search_html",
+      rank: out.length + 1
+    });
+
+    if (out.length >= limit) break;
+  }
+
+  return out;
+}
+
+/** ============ 아래는 위 메서드 전용 private 유틸들 (클래스 내부에 함께 추가) ============ */
+
+private async __fetchHtml(url: string, timeoutMs: number): Promise<string> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+        Accept: "text/html,application/xhtml+xml"
+      },
+      signal: ctrl.signal
+    });
+
+    if (!res.ok) throw new Error(`searchHTML status=${res.status}`);
+    return (await res.text()) || "";
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+private __extractPlaceIdsInOrder(html: string): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+
+  // /place/123456789
+  for (const m of html.matchAll(/\/place\/(\d{5,12})/g)) {
+    const id = m[1];
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= 50) break;
+  }
+
+  // placeId":"123456789 (보강)
+  if (ids.length < 10) {
+    for (const m of html.matchAll(/placeId["']?\s*[:=]\s*["'](\d{5,12})["']/g)) {
+      const id = m[1];
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+      if (ids.length >= 50) break;
+    }
+  }
+
+  return ids;
+}
+
+private __sliceAround(html: string, token: string, windowSize: number) {
+  const idx = html.indexOf(token);
+  if (idx < 0) return html.slice(0, Math.min(html.length, windowSize));
+  const start = Math.max(0, idx - Math.floor(windowSize / 2));
+  const end = Math.min(html.length, idx + Math.floor(windowSize / 2));
+  return html.slice(start, end);
+}
+
+private __extractKeywordListFromBlock(block: string): string[] {
+  // keywordList: ["...","..."]
+  const m1 = block.match(/keywordList["']?\s*:\s*\[([^\]]{1,2000})\]/);
+  if (m1?.[1]) {
+    const arr = this.__parseStringArrayLoose(m1[1]);
+    if (arr.length) return arr;
+  }
+
+  // fallback: 텍스트 후보
+  const cand = [...block.matchAll(/>([^<>]{2,25})</g)]
+    .map((x) => this.__cleanText(x[1]))
+    .filter((s) => s && !s.includes("네이버") && !s.includes("더보기"));
+
+  const filtered = cand.filter((s) => /(역|동|구|미용실|카페|맛집|헤어|살롱|클리닉|필라테스|학원|부동산|병원)/.test(s));
+  return filtered.slice(0, 8);
+}
+
+private __extractNameFromBlock(block: string): string {
+  const m1 = block.match(/title["']?\s*:\s*["']([^"']{2,60})["']/);
+  if (m1?.[1]) return m1[1];
+
+  const m2 = block.match(/name["']?\s*:\s*["']([^"']{2,60})["']/);
+  if (m2?.[1]) return m2[1];
+
+  const m3 = block.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
+  if (m3?.[1]) return m3[1];
+
+  const m4 = block.match(/([가-힣A-Za-z0-9\s]{2,40})\s*:\s*네이버/);
+  if (m4?.[1]) return m4[1].trim();
+
+  return "";
+}
+
+private __parseStringArrayLoose(inner: string): string[] {
+  const out: string[] = [];
+  for (const m of inner.matchAll(/["']([^"']{1,40})["']/g)) {
+    const v = this.__cleanText(m[1]);
+    if (!v) continue;
+    out.push(v);
+  }
+  return Array.from(new Set(out));
+}
+
+private __cleanText(s: string) {
+  return String(s || "")
+    .replace(/\\u003c/g, "<")
+    .replace(/\\u003e/g, ">")
+    .replace(/&quot;|&#34;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .replace(/[^\w가-힣\s\-·]/g, "")
+    .trim();
+}
 }
