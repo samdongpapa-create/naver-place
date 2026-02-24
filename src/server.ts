@@ -357,51 +357,64 @@ function buildRecommendedKeywordsTrafficFirst(params: {
     if (out.length >= 3) break;
     push(`${w}${categoryK}`);
   }
-
+    // =========================
+  // 2) 메뉴/시술 키워드 2개 (✅ 지역명 붙이지 않음 + 트래픽 우선)
   // =========================
-  // 2) 메뉴/시술 키워드 2개 (지역+메뉴)
-  // =========================
-  const menuBase = locality || district || "";
-  const menus = (params.menuTerms || []).map((s) => String(s || "").trim()).filter(Boolean);
 
+  // 업종별 "트래픽 상위" 후보(고정 세트) — 외부 API 없이도 안정적으로 동작
+  const trafficMenuPoolByCategoryK: Record<string, string[]> = {
+    "미용실": ["커트", "펌", "염색", "클리닉", "다운펌", "볼륨매직", "매직", "탈색", "두피클리닉", "레이어드컷"],
+    "카페": ["디저트", "브런치", "커피", "테이크아웃", "라떼", "아메리카노", "케이크", "베이커리"],
+    "맛집": ["점심", "저녁", "예약", "포장", "가성비", "혼밥", "데이트", "단체"]
+  };
+
+  // 경쟁사 상위 키워드에서도 “메뉴/시술형”은 보조로 사용
+  const menuRegex = /(커트|컷|펌|염색|탈색|클리닉|다운펌|볼륨매직|매직|두피|레이어드|남자|여자|복구)/;
+
+  const menus = (params.menuTerms || [])
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
+
+  const basePool = trafficMenuPoolByCategoryK[categoryK] || ["커트", "펌", "예약", "문의"];
+
+  // 1) 우선: traffic 상위 pool에서 2개
   const menuPick: string[] = [];
-  for (const t of menus) {
+  for (const t of basePool) {
     if (menuPick.length >= 2) break;
-    if (/(추천|베스트|이벤트|할인|예약)/.test(t)) continue;
     menuPick.push(t);
   }
+
+  // 2) 보강: pool이 부족하면, serviceTokens/경쟁사 메뉴형 키워드에서 채우기
+  if (menuPick.length < 2) {
+    for (const t of menus) {
+      if (menuPick.length >= 2) break;
+      if (/(추천|베스트|이벤트|할인|예약)/.test(t)) continue;
+      // "펌/염색" 같은 핵심만 추려서
+      const core = t.replace(/\s+/g, "");
+      if (!core) continue;
+      menuPick.push(core);
+    }
+  }
+
+  if (menuPick.length < 2) {
+    for (const kw of competitorKeywordTop || []) {
+      if (menuPick.length >= 2) break;
+      if (!menuRegex.test(kw)) continue;
+      // 지역명 붙은 형태면 core만 남기기(예: 서대문역커트 -> 커트)
+      const core = kw.replace(/^[가-힣A-Za-z0-9]+?(역|동|구)?/,"").trim();
+      const cleaned = core && core.length <= 10 ? core : kw;
+      if (!cleaned) continue;
+      menuPick.push(cleaned);
+    }
+  }
+
   while (menuPick.length < 2) {
-    // 업종 공통 fallback
     menuPick.push(menuPick.length === 0 ? "커트" : "펌");
   }
 
-  if (menuBase) {
-    push(`${menuBase}${menuPick[0]}`);
-    push(`${menuBase}${menuPick[1]}`);
-  } else {
-    push(menuPick[0]);
-    push(menuPick[1]);
-  }
-
-  // 안전장치: 5개 못 채우면 브랜드/부스트로 보강
-  if (out.length < 5 && brand) push(brand);
-  if (out.length < 5 && (categoryBoost?.[0] || "")) push(categoryBoost[0]);
-  while (out.length < 5) push(categoryK);
-
-  return {
-    recommended: out.slice(0, 5),
-    debug: {
-      locality,
-      district,
-      city,
-      expansionPool,
-      brand,
-      categoryK,
-      categoryBoost,
-      menuTerms: menus.slice(0, 8),
-      competitorKeywordTopSample: (competitorKeywordTop || []).slice(0, 10)
-    }
-  };
+  // ✅ 여기서 핵심: 메뉴/시술 2개는 "지역명 없이" 그대로 push
+  push(menuPick[0]);
+  push(menuPick[1]);
 }
 
 /**
