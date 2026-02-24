@@ -17,13 +17,14 @@ type Competitor = {
 type FindTopCompetitorsOpts = {
   excludePlaceId?: string;
   limit?: number;
-  timeoutMs?: number; // 전체 예산(상한) - 내부에서 search/enrich로 분배
+  timeoutMs?: number; // 전체 예산(상한)
 };
 
 export class CompetitorService {
   private browser: Browser | null = null;
 
   private async getBrowser() {
+    // ✅ 이미 닫혔으면(null) 다시 띄우기
     if (this.browser) return this.browser;
     this.browser = await chromium.launch({
       headless: true,
@@ -131,9 +132,10 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 핵심: where=place 검색 → TOP placeId → 대표키워드(keywordList) 보강(안정형)
-  // - timeout 예산 분리 (a)
-  // - enrich 병렬 제한(세마포어, b)
+  // ✅ 핵심: where=place 검색 → TOP placeId → 대표키워드 보강(안정형)
+  // - (a) timeout 예산 분리
+  // - (b) enrich 병렬 제한 + “절대 reject 금지”
+  // - (A) enrich 대상 과다 실행 방지
   // ==========================
   public async findTopCompetitorsByKeyword(keyword: string, opts: FindTopCompetitorsOpts = {}): Promise<Competitor[]> {
     const q = String(keyword || "").trim();
@@ -142,14 +144,17 @@ export class CompetitorService {
     const limit = Math.max(1, Math.min(10, opts.limit ?? 5));
     const exclude = String(opts.excludePlaceId || "").trim();
 
-    // ✅ 전체 예산(상한)
-    const totalTimeoutMs = Math.max(3000, Math.min(30000, opts.timeoutMs ?? Number(process.env.COMPETITOR_TIMEOUT_MS || 12000)));
+    const totalTimeoutMs = Math.max(
+      3000,
+      Math.min(30000, opts.timeoutMs ?? Number(process.env.COMPETITOR_TIMEOUT_MS || 12000))
+    );
 
-    // ✅ (a) 예산 분리: search는 짧고 고정, enrich는 조금 더 길게
-    // - search는 실패해도 다음 쿼리/로직으로 갈 수 있으니 “짧게”
-    // - enrich는 iframe/xhr 기다려야 하니 “조금 길게”
+    // ✅ (a) 예산 분리
     const searchTimeoutMs = Math.max(2500, Math.min(7000, Math.floor(totalTimeoutMs * 0.45)));
     const enrichTimeoutMs = Math.max(6000, Math.min(12000, totalTimeoutMs)); // place 1개당 상한
+
+    // ✅ 전체 데드라인(바깥 타임아웃보다 살짝 먼저 끝내서 안전 종료)
+    const deadline = Date.now() + totalTimeoutMs - 300;
 
     const url = `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`;
 
@@ -157,17 +162,14 @@ export class CompetitorService {
     try {
       html = await this.__fetchHtml(url, searchTimeoutMs);
     } catch {
-      // search 자체 실패면 그대로 빈 결과
       return [];
     }
 
     const placeIds = this.__extractPlaceIdsInOrder(html);
-
-    // search html에서도 __NEXT_DATA__에 들어있으면 name/keywords 일부는 캐치 가능
     const searchNext = this.__parseNextData(html);
 
-    // 너무 많이 잡아서 무한 시도 방지: limit*3 정도만 후보로
-    const maxCandidates = Math.min(30, Math.max(10, limit * 3));
+    // ✅ (A) 후보 과다 금지: limit*2까지만 (최대 12)
+    const maxCandidates = Math.min(12, Math.max(limit, limit * 2));
     const candidateIds: string[] = [];
     const seenPid = new Set<string>();
 
@@ -184,7 +186,6 @@ export class CompetitorService {
     const enrichConcurrency = Math.max(1, Math.min(4, Number(process.env.COMPETITOR_ENRICH_CONCURRENCY || 2)));
     const runLimited = this.__createLimiter(enrichConcurrency);
 
-    // 후보별 기본값 + (필요시) enrich promise를 미리 만들어 둔다
     const base = candidateIds.map((pid) => {
       const name = this.__findNameForPlaceId(searchNext, pid) || "";
       const keywords = this.__findKeywordsForPlaceId(searchNext, pid).slice(0, 5);
@@ -192,32 +193,38 @@ export class CompetitorService {
       return { pid, name, keywords, need };
     });
 
+    // ✅ (A) enrich도 상위 일부만: (limit+2)까지만, 최대 8
+    const needList = base.filter((x) => x.need).slice(0, Math.min(8, limit + 2));
+
+    // ✅ (b) 절대 reject 금지: catch로 빈값 반환
     const enrichPromises = new Map<string, Promise<{ name: string; keywords: string[] }>>();
-    for (const c of base) {
-      if (!c.need) continue;
-      // limiter를 통해 동시에 N개만 실행
-      enrichPromises.set(
-        c.pid,
-        runLimited(() => this.__fetchPlaceHomeAndExtract(c.pid, enrichTimeoutMs))
-      );
+    for (const c of needList) {
+      const p = runLimited(() => this.__fetchPlaceHomeAndExtract(c.pid, enrichTimeoutMs)).catch(() => ({
+        name: "",
+        keywords: []
+      }));
+      enrichPromises.set(c.pid, p);
     }
 
-    // ✅ 순서 유지하면서 결과 채우기 (TOP5)
     const out: Competitor[] = [];
+
     for (const c of base) {
       if (out.length >= limit) break;
+
+      // ✅ 데드라인 초과면 더 enrich 안 기다리고 종료
+      if (Date.now() > deadline) break;
 
       let name = c.name;
       let keywords = c.keywords;
 
       const p = enrichPromises.get(c.pid);
       if (p) {
-        try {
-          const enriched = await p;
+        const remaining = Math.max(1, deadline - Date.now());
+        // 남은 시간이 너무 짧으면 enrich 기다리지 않음
+        if (remaining >= 900) {
+          const enriched = await this.__withTimeout(p, remaining).catch(() => ({ name: "", keywords: [] }));
           if (enriched?.name && !name) name = enriched.name;
           if (enriched?.keywords?.length) keywords = enriched.keywords.slice(0, 5);
-        } catch {
-          // ignore
         }
       }
 
@@ -238,7 +245,6 @@ export class CompetitorService {
       });
     }
 
-    // ✅ 오염 방지(마지막 필터 한번 더)
     return out.map((c) => ({
       ...c,
       keywords: (c.keywords || [])
@@ -314,7 +320,6 @@ export class CompetitorService {
       .trim();
   }
 
-  // ✅ 키워드가 아예 없거나, 브랜드명만 있으면 보강 필요
   private __needKeywordEnrich(keywords: string[], name: string) {
     const ks = Array.isArray(keywords) ? keywords.filter(Boolean) : [];
     if (ks.length >= 3) return false;
@@ -333,9 +338,6 @@ export class CompetitorService {
     return allBrandLike;
   }
 
-  // ==========================
-  // ✅ __NEXT_DATA__ 파싱 + 딥서치
-  // ==========================
   private __parseNextData(html: string): any | null {
     const m = html.match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
     if (!m?.[1]) return null;
@@ -440,7 +442,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 핵심 개선: place home은 “iframe + 네트워크 응답 스니핑”으로 대표키워드 추출
+  // ✅ place home: iframe + 네트워크 응답 스니핑
   // ==========================
   private async __fetchPlaceHomeAndExtract(placeId: string, timeoutMs: number): Promise<{ name: string; keywords: string[] }> {
     const pid = String(placeId).trim();
@@ -456,7 +458,6 @@ export class CompetitorService {
     for (const url of candidates) {
       const r = await this.__renderAndExtractFromPlaceHome(url, Math.max(2500, Math.min(15000, timeoutMs)));
       if (r.keywords.length) return r;
-      // name만 있고 keywords 없으면 다음 후보도 더 시도
     }
 
     return { name: "", keywords: [] };
@@ -466,27 +467,10 @@ export class CompetitorService {
     url: string,
     timeoutMs: number
   ): Promise<{ name: string; keywords: string[] }> {
-    const browser = await this.getBrowser();
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      viewport: { width: 390, height: 844 },
-      locale: "ko-KR"
-    });
+    // ✅ (C) newContext 단계부터 실패해도 절대 throw 하지 않게 감싸기
+    let context: any = null;
+    let page: any = null;
 
-    const page = await context.newPage();
-
-    // 리소스 절약 (단, script/xhr/fetch는 살려야 키워드가 로드될 수 있음)
-    await page.route("**/*", (route) => {
-      const req = route.request();
-      const rtype = req.resourceType();
-      if (rtype === "document" || rtype === "script" || rtype === "xhr" || rtype === "fetch") return route.continue();
-      return route.abort();
-    });
-
-    page.setDefaultTimeout(timeoutMs);
-
-    // ✅ 네트워크 응답에서 대표키워드/이름을 “가로채기”
     const netState = {
       name: "",
       keywords: [] as string[]
@@ -532,12 +516,30 @@ export class CompetitorService {
       }
     };
 
-    page.on("response", onResponse);
-
     try {
+      const browser = await this.getBrowser();
+      context = await browser.newContext({
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        viewport: { width: 390, height: 844 },
+        locale: "ko-KR"
+      });
+
+      page = await context.newPage();
+
+      await page.route("**/*", (route: any) => {
+        const req = route.request();
+        const rtype = req.resourceType();
+        if (rtype === "document" || rtype === "script" || rtype === "xhr" || rtype === "fetch") return route.continue();
+        return route.abort();
+      });
+
+      page.setDefaultTimeout(timeoutMs);
+      page.on("response", onResponse);
+
       await page.goto(url, { waitUntil: "domcontentloaded" });
 
-      // ✅ 핵심: entryIframe 대기 → iframe 내부 HTML/NextData도 파싱
+      // iframe 파싱
       let frameHtml = "";
       const iframeHandle = await page
         .waitForSelector('iframe#entryIframe, iframe[name="entryIframe"]', { timeout: Math.min(7000, timeoutMs) })
@@ -552,9 +554,8 @@ export class CompetitorService {
         }
       }
 
-      // ✅ 키워드가 “늦게” 오는 케이스 대응: 최대 timeout까지 폴링
       const started = Date.now();
-      while (Date.now() - started < Math.min(timeoutMs, 12000)) {
+      while (Date.now() - started < Math.min(timeoutMs, 11000)) {
         if (netState.keywords.length) break;
 
         if (frameHtml) {
@@ -581,7 +582,6 @@ export class CompetitorService {
 
         if (netState.keywords.length) break;
 
-        // iframe html 갱신 시도 (가끔 늦게 hydration)
         if (iframeHandle) {
           const frame = await iframeHandle.contentFrame().catch(() => null);
           if (frame) frameHtml = await frame.content().catch(() => frameHtml);
@@ -590,7 +590,7 @@ export class CompetitorService {
         await page.waitForTimeout(250);
       }
 
-      // ✅ 마지막 name fallback (outer html에서도 og:title 등)
+      // name fallback
       if (!netState.name) {
         const outer = await page.content().catch(() => "");
         const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
@@ -612,27 +612,21 @@ export class CompetitorService {
       return { name: "", keywords: [] };
     } finally {
       try {
-        page.off("response", onResponse);
+        if (page) {
+          page.off("response", onResponse);
+          await page.close();
+        }
       } catch {}
       try {
-        await page.close();
-      } catch {}
-      try {
-        await context.close();
+        if (context) await context.close();
       } catch {}
     }
   }
 
-  /**
-   * ✅ HTML에 들어있는 대표키워드 배열을 직접 뽑는 fallback
-   * - 예: "representKeywordList":["서대문역미용실","..."]
-   * - 또는 "keywordList":[{...}] 형태라도 문자열만 최대한 긁는다
-   */
   private __extractKeywordArrayByRegex(html: string): string[] {
     const text = String(html || "");
-
-    // 1) 가장 흔한 문자열 배열 형태
     const re1 = /"(?:representKeywordList|keywordList|representKeywords|keywords)"\s*:\s*\[([^\]]{1,2000})\]/g;
+
     for (const m of text.matchAll(re1)) {
       const inside = m[1] || "";
       const strs = [...inside.matchAll(/"([^"]{2,40})"/g)]
@@ -645,7 +639,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ (b) 세마포어/리미터: 동시에 N개만 실행
+  // ✅ 세마포어/리미터: 동시에 N개만 실행
   // ==========================
   private __createLimiter(concurrency: number) {
     let active = 0;
@@ -670,10 +664,20 @@ export class CompetitorService {
               next();
             });
         };
-
         queue.push(run);
         next();
       });
     };
+  }
+
+  // ✅ 남은 시간 내로만 기다리는 타임아웃 래퍼 (외부 timeout과 충돌 방지)
+  private async __withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+    const t = new Promise<T>((_, reject) => {
+      const id = setTimeout(() => {
+        clearTimeout(id);
+        reject(new Error("withTimeout"));
+      }, Math.max(1, ms));
+    });
+    return await Promise.race([p, t]);
   }
 }
