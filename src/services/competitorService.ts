@@ -278,8 +278,10 @@ export class CompetitorService {
     }
 
     const candidateMetas = (mapIds.length ? mapIds.map((id) => ({ placeId: id, name: "" })) : metas)
-      .filter((x) => !(exclude && x.placeId === exclude))
-      .slice(0, limit);
+  .map((x) => ({ placeId: this.__normPlaceId(x.placeId), name: this.__cleanText(x.name || "") }))
+  .filter((x) => this.__isValidPlaceId(x.placeId)) // ✅ 13008 같은 오탐 제거
+  .filter((x) => !(exclude && x.placeId === exclude))
+  .slice(0, limit);
 
     console.log("[COMP] query:", q);
     console.log("[COMP] mapIds:", mapIds);
@@ -359,9 +361,12 @@ export class CompetitorService {
     const seen = new Set<string>();
 
     for (const m of html.matchAll(reAnyPlaceId)) {
-      const pid = m[1];
-      if (!pid || seen.has(pid)) continue;
-      seen.add(pid);
+  const pid = m[1];
+  if (!this.__isValidPlaceId(pid)) continue; // ✅ 오탐 제거
+  if (!pid || seen.has(pid)) continue;
+  seen.add(pid);
+  ...
+}
 
       const idx = m.index ?? -1;
       const chunk = idx >= 0 ? html.slice(Math.max(0, idx - 900), Math.min(html.length, idx + 900)) : "";
@@ -665,6 +670,15 @@ export class CompetitorService {
     });
     return await Promise.race([p, t]);
   }
+  private __isValidPlaceId(pid: string) {
+  const s = String(pid || "").trim();
+  // ✅ 네이버 플레이스 업체 ID는 대부분 7자리 이상 (5자리(13008 등)는 거의 오탐)
+  return /^\d{7,12}$/.test(s);
+}
+
+private __normPlaceId(pid: string) {
+  return String(pid || "").trim();
+}
 
   private __createLimiter(concurrency: number) {
     let active = 0;
@@ -770,45 +784,48 @@ export class CompetitorService {
   }
 
   private __extractPlaceIdsFromAnyTextInOrder(text: string): string[] {
-    const ids: string[] = [];
-    const seen = new Set<string>();
-    const s = String(text || "");
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  const s = String(text || "");
 
-    const rePath =
-      /\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})/g;
+  const rePath =
+    /\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})/g;
 
-    for (const m of s.matchAll(rePath)) {
+  for (const m of s.matchAll(rePath)) {
+    const id = m[1];
+    if (!id || seen.has(id)) continue;
+    if (!this.__isValidPlaceId(id)) continue; // ✅ (4) 오탐(13008 등) 제거
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= 120) break;
+  }
+
+  if (ids.length < 10) {
+    const rePlaceId = /placeId["']?\s*[:=]\s*["'](\d{5,12})["']/g;
+    for (const m of s.matchAll(rePlaceId)) {
       const id = m[1];
       if (!id || seen.has(id)) continue;
+      if (!this.__isValidPlaceId(id)) continue; // ✅ (4) 오탐 제거
       seen.add(id);
       ids.push(id);
       if (ids.length >= 120) break;
     }
-
-    if (ids.length < 10) {
-      const rePlaceId = /placeId["']?\s*[:=]\s*["'](\d{5,12})["']/g;
-      for (const m of s.matchAll(rePlaceId)) {
-        const id = m[1];
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
-        ids.push(id);
-        if (ids.length >= 120) break;
-      }
-    }
-
-    if (ids.length < 10) {
-      const reId = /["']id["']\s*:\s*["'](\d{5,12})["']/g;
-      for (const m of s.matchAll(reId)) {
-        const id = m[1];
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
-        ids.push(id);
-        if (ids.length >= 120) break;
-      }
-    }
-
-    return ids;
   }
+
+  if (ids.length < 10) {
+    const reId = /["']id["']\s*:\s*["'](\d{5,12})["']/g;
+    for (const m of s.matchAll(reId)) {
+      const id = m[1];
+      if (!id || seen.has(id)) continue;
+      if (!this.__isValidPlaceId(id)) continue; // ✅ (4) 오탐 제거
+      seen.add(id);
+      ids.push(id);
+      if (ids.length >= 120) break;
+    }
+  }
+
+  return ids;
+}
 
   private __mergeInOrder(a: string[], b: string[]) {
     const out: string[] = [];
