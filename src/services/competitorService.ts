@@ -184,7 +184,7 @@ export class CompetitorService {
 
         const text = await res.text().catch(() => "");
         if (!text) return;
-        if (!/placeId|\/place\/\d{5,12}/.test(text)) return;
+        if (!/(placeId|\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/\d{5,12})/.test(text)) return;
 
         buf.push(text);
         if (buf.length > 35) buf.shift();
@@ -688,34 +688,50 @@ export class CompetitorService {
     return [];
   }
 
-  // ✅ 어떤 텍스트든 placeId를 “등장 순서대로” 뽑는 유틸 (map 응답/HTML 공용)
-  private __extractPlaceIdsFromAnyTextInOrder(text: string): string[] {
-    const ids: string[] = [];
-    const seen = new Set<string>();
-    const s = String(text || "");
+// ✅ 어떤 텍스트든 placeId를 “등장 순서대로” 뽑는 유틸 (map 응답/HTML 공용)
+private __extractPlaceIdsFromAnyTextInOrder(text: string): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  const s = String(text || "");
 
-    // /place/12345
-    for (const m of s.matchAll(/\/place\/(\d{5,12})/g)) {
+  // 1) /{category}/{id} (네이버 플레이스는 업종별 경로가 많음)
+  const rePath = /\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})/g;
+  for (const m of s.matchAll(rePath)) {
+    const id = m[1];
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= 80) break;
+  }
+
+  // 2) placeId:"12345" / placeId: "12345"
+  if (ids.length < 10) {
+    const rePlaceId = /placeId["']?\s*[:=]\s*["'](\d{5,12})["']/g;
+    for (const m of s.matchAll(rePlaceId)) {
       const id = m[1];
       if (!id || seen.has(id)) continue;
       seen.add(id);
       ids.push(id);
       if (ids.length >= 80) break;
     }
-
-    // placeId:"12345"
-    if (ids.length < 10) {
-      for (const m of s.matchAll(/placeId["']?\s*[:=]\s*["'](\d{5,12})["']/g)) {
-        const id = m[1];
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
-        ids.push(id);
-        if (ids.length >= 80) break;
-      }
-    }
-
-    return ids;
   }
+
+  // 3) "id":"12345" (allSearch / 여러 JSON에서 흔함)
+  if (ids.length < 10) {
+    const reId = /["']id["']\s*:\s*["'](\d{5,12})["']/g;
+    for (const m of s.matchAll(reId)) {
+      const id = m[1];
+      if (!id || seen.has(id)) continue;
+      // 너무 많은 숫자 id(다른 객체) 섞이는 걸 조금 방지: 앞뒤에 place 단어가 있으면 우선
+      // (가볍게만 필터)
+      seen.add(id);
+      ids.push(id);
+      if (ids.length >= 80) break;
+    }
+  }
+
+  return ids;
+}
 
   private __mergeInOrder(a: string[], b: string[]) {
     const out: string[] = [];
