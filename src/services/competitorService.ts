@@ -40,9 +40,79 @@ export class CompetitorService {
   }
 
   // ==========================
+  // ✅ 0) (NEW) Naver Map allSearch JSON으로 TOP placeId 추출
+  // - Playwright/HTML 파싱보다 안정적
+  // - User-Agent + Referer 필요 (403/빈값 방지)
+  // ==========================
+  private __pickRandomUA() {
+    const pool = [
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ];
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  private __buildMapReferer(query: string) {
+    const q = encodeURIComponent(query);
+    // 지도 검색 화면에서 온 것처럼
+    return `https://map.naver.com/p/search/${q}?c=15.00,0,0,0,dh`;
+  }
+
+  private async __findTopPlaceIdsViaAllSearch(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
+    const q = String(keyword || "").trim();
+    if (!q) return [];
+
+    const url = new URL("https://map.naver.com/p/api/search/allSearch");
+
+    // ✅ searchCoord: "경도;위도" (기본은 서울시청 근처)
+    //    필요하면 Railway env로 바꿔서 지역 맞추면 됨.
+    const searchCoord = String(process.env.NAVER_MAP_SEARCH_COORD || "126.9780;37.5665");
+    const boundary = String(process.env.NAVER_MAP_BOUNDARY || ""); // 비워도 동작하는 케이스 많음
+
+    url.searchParams.set("query", q);
+    url.searchParams.set("type", "all");
+    url.searchParams.set("page", "1");
+    url.searchParams.set("searchCoord", searchCoord);
+    if (boundary) url.searchParams.set("boundary", boundary);
+
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), Math.max(1, timeoutMs));
+
+    try {
+      const res = await fetch(url.toString(), {
+        method: "GET",
+        headers: {
+          accept: "application/json, text/plain, */*",
+          "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.6,en;q=0.4",
+          "user-agent": this.__pickRandomUA(),
+          referer: this.__buildMapReferer(q)
+        },
+        redirect: "follow",
+        signal: ctrl.signal
+      });
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(`[allSearch] status=${res.status} body=${txt.slice(0, 240)}`);
+      }
+
+      const data: any = await res.json().catch(() => null);
+      const list: any[] = data?.result?.place?.list || [];
+
+      const ids = list
+        .map((x) => (x?.id ? String(x.id) : ""))
+        .filter(Boolean);
+
+      return Array.from(new Set(ids)).slice(0, limit);
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  // ==========================
   // ✅ 1) 지도(=실제 노출) TOP placeId 추출
-  // - HTML 파싱 X (가능한 한)
-  // - JSON 응답 스니핑으로 placeId를 “등장 순서대로” 추출
+  // - (NEW) 1순위: allSearch JSON
+  // - 2순위: Playwright 응답 스니핑(기존)
   // ==========================
   async findTopPlaceIdsFromMapRank(keyword: string, opts: FindTopIdsOptions = {}) {
     const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
@@ -50,6 +120,26 @@ export class CompetitorService {
     const q = String(keyword || "").trim();
     if (!q) return [];
 
+    // ✅ (NEW) 1순위: JSON allSearch (빨라서 짧게 예산)
+    try {
+      const ids = await this.__findTopPlaceIdsViaAllSearch(q, limit + 2, 4500);
+      const out: string[] = [];
+      const seen = new Set<string>();
+      for (const id of ids) {
+        if (!id) continue;
+        if (exclude && id === exclude) continue;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push(id);
+        if (out.length >= limit) break;
+      }
+      if (out.length) return out;
+    } catch (e) {
+      // allSearch가 막히거나 구조가 바뀌면 여기로 떨어짐 → Playwright로 2순위
+      console.warn("[COMP][mapRank] allSearch failed:", e);
+    }
+
+    // ✅ 2순위: 기존 Playwright(모바일 지도) 응답 스니핑
     const url = `https://m.map.naver.com/search2/search.naver?query=${encodeURIComponent(q)}`;
 
     const browser = await this.getBrowser();
@@ -97,7 +187,6 @@ export class CompetitorService {
         if (!/placeId|\/place\/\d{5,12}/.test(text)) return;
 
         buf.push(text);
-        // 너무 쌓이지 않게 컷
         if (buf.length > 35) buf.shift();
       } catch {}
     };
@@ -170,9 +259,10 @@ export class CompetitorService {
     let candidateIds = mapIds;
 
     if (!candidateIds.length) {
-      const fallback = await this.__findTopPlaceIdsFromSearchWherePlace(q, Math.min(12000, Math.max(5000, deadline - Date.now()))).catch(
-        () => []
-      );
+      const fallback = await this.__findTopPlaceIdsFromSearchWherePlace(
+        q,
+        Math.min(12000, Math.max(5000, deadline - Date.now()))
+      ).catch(() => []);
       candidateIds = fallback.filter((x) => !(exclude && x === exclude)).slice(0, limit);
     }
 
@@ -182,10 +272,9 @@ export class CompetitorService {
     const enrichConcurrency = Math.max(1, Math.min(4, Number(process.env.COMPETITOR_ENRICH_CONCURRENCY || 2)));
     const runLimited = this.__createLimiter(enrichConcurrency);
 
+    // ✅ (개선) 경쟁사 일부만 실패해도 결과 유지: allSettled 형태로 안전하게
     const enrichPromises = candidateIds.map((pid) =>
-      runLimited(() => this.__fetchPlaceHomeAndExtract(pid, Math.min(15000, Math.max(7000, deadline - Date.now())))).catch(
-        () => ({ name: "", keywords: [] })
-      )
+      runLimited(() => this.__fetchPlaceHomeAndExtract(pid, Math.min(15000, Math.max(7000, deadline - Date.now()))))
     );
 
     const out: Competitor[] = [];
