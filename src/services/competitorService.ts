@@ -25,9 +25,6 @@ type PlaceMeta = { placeId: string; name: string };
 export class CompetitorService {
   private browser: Browser | null = null;
 
-  // ==========================
-  // ✅ 브라우저(싱글톤)
-  // ==========================
   private async getBrowser() {
     if (this.browser) return this.browser;
     this.browser = await chromium.launch({
@@ -75,7 +72,6 @@ export class CompetitorService {
 
   // ==========================
   // ✅ PlaceId 필터/정규화
-  // - 5자리(13008 등) 오탐이 자주 섞여서 기본 차단
   // ==========================
   private __normPlaceId(pid: string) {
     return String(pid || "").trim();
@@ -87,7 +83,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 공통: Playwright Context 생성(차단 완화)
+  // ✅ Playwright Context 생성
   // ==========================
   private async __newContext(baseReferer: string): Promise<BrowserContext> {
     const browser = await this.getBrowser();
@@ -101,7 +97,6 @@ export class CompetitorService {
       }
     });
 
-    // webdriver 숨김(완벽하진 않지만 조금 도움)
     await context.addInitScript(() => {
       try {
         const nav: any = (globalThis as any).navigator;
@@ -116,7 +111,6 @@ export class CompetitorService {
     const page = await context.newPage();
     page.setDefaultTimeout(Math.max(1000, timeoutMs));
 
-    // 리소스 절약: 이미지/폰트/미디어 차단
     await page.route("**/*", (route) => {
       const rt = route.request().resourceType();
       if (rt === "image" || rt === "font" || rt === "media") return route.abort();
@@ -127,7 +121,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 0) Naver Map allSearch JSON으로 TOP placeId 추출 (가장 빠르고 안정적 시도)
+  // ✅ 0) allSearch JSON
   // ==========================
   private async __findTopPlaceIdsViaAllSearch(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
     const q = String(keyword || "").trim();
@@ -135,7 +129,6 @@ export class CompetitorService {
 
     const url = new URL("https://map.naver.com/p/api/search/allSearch");
 
-    // ✅ 기본은 서울시청 근처, 필요하면 env로 교체
     const searchCoord = String(process.env.NAVER_MAP_SEARCH_COORD || "126.9780;37.5665"); // lng;lat
     const boundary = String(process.env.NAVER_MAP_BOUNDARY || "");
 
@@ -181,9 +174,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 1) 지도(=실제 노출) TOP placeId 추출
-  // - 1순위: allSearch JSON
-  // - 2순위: m.map playwright 스니핑 (Railway에서 500이 자주 나서 최후순위)
+  // ✅ 1) 지도 TOP placeId
   // ==========================
   async findTopPlaceIdsFromMapRank(keyword: string, opts: FindTopIdsOptions = {}) {
     const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
@@ -191,7 +182,7 @@ export class CompetitorService {
     const q = String(keyword || "").trim();
     if (!q) return [];
 
-    // ✅ 1순위: allSearch (짧게)
+    // 1순위 allSearch
     try {
       const ids = await this.__findTopPlaceIdsViaAllSearch(q, limit + 5, 4500);
       const out: string[] = [];
@@ -209,13 +200,12 @@ export class CompetitorService {
       console.warn("[COMP][mapRank] allSearch failed:", e);
     }
 
-    // ✅ 2순위: m.map (막힐 확률 높음)
+    // 2순위 m.map (막힐 확률 높음)
     const url = `https://m.map.naver.com/search2/search.naver?query=${encodeURIComponent(q)}`;
 
     const context = await this.__newContext("https://m.map.naver.com/");
     const page = await this.__newLightPage(context, Number(process.env.MAP_GOTO_TIMEOUT_MS || 25000));
 
-    // xhr/fetch에서 placeId 텍스트만 모은다
     const buf: string[] = [];
     const onResponse = async (res: any) => {
       try {
@@ -252,14 +242,6 @@ export class CompetitorService {
       await page.goto(url, { waitUntil: "domcontentloaded" });
       await page.waitForTimeout(1200);
 
-      try {
-        const title = await page.title().catch(() => "");
-        const htmlLen = (await page.content().catch(() => "")).length;
-        console.log("[COMP][mapRank] finalUrl:", page.url());
-        console.log("[COMP][mapRank] title:", title);
-        console.log("[COMP][mapRank] htmlLen:", htmlLen);
-      } catch {}
-
       const mergedText = buf.join("\n");
       let ids = this.__extractPlaceIdsFromAnyTextInOrder(mergedText);
 
@@ -295,8 +277,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 2) 메인: 경쟁사 추출 + 대표키워드 크롤링
-  // - 핵심: 키워드 수집 실패해도 경쟁사 목록(최소 placeId+name) 반환
+  // ✅ 2) 메인
   // ==========================
   public async findTopCompetitorsByKeyword(keyword: string, opts: FindTopCompetitorsOpts = {}): Promise<Competitor[]> {
     const q = String(keyword || "").trim();
@@ -311,20 +292,15 @@ export class CompetitorService {
     );
     const deadline = this.__deadlineMs(totalTimeoutMs);
 
-    // 1) 지도(노출 순) 1차 시도
     const mapIds = await this.findTopPlaceIdsFromMapRank(q, { excludePlaceId: exclude, limit }).catch(() => []);
 
-    // 2) fallback: search where=place (fetch → 안되면 playwright 렌더)
     let metas: PlaceMeta[] = [];
     if (!mapIds.length) {
       const remain = Math.min(12000, Math.max(5000, this.__remaining(deadline)));
       metas = await this.__findTopPlaceMetasFromSearchWherePlaceFetch(q, remain).catch(() => []);
-      if (!metas.length) {
-        metas = await this.__findTopPlaceMetasFromSearchWherePlaceRendered(q, remain).catch(() => []);
-      }
+      if (!metas.length) metas = await this.__findTopPlaceMetasFromSearchWherePlaceRendered(q, remain).catch(() => []);
     }
 
-    // 후보 메타
     const candidateMetas = (mapIds.length ? mapIds.map((id) => ({ placeId: id, name: "" })) : metas)
       .map((x) => ({ placeId: this.__normPlaceId(x.placeId), name: this.__cleanText(x.name || "") }))
       .filter((x) => this.__isValidPlaceId(x.placeId))
@@ -338,11 +314,8 @@ export class CompetitorService {
     if (!candidateMetas.length) return [];
 
     const nameMap = new Map<string, string>();
-    for (const m of candidateMetas) {
-      if (m.placeId && m.name) nameMap.set(m.placeId, this.__cleanText(m.name));
-    }
+    for (const m of candidateMetas) if (m.placeId && m.name) nameMap.set(m.placeId, this.__cleanText(m.name));
 
-    // enrich 병렬 제한
     const enrichConcurrency = Math.max(1, Math.min(4, Number(process.env.COMPETITOR_ENRICH_CONCURRENCY || 2)));
     const runLimited = this.__createLimiter(enrichConcurrency);
 
@@ -371,7 +344,6 @@ export class CompetitorService {
         .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
         .slice(0, 5);
 
-      // ✅ 상위에서 keywords.length로 필터하면 0 나와버리니, 기본은 플레이스홀더 1개 넣어줌
       const safeKeywords = finalKeywords.length ? finalKeywords : allowEmpty ? [] : ["키워드수집실패"];
 
       out.push({
@@ -387,8 +359,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ fallback(1): where=place HTML(fetch)에서 placeId+name 추출
-  // - 네이버가 초기 HTML에 링크를 안 박는 케이스가 많아서 "있으면 쓰고, 없으면 렌더로 넘어감"
+  // ✅ where=place (fetch)
   // ==========================
   private async __findTopPlaceMetasFromSearchWherePlaceFetch(keyword: string, timeoutMs: number): Promise<PlaceMeta[]> {
     const q = String(keyword || "").trim();
@@ -439,8 +410,8 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ fallback(2): where=place (Playwright 렌더)에서 placeId+name 추출
-  // - "브라우저에선 보이는데 서버 fetch는 빈값" 문제 해결용 핵심
+  // ✅ where=place (render)
+  // - ❗ DOM lib 없이도 TS 빌드되도록: document/HTMLAnchorElement 타입을 안 씀
   // ==========================
   private async __findTopPlaceMetasFromSearchWherePlaceRendered(keyword: string, timeoutMs: number): Promise<PlaceMeta[]> {
     const q = String(keyword || "").trim();
@@ -455,21 +426,25 @@ export class CompetitorService {
       await page.goto(url, { waitUntil: "domcontentloaded" });
       await page.waitForTimeout(700);
 
+      // ✅ 여기서 DOM 타입을 전혀 쓰지 않음 (document, HTMLAnchorElement 등)
       const rows = await page.evaluate(() => {
         const out: Array<{ href: string; text: string }> = [];
-        const anchors = Array.from(
-          document.querySelectorAll<HTMLAnchorElement>(
-            'a[href*="place.naver.com"], a[href*="m.place.naver.com"], a[href*="pcmap.place.naver.com"]'
-          )
+        const d: any = (globalThis as any).document;
+        if (!d || !d.querySelectorAll) return out;
+
+        const nodes: any[] = Array.from(
+          d.querySelectorAll('a[href*="place.naver.com"], a[href*="m.place.naver.com"], a[href*="pcmap.place.naver.com"]')
         );
-        for (const a of anchors) {
-          const href = a.href || "";
-          const text = (a.textContent || "").replace(/\s+/g, " ").trim();
+
+        for (const n of nodes) {
+          const href = String((n && n.href) || "");
+          const text = String((n && (n.textContent || n.innerText)) || "").replace(/\s+/g, " ").trim();
           if (!href) continue;
           if (!text || text.length < 2) continue;
           out.push({ href, text });
           if (out.length >= 300) break;
         }
+
         return out;
       });
 
@@ -480,7 +455,7 @@ export class CompetitorService {
       const seen = new Set<string>();
 
       for (const r of rows) {
-        const m = r.href.match(rePid);
+        const m = String(r.href || "").match(rePid);
         const pid = this.__normPlaceId(m?.[1] || "");
         if (!this.__isValidPlaceId(pid)) continue;
         if (seen.has(pid)) continue;
@@ -493,10 +468,9 @@ export class CompetitorService {
         if (metas.length >= 10) break;
       }
 
-      // ✅ name이 다 비면 id만이라도 뽑아서 반환
       if (!metas.length) {
         const ids = rows
-          .map((r) => this.__normPlaceId(r.href.match(rePid)?.[1] || ""))
+          .map((r) => this.__normPlaceId(String(r.href || "").match(rePid)?.[1] || ""))
           .filter((id) => this.__isValidPlaceId(id));
         const uniq = Array.from(new Set(ids)).slice(0, 10);
         return uniq.map((id) => ({ placeId: id, name: "" }));
@@ -541,7 +515,6 @@ export class CompetitorService {
 
   // ==========================
   // ✅ place home: 대표키워드 추출
-  // - universal /place 먼저 시도(리다이렉트가 잘 됨)
   // ==========================
   private async __fetchPlaceHomeAndExtract(placeId: string, timeoutMs: number): Promise<{ name: string; keywords: string[] }> {
     const pid = this.__normPlaceId(placeId);
@@ -554,8 +527,8 @@ export class CompetitorService {
       `https://m.place.naver.com/cafe/${pid}/home`
     ];
 
-    for (const url of candidates) {
-      const r = await this.__renderAndExtractFromPlaceHome(url, Math.max(2500, Math.min(20000, timeoutMs)));
+    for (const u of candidates) {
+      const r = await this.__renderAndExtractFromPlaceHome(u, Math.max(2500, Math.min(20000, timeoutMs)));
       if (r.keywords.length || r.name) return r;
     }
 
@@ -686,9 +659,6 @@ export class CompetitorService {
     }
   }
 
-  // ==========================
-  // ✅ DOM 기반 대표키워드 추출(iframe 내부)
-  // ==========================
   private async __extractKeywordsFromDom(frame: any): Promise<string[]> {
     const raw: string[] = await frame.evaluate(() => {
       const texts: string[] = [];
@@ -741,7 +711,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // helpers
+  // generic helpers
   // ==========================
   private async __withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
     const t = new Promise<T>((_, reject) => {
@@ -856,7 +826,6 @@ export class CompetitorService {
     return [];
   }
 
-  // ✅ 어떤 텍스트든 placeId를 “등장 순서대로” 뽑는 유틸
   private __extractPlaceIdsFromAnyTextInOrder(text: string): string[] {
     const ids: string[] = [];
     const seen = new Set<string>();
