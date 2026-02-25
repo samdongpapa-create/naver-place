@@ -336,52 +336,49 @@ export class CompetitorService {
   // ==========================
   // ✅ fallback: where=place HTML에서 placeId + name TOP 추출
   // ==========================
-  private async __findTopPlaceMetasFromSearchWherePlace(keyword: string, timeoutMs: number): Promise<PlaceMeta[]> {
-    const q = String(keyword || "").trim();
-    if (!q) return [];
+private async __findTopPlaceMetasFromSearchWherePlace(keyword: string, timeoutMs: number): Promise<{ placeId: string; name: string }[]> {
+  const q = String(keyword || "").trim();
+  if (!q) return [];
 
-    const url = `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`;
-    const html = await this.__fetchHtml(url, timeoutMs);
+  const url = `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`;
+  const html = await this.__fetchHtml(url, timeoutMs);
 
-    // 1) 먼저 placeId를 많이 뽑고
-    const ids = this.__extractPlaceIdsFromAnyTextInOrder(html).slice(0, 30);
+  // 1) place 링크를 먼저 찾고 (업종 경로 포함)
+  const reLink =
+    /https?:\/\/m\.place\.naver\.com\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})(?:\/|["'?\s])/g;
 
-    // 2) id 주변 텍스트에서 name을 최대한 뽑기(완벽할 필요 없음, name만 채우면 상위에서 안 버림)
-    const metas: PlaceMeta[] = [];
-    const seen = new Set<string>();
+  const metas: { placeId: string; name: string }[] = [];
+  const seen = new Set<string>();
 
-    for (const id of ids) {
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
+  for (const m of html.matchAll(reLink)) {
+    const pid = m[1];
+    if (!pid || seen.has(pid)) continue;
+    seen.add(pid);
 
-      // id가 나오는 위치 근처를 잘라서 name 후보를 찾는다
-      const idx = html.indexOf(id);
-      const chunk = idx >= 0 ? html.slice(Math.max(0, idx - 600), Math.min(html.length, idx + 600)) : "";
+    // 링크 주변 1500자에서 업체명 후보를 뽑는다
+    const idx = m.index ?? -1;
+    const chunk = idx >= 0 ? html.slice(Math.max(0, idx - 800), Math.min(html.length, idx + 800)) : "";
 
-      let name = "";
+    // (A) title="업체명" 우선 (저장/길찾기/예약 제외)
+    const titleMatches = [...chunk.matchAll(/title=["']([^"']{2,80})["']/gi)]
+      .map((x) => this.__cleanText(x[1]))
+      .filter(Boolean)
+      .filter((t) => !/^(저장|길찾기|예약|전화|공유|블로그|리뷰|사진)$/i.test(t));
 
-      // (A) title="업체명"
-      const m1 = chunk.match(/title=["']([^"']{2,80})["']/i);
-      if (m1?.[1]) name = m1[1];
+    // (B) <a ...>텍스트</a> 후보 (저장 제외)
+    const textMatches = [...chunk.matchAll(/>\s*([가-힣A-Za-z0-9][^<>]{1,40})\s*</g)]
+      .map((x) => this.__cleanText(x[1]))
+      .filter(Boolean)
+      .filter((t) => !/^(저장|길찾기|예약|전화|공유|블로그|리뷰|사진)$/i.test(t));
 
-      // (B) aria-label="업체명"
-      if (!name) {
-        const m2 = chunk.match(/aria-label=["']([^"']{2,80})["']/i);
-        if (m2?.[1]) name = m2[1];
-      }
+    const name = titleMatches[0] || textMatches[0] || "";
 
-      // (C) >업체명< (너무 길거나 태그 섞이면 걸러짐)
-      if (!name) {
-        const m3 = chunk.match(/>\s*([가-힣A-Za-z0-9][^<>]{1,40})\s*</);
-        if (m3?.[1]) name = m3[1];
-      }
-
-      metas.push({ placeId: id, name: this.__cleanText(name) });
-      if (metas.length >= 10) break;
-    }
-
-    return metas;
+    metas.push({ placeId: pid, name });
+    if (metas.length >= 10) break;
   }
+
+  return metas;
+}
 
   private async __fetchHtml(url: string, timeoutMs: number): Promise<string> {
     const ctrl = new AbortController();
@@ -501,7 +498,19 @@ export class CompetitorService {
       page.setDefaultTimeout(timeoutMs);
       page.on("response", onResponse);
 
-      await page.goto(url, { waitUntil: "domcontentloaded" });
+      const resp = await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => null);
+
+const status = resp?.status?.() ?? -1;
+const finalUrl = page.url();
+const outer = await page.content().catch(() => "");
+const title = await page.title().catch(() => "");
+
+console.log("[COMP][placeHome] goto", { status, url, finalUrl, title, htmlLen: outer.length });
+
+// htmlLen 너무 작으면 body 앞부분도 찍어서 차단/에러 페이지인지 확인
+if (outer.length > 0 && outer.length < 300) {
+  console.log("[COMP][placeHome] tinyHtmlHead:", outer.slice(0, 200));
+}
 
       // ✅ place 차단/축소 응답 확인용(너무 시끄러우면 나중에 지워도 됨)
       try {
