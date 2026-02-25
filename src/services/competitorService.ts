@@ -83,6 +83,31 @@ export class CompetitorService {
   }
 
   // ==========================
+  // ✅ Text util
+  // ==========================
+  private __cleanText(s: string) {
+    return String(s || "")
+      .replace(/\\u003c/g, "<")
+      .replace(/\\u003e/g, ">")
+      .replace(/&quot;|&#34;/g, '"')
+      .replace(/&amp;/g, "&")
+      .replace(/\s+/g, " ")
+      .replace(/[^\w가-힣\s\-·]/g, "")
+      .trim();
+  }
+
+  private __isBannedName(name: string) {
+    const n = this.__cleanText(name);
+    if (!n) return true;
+    // ✅ “광고”가 업체명으로 들어오는 케이스 확실히 차단
+    if (/^(광고|저장|길찾기|예약|전화|공유|블로그|리뷰|사진|홈|메뉴|가격)$/i.test(n)) return true;
+    // ✅ 플레이스 공통 타이틀류 차단
+    if (/^네이버\s*플레이스$/i.test(n)) return true;
+    if (/네이버\s*플레이스/i.test(n) && n.length <= 12) return true;
+    return false;
+  }
+
+  // ==========================
   // ✅ Playwright Context 생성
   // ==========================
   private async __newContext(baseReferer: string): Promise<BrowserContext> {
@@ -313,17 +338,21 @@ export class CompetitorService {
 
     if (!candidateMetas.length) return [];
 
+    // ✅ 광고/저장 같은 name은 nameMap에 넣지 않는다
     const nameMap = new Map<string, string>();
-    for (const m of candidateMetas) if (m.placeId && m.name) nameMap.set(m.placeId, this.__cleanText(m.name));
+    for (const m of candidateMetas) {
+      const nm = this.__cleanText(m.name || "");
+      if (m.placeId && nm && !this.__isBannedName(nm)) nameMap.set(m.placeId, nm);
+    }
 
     const enrichConcurrency = Math.max(1, Math.min(4, Number(process.env.COMPETITOR_ENRICH_CONCURRENCY || 2)));
     const runLimited = this.__createLimiter(enrichConcurrency);
 
     const enrichPromises = candidateMetas.map((m) =>
-      runLimited(() => this.__fetchPlaceHomeAndExtract(m.placeId, Math.min(15000, Math.max(7000, this.__remaining(deadline)))))
+      runLimited(() =>
+        this.__fetchPlaceHomeAndExtract(m.placeId, Math.min(15000, Math.max(7000, this.__remaining(deadline))))
+      ).catch(() => ({ name: "", keywords: [] as string[] }))
     );
-
-    const allowEmpty = String(process.env.ALLOW_EMPTY_COMP_KEYWORDS || "") === "1";
 
     const out: Competitor[] = [];
     for (let i = 0; i < candidateMetas.length && out.length < limit; i++) {
@@ -333,9 +362,14 @@ export class CompetitorService {
       const remaining = this.__remaining(deadline);
 
       const enriched = await this.__withTimeout(enrichPromises[i], remaining).catch(() => ({ name: "", keywords: [] as string[] }));
-      const fallbackName = nameMap.get(pid) || "";
 
-      const finalName = this.__cleanText(enriched?.name || fallbackName || "") || `place_${pid}`;
+      const fallbackName = nameMap.get(pid) || "";
+      const enrichedName = this.__cleanText(enriched?.name || "");
+
+      // ✅ “네이버 플레이스/광고” 같은 잡음이면 버리고 place_로라도 세팅
+      let finalName = this.__cleanText(enrichedName || fallbackName || "");
+      if (this.__isBannedName(finalName)) finalName = "";
+      if (!finalName) finalName = `place_${pid}`;
 
       const finalKeywords = (enriched?.keywords || [])
         .map((k) => this.__cleanText(k))
@@ -344,13 +378,14 @@ export class CompetitorService {
         .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
         .slice(0, 5);
 
-      const safeKeywords = finalKeywords.length ? finalKeywords : allowEmpty ? [] : ["키워드수집실패"];
+      // ✅ 절대 빈 배열로 반환하지 않게(상위 필터가 있어도 살아남도록)
+      const safeKeywords = finalKeywords.length ? finalKeywords : ["키워드수집실패"];
 
       out.push({
         placeId: pid,
         name: finalName,
         keywords: safeKeywords,
-        source: safeKeywords.length && safeKeywords[0] !== "키워드수집실패" ? "place_home" : "search_html",
+        source: safeKeywords[0] !== "키워드수집실패" ? "place_home" : "search_html",
         rank: out.length + 1
       });
     }
@@ -371,8 +406,6 @@ export class CompetitorService {
     const reAnyPlaceId =
       /https?:\/\/(?:m\.place\.naver\.com|pcmap\.place\.naver\.com|place\.naver\.com)\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})/g;
 
-    const banned = /^(저장|길찾기|예약|전화|공유|블로그|리뷰|사진|홈|메뉴|가격)$/i;
-
     const metas: PlaceMeta[] = [];
     const seen = new Set<string>();
 
@@ -388,21 +421,20 @@ export class CompetitorService {
       const titleMatches = [...chunk.matchAll(/title=["']([^"']{2,80})["']/gi)]
         .map((x) => this.__cleanText(x[1]))
         .filter(Boolean)
-        .filter((t) => !banned.test(t));
+        .filter((t) => !this.__isBannedName(t));
 
       const ariaMatches = [...chunk.matchAll(/aria-label=["']([^"']{2,80})["']/gi)]
         .map((x) => this.__cleanText(x[1]))
         .filter(Boolean)
-        .filter((t) => !banned.test(t));
+        .filter((t) => !this.__isBannedName(t));
 
       const textMatches = [...chunk.matchAll(/>\s*([가-힣A-Za-z0-9][^<>]{1,50})\s*</g)]
         .map((x) => this.__cleanText(x[1]))
         .filter(Boolean)
-        .filter((t) => !banned.test(t));
+        .filter((t) => !this.__isBannedName(t));
 
       const name = titleMatches[0] || ariaMatches[0] || textMatches[0] || "";
       metas.push({ placeId: pid, name });
-
       if (metas.length >= 10) break;
     }
 
@@ -411,7 +443,8 @@ export class CompetitorService {
 
   // ==========================
   // ✅ where=place (render)
-  // - ❗ DOM lib 없이도 TS 빌드되도록: document/HTMLAnchorElement 타입을 안 씀
+  // - ❗ DOM lib 없이도 TS 빌드되도록: document/HTMLElement 타입을 안 씀
+  // - ✅ “광고” 텍스트가 아니라 결과 카드에서 업체명을 뽑도록 강화
   // ==========================
   private async __findTopPlaceMetasFromSearchWherePlaceRendered(keyword: string, timeoutMs: number): Promise<PlaceMeta[]> {
     const q = String(keyword || "").trim();
@@ -424,53 +457,101 @@ export class CompetitorService {
 
     try {
       await page.goto(url, { waitUntil: "domcontentloaded" });
-      await page.waitForTimeout(700);
+      await page.waitForTimeout(800);
 
-      // ✅ 여기서 DOM 타입을 전혀 쓰지 않음 (document, HTMLAnchorElement 등)
-      const rows = await page.evaluate(() => {
-        const out: Array<{ href: string; text: string }> = [];
+      const items = await page.evaluate(() => {
         const d: any = (globalThis as any).document;
+        const out: Array<{ placeId: string; name: string }> = [];
         if (!d || !d.querySelectorAll) return out;
 
-        const nodes: any[] = Array.from(
+        const linkNodes: any[] = Array.from(
           d.querySelectorAll('a[href*="place.naver.com"], a[href*="m.place.naver.com"], a[href*="pcmap.place.naver.com"]')
         );
 
-        for (const n of nodes) {
-          const href = String((n && n.href) || "");
-          const text = String((n && (n.textContent || n.innerText)) || "").replace(/\s+/g, " ").trim();
-          if (!href) continue;
-          if (!text || text.length < 2) continue;
-          out.push({ href, text });
-          if (out.length >= 300) break;
+        const rePid = /\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})/;
+
+        const pickNameFromContainer = (el: any) => {
+          // 가까운 카드/리스트 아이템 컨테이너에서 “업체명으로 보이는 텍스트”를 우선 추출
+          let cur: any = el;
+          for (let i = 0; i < 8 && cur; i++) {
+            const tag = String(cur.tagName || "").toLowerCase();
+            if (tag === "li" || tag === "article" || tag === "section" || tag === "div") break;
+            cur = cur.parentElement;
+          }
+          const root = cur || el;
+
+          const candidates: any[] = [];
+          const sels = [
+            'span[class*="tit"]',
+            'a[class*="tit"]',
+            'strong',
+            'span[class*="name"]',
+            'a[class*="name"]',
+            'span'
+          ];
+          for (const sel of sels) {
+            const ns: any[] = Array.from(root.querySelectorAll(sel));
+            for (const n of ns) candidates.push(n);
+            if (candidates.length > 30) break;
+          }
+
+          const texts: string[] = [];
+          for (const n of candidates) {
+            const t = String((n && (n.textContent || n.innerText)) || "").replace(/\s+/g, " ").trim();
+            if (!t) continue;
+            if (t.length < 2 || t.length > 40) continue;
+            texts.push(t);
+            if (texts.length >= 30) break;
+          }
+
+          // fallback: 링크 텍스트
+          const fallback = String((el && (el.textContent || el.innerText)) || "").replace(/\s+/g, " ").trim();
+          if (fallback) texts.unshift(fallback);
+
+          // 너무 흔한 버튼/라벨류 제거는 서버단에서 한 번 더 함
+          return texts[0] || "";
+        };
+
+        for (const a of linkNodes) {
+          const href = String(a?.href || "");
+          const m = href.match(rePid);
+          const pid = String(m?.[1] || "").trim();
+          if (!pid) continue;
+
+          const name = pickNameFromContainer(a);
+          out.push({ placeId: pid, name });
+
+          if (out.length >= 200) break;
         }
 
         return out;
       });
 
-      const banned = /^(저장|길찾기|예약|전화|공유|블로그|리뷰|사진|홈|메뉴|가격)$/i;
-      const rePid = /\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})/;
-
       const metas: PlaceMeta[] = [];
       const seen = new Set<string>();
 
-      for (const r of rows) {
-        const m = String(r.href || "").match(rePid);
-        const pid = this.__normPlaceId(m?.[1] || "");
+      for (const it of items) {
+        const pid = this.__normPlaceId(it.placeId);
         if (!this.__isValidPlaceId(pid)) continue;
         if (seen.has(pid)) continue;
 
-        const name = this.__cleanText(r.text);
-        if (!name || banned.test(name)) continue;
+        const name = this.__cleanText(it.name || "");
+        if (name && this.__isBannedName(name)) {
+          // name이 “광고/저장” 같은 쓰레기면 name 없이라도 pid는 확보
+          seen.add(pid);
+          metas.push({ placeId: pid, name: "" });
+        } else {
+          seen.add(pid);
+          metas.push({ placeId: pid, name });
+        }
 
-        seen.add(pid);
-        metas.push({ placeId: pid, name });
         if (metas.length >= 10) break;
       }
 
+      // 마지막 보루: pid만이라도 반환
       if (!metas.length) {
-        const ids = rows
-          .map((r) => this.__normPlaceId(String(r.href || "").match(rePid)?.[1] || ""))
+        const ids = items
+          .map((x) => this.__normPlaceId(x.placeId))
           .filter((id) => this.__isValidPlaceId(id));
         const uniq = Array.from(new Set(ids)).slice(0, 10);
         return uniq.map((id) => ({ placeId: id, name: "" }));
@@ -563,7 +644,7 @@ export class CompetitorService {
 
         if (!netState.name) {
           const nm = this.__deepFindName(j);
-          if (nm) netState.name = nm;
+          if (nm && !this.__isBannedName(nm)) netState.name = nm;
         }
 
         if (!netState.keywords.length) {
@@ -608,7 +689,8 @@ export class CompetitorService {
       if (frameHtml) {
         const next = this.__parseNextData(frameHtml);
 
-        if (!netState.name) netState.name = this.__deepFindName(next) || netState.name;
+        const nm = this.__deepFindName(next);
+        if (!netState.name && nm && !this.__isBannedName(nm)) netState.name = nm;
 
         if (!netState.keywords.length) {
           for (const k of ["keywordList", "representKeywordList", "representKeywords", "keywords"]) {
@@ -633,7 +715,8 @@ export class CompetitorService {
 
       if (!netState.name) {
         const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
-        if (m1?.[1]) netState.name = this.__cleanText(m1[1]);
+        const og = m1?.[1] ? this.__cleanText(m1[1]) : "";
+        if (og && !this.__isBannedName(og)) netState.name = og;
       }
 
       const cleanedKeywords = (netState.keywords || [])
@@ -796,22 +879,14 @@ export class CompetitorService {
         const v = (h as any)[k];
         if (typeof v === "string") {
           const t = this.__cleanText(v);
-          if (t && t.length >= 2 && t.length <= 60) return t;
+          // ✅ “네이버 플레이스” 같은 공통 타이틀은 무시
+          if (!t) continue;
+          if (this.__isBannedName(t)) continue;
+          if (t.length >= 2 && t.length <= 60) return t;
         }
       }
     }
     return "";
-  }
-
-  private __cleanText(s: string) {
-    return String(s || "")
-      .replace(/\\u003c/g, "<")
-      .replace(/\\u003e/g, ">")
-      .replace(/&quot;|&#34;/g, '"')
-      .replace(/&amp;/g, "&")
-      .replace(/\s+/g, " ")
-      .replace(/[^\w가-힣\s\-·]/g, "")
-      .trim();
   }
 
   private __extractKeywordArrayByRegex(html: string): string[] {
