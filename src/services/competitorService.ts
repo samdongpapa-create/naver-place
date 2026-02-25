@@ -106,7 +106,7 @@ export class CompetitorService {
   // ==========================
   // ✅ 1) 지도(=실제 노출) TOP placeId 추출
   // - 1순위: allSearch JSON
-  // - 2순위: Playwright(모바일 지도) 스니핑
+  // - 2순위: Playwright(모바일 지도) 스니핑 (이건 500이 자주 나서 "있으면 줌" 수준)
   // ==========================
   async findTopPlaceIdsFromMapRank(keyword: string, opts: FindTopIdsOptions = {}) {
     const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
@@ -132,7 +132,7 @@ export class CompetitorService {
       console.warn("[COMP][mapRank] allSearch failed:", e);
     }
 
-    // ✅ 2순위: m.map (Railway에서 500 나는 케이스)
+    // ✅ 2순위: m.map (Railway에서 500 나는 케이스가 많아서, 실패해도 그냥 빈 배열)
     const url = `https://m.map.naver.com/search2/search.naver?query=${encodeURIComponent(q)}`;
 
     const browser = await this.getBrowser();
@@ -179,12 +179,7 @@ export class CompetitorService {
         const text = await res.text().catch(() => "");
         if (!text) return;
 
-        if (
-          !/(placeId|\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/\d{5,12})/.test(
-            text
-          )
-        )
-          return;
+        if (!/(placeId|\/(?:place|hairshop|restaurant|cafe|beauty)\/\d{5,12})/.test(text)) return;
 
         buf.push(text);
         if (buf.length > 50) buf.shift();
@@ -206,14 +201,6 @@ export class CompetitorService {
       await page.goto(url, { waitUntil: "domcontentloaded" });
       await page.waitForTimeout(1200);
 
-      try {
-        const title = await page.title().catch(() => "");
-        const htmlLen = (await page.content().catch(() => "")).length;
-        console.log("[COMP][mapRank] finalUrl:", page.url());
-        console.log("[COMP][mapRank] title:", title);
-        console.log("[COMP][mapRank] htmlLen:", htmlLen);
-      } catch {}
-
       const mergedText = buf.join("\n");
       let ids = this.__extractPlaceIdsFromAnyTextInOrder(mergedText);
 
@@ -234,6 +221,8 @@ export class CompetitorService {
       }
 
       return out;
+    } catch {
+      return [];
     } finally {
       try {
         page.off("response", onResponse);
@@ -250,7 +239,7 @@ export class CompetitorService {
 
   // ==========================
   // ✅ 2) 메인: 경쟁사 추출 + 대표키워드 크롤링
-  // - 핵심: 키워드 실패해도 경쟁사 반환(0 방지)
+  // - 핵심: 후보 placeId가 "진짜 미용실"인지 1차 검증 후 enrich
   // ==========================
   public async findTopCompetitorsByKeyword(keyword: string, opts: FindTopCompetitorsOpts = {}): Promise<Competitor[]> {
     const q = String(keyword || "").trim();
@@ -277,11 +266,31 @@ export class CompetitorService {
       ).catch(() => []);
     }
 
-    const candidateMetas = (mapIds.length ? mapIds.map((id) => ({ placeId: id, name: "" })) : metas)
+    // 후보 구성
+    const rawCandidates = (mapIds.length ? mapIds.map((id) => ({ placeId: id, name: "" })) : metas)
       .map((x) => ({ placeId: this.__normPlaceId(x.placeId), name: this.__cleanText(x.name || "") }))
-      .filter((x) => this.__isValidPlaceId(x.placeId)) // ✅ 13008 같은 오탐 제거
+      .filter((x) => this.__isValidPlaceId(x.placeId))
       .filter((x) => !(exclude && x.placeId === exclude))
-      .slice(0, limit);
+      .slice(0, Math.max(10, limit * 3)); // ✅ 검증에서 떨어질 수 있으니 여유 확보
+
+    if (!rawCandidates.length) return [];
+
+    // ✅ "미용실/헤어/살롱" 쿼리면 hairshop만 남기기
+    const needHairshop = /(미용실|헤어|살롱|펌|컷|커트|염색)/.test(q);
+
+    const checked: PlaceMeta[] = [];
+    for (const c of rawCandidates) {
+      if (Date.now() > deadline) break;
+      const kind = await this.__resolvePlaceType(c.placeId, Math.min(3500, Math.max(800, deadline - Date.now()))).catch(
+        () => "unknown"
+      );
+
+      if (needHairshop && kind !== "hairshop") continue;
+      checked.push(c);
+      if (checked.length >= limit) break;
+    }
+
+    const candidateMetas = checked.slice(0, limit);
 
     console.log("[COMP] query:", q);
     console.log("[COMP] mapIds:", mapIds);
@@ -324,7 +333,6 @@ export class CompetitorService {
         .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
         .slice(0, 5);
 
-      // ✅ 상위에서 keywords.length로 필터하면 0 나와버리니, 기본은 플레이스홀더 1개 넣어줌
       const safeKeywords = finalKeywords.length ? finalKeywords : allowEmpty ? [] : ["키워드수집실패"];
 
       out.push({
@@ -340,9 +348,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ fallback: where=place HTML에서 placeId + name TOP 추출 (강화판)
-  // - m.place / pcmap.place / place.naver.com 등 링크 다양성 대응
-  // - "저장" 같은 버튼 텍스트를 name으로 잡는 문제 방지
+  // ✅ fallback: where=place HTML에서 placeId + name TOP 추출
   // ==========================
   private async __findTopPlaceMetasFromSearchWherePlace(keyword: string, timeoutMs: number): Promise<PlaceMeta[]> {
     const q = String(keyword || "").trim();
@@ -362,11 +368,10 @@ export class CompetitorService {
     for (const m of html.matchAll(reAnyPlaceId)) {
       const pid = String(m[1] || "").trim();
       if (!pid) continue;
-      if (!this.__isValidPlaceId(pid)) continue; // ✅ 오탐 제거(13008 등)
+      if (!this.__isValidPlaceId(pid)) continue;
       if (seen.has(pid)) continue;
       seen.add(pid);
 
-      // 링크 주변 chunk에서 업체명 후보 추출
       const idx = m.index ?? -1;
       const chunk = idx >= 0 ? html.slice(Math.max(0, idx - 900), Math.min(html.length, idx + 900)) : "";
 
@@ -388,10 +393,9 @@ export class CompetitorService {
       const name = titleMatches[0] || ariaMatches[0] || textMatches[0] || "";
 
       metas.push({ placeId: pid, name });
-      if (metas.length >= 10) break;
+      if (metas.length >= 20) break;
     }
 
-    // 마지막 보루: 텍스트 전체에서 placeId만 뽑아서 name 비우고라도 채움
     if (!metas.length) {
       const ids = this.__extractPlaceIdsFromAnyTextInOrder(html).slice(0, 10);
       return ids.map((id) => ({ placeId: id, name: "" }));
@@ -426,19 +430,62 @@ export class CompetitorService {
   }
 
   // ==========================
+  // ✅ placeId가 "어떤 업종 path로 라우팅되는지" 빠르게 판별
+  // - Playwright 쓰지 않고 fetch로 리다이렉트 최종 URL만 본다
+  // ==========================
+  private async __resolvePlaceType(
+    placeId: string,
+    timeoutMs: number
+  ): Promise<"hairshop" | "restaurant" | "cafe" | "place" | "unknown"> {
+    const pid = String(placeId || "").trim();
+    if (!pid) return "unknown";
+
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), Math.max(1, timeoutMs));
+
+    try {
+      const res = await fetch(`https://m.place.naver.com/place/${pid}/home`, {
+        method: "GET",
+        redirect: "follow",
+        signal: ctrl.signal,
+        headers: {
+          "user-agent": this.__pickRandomUA(),
+          "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.6,en;q=0.4",
+          referer: "https://m.place.naver.com/"
+        }
+      });
+
+      const finalUrl = String((res as any)?.url || "");
+      if (/\/hairshop\/\d+\//.test(finalUrl)) return "hairshop";
+      if (/\/restaurant\/\d+\//.test(finalUrl)) return "restaurant";
+      if (/\/cafe\/\d+\//.test(finalUrl)) return "cafe";
+      if (/\/place\/\d+\//.test(finalUrl)) return "place";
+      return "unknown";
+    } catch {
+      return "unknown";
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  // ==========================
   // ✅ place home: 업종 경로 후보 → iframe + 데이터 + DOM fallback
   // ==========================
   private async __fetchPlaceHomeAndExtract(placeId: string, timeoutMs: number): Promise<{ name: string; keywords: string[] }> {
     const pid = String(placeId).trim();
     if (!pid) return { name: "", keywords: [] };
 
-    // ✅ universal 먼저 시도(리다이렉트/라우팅되는 케이스가 있음)
-    const candidates = [
-      `https://m.place.naver.com/place/${pid}/home`,
-      `https://m.place.naver.com/hairshop/${pid}/home`,
-      `https://m.place.naver.com/restaurant/${pid}/home`,
-      `https://m.place.naver.com/cafe/${pid}/home`
-    ];
+    // ✅ 먼저 최종 업종을 판별해서 "맞는 path"만 때린다 (불필요한 hairshop/restaurant/cafe 연타 방지)
+    const kind = await this.__resolvePlaceType(pid, Math.min(3500, timeoutMs)).catch(() => "unknown");
+
+    const candidates =
+      kind === "hairshop"
+        ? [`https://m.place.naver.com/hairshop/${pid}/home`, `https://m.place.naver.com/place/${pid}/home`]
+        : kind === "restaurant"
+          ? [`https://m.place.naver.com/restaurant/${pid}/home`, `https://m.place.naver.com/place/${pid}/home`]
+          : kind === "cafe"
+            ? [`https://m.place.naver.com/cafe/${pid}/home`, `https://m.place.naver.com/place/${pid}/home`]
+            : [`https://m.place.naver.com/place/${pid}/home`];
 
     for (const url of candidates) {
       const r = await this.__renderAndExtractFromPlaceHome(url, Math.max(2500, Math.min(20000, timeoutMs)));
@@ -531,13 +578,14 @@ export class CompetitorService {
       const pageTitle = await page.title().catch(() => "");
 
       console.log("[COMP][placeHome] goto", { status, url, finalUrl, title: pageTitle, htmlLen: outer.length });
-      if (outer.length > 0 && outer.length < 300) {
-        console.log("[COMP][placeHome] tinyHtmlHead:", outer.slice(0, 200));
-      }
       if (outer.length < 500) console.warn("[COMP][placeHome] suspicious htmlLen", outer.length, "url=", url, "title=", pageTitle);
 
+      // ✅ iframe selector fallback 강화
       const iframeHandle = await page
-        .waitForSelector('iframe#entryIframe, iframe[name="entryIframe"]', { timeout: Math.min(8000, timeoutMs) })
+        .waitForSelector(
+          'iframe#entryIframe, iframe[name="entryIframe"], iframe[src*="entry"], iframe[src*="/entry"]',
+          { timeout: Math.min(9000, timeoutMs) }
+        )
         .catch(() => null);
 
       let frame: any = null;
@@ -546,6 +594,21 @@ export class CompetitorService {
       if (frame) {
         await frame.waitForLoadState("domcontentloaded").catch(() => {});
         await frame.waitForSelector('script#__NEXT_DATA__', { timeout: Math.min(6500, timeoutMs) }).catch(() => {});
+      }
+
+      // ✅ frame이 없으면 outer에서라도 NEXT_DATA 시도
+      const outerNext = this.__parseNextData(outer);
+      if (outerNext) {
+        if (!netState.name) netState.name = this.__deepFindName(outerNext) || netState.name;
+        if (!netState.keywords.length) {
+          for (const k of ["keywordList", "representKeywordList", "representKeywords", "keywords"]) {
+            const arr = this.__deepFindStringArray(outerNext, k);
+            if (arr.length) {
+              netState.keywords = arr;
+              break;
+            }
+          }
+        }
       }
 
       const frameHtml = frame ? await frame.content().catch(() => "") : "";
@@ -670,7 +733,7 @@ export class CompetitorService {
 
   private __isValidPlaceId(pid: string) {
     const s = String(pid || "").trim();
-    // ✅ 네이버 플레이스 업체 ID는 대부분 7자리 이상 (5자리(13008 등)는 거의 오탐)
+    // ✅ 네이버 플레이스 업체 ID는 보통 7자리 이상
     return /^\d{7,12}$/.test(s);
   }
 
@@ -786,13 +849,12 @@ export class CompetitorService {
     const seen = new Set<string>();
     const s = String(text || "");
 
-    const rePath =
-      /\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})/g;
+    const rePath = /\/(?:place|hairshop|restaurant|cafe|beauty|bakery)\/(\d{5,12})/g;
 
     for (const m of s.matchAll(rePath)) {
       const id = m[1];
       if (!id || seen.has(id)) continue;
-      if (!this.__isValidPlaceId(id)) continue; // ✅ 오탐(13008 등) 제거
+      if (!this.__isValidPlaceId(id)) continue; // ✅ 오탐 제거
       seen.add(id);
       ids.push(id);
       if (ids.length >= 120) break;
@@ -803,7 +865,7 @@ export class CompetitorService {
       for (const m of s.matchAll(rePlaceId)) {
         const id = m[1];
         if (!id || seen.has(id)) continue;
-        if (!this.__isValidPlaceId(id)) continue; // ✅ 오탐 제거
+        if (!this.__isValidPlaceId(id)) continue;
         seen.add(id);
         ids.push(id);
         if (ids.length >= 120) break;
@@ -815,7 +877,7 @@ export class CompetitorService {
       for (const m of s.matchAll(reId)) {
         const id = m[1];
         if (!id || seen.has(id)) continue;
-        if (!this.__isValidPlaceId(id)) continue; // ✅ 오탐 제거
+        if (!this.__isValidPlaceId(id)) continue;
         seen.add(id);
         ids.push(id);
         if (ids.length >= 120) break;
