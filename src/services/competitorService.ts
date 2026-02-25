@@ -20,6 +20,8 @@ type FindTopCompetitorsOpts = {
   timeoutMs?: number; // 전체 예산(상한)
 };
 
+type PlaceMeta = { placeId: string; name: string };
+
 export class CompetitorService {
   private browser: Browser | null = null;
 
@@ -94,10 +96,7 @@ export class CompetitorService {
       const data: any = await res.json().catch(() => null);
       const list: any[] = data?.result?.place?.list || [];
 
-      const ids = list
-        .map((x) => (x?.id ? String(x.id) : ""))
-        .filter(Boolean);
-
+      const ids = list.map((x) => (x?.id ? String(x.id) : "")).filter(Boolean);
       return Array.from(new Set(ids)).slice(0, limit);
     } finally {
       clearTimeout(t);
@@ -107,7 +106,7 @@ export class CompetitorService {
   // ==========================
   // ✅ 1) 지도(=실제 노출) TOP placeId 추출
   // - 1순위: allSearch JSON
-  // - 2순위: Playwright 응답 스니핑
+  // - 2순위: Playwright(모바일 지도) 스니핑
   // ==========================
   async findTopPlaceIdsFromMapRank(keyword: string, opts: FindTopIdsOptions = {}) {
     const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
@@ -115,7 +114,7 @@ export class CompetitorService {
     const q = String(keyword || "").trim();
     if (!q) return [];
 
-    // ✅ 1순위: JSON allSearch
+    // ✅ 1순위: allSearch
     try {
       const ids = await this.__findTopPlaceIdsViaAllSearch(q, limit + 5, 4500);
       const out: string[] = [];
@@ -133,7 +132,7 @@ export class CompetitorService {
       console.warn("[COMP][mapRank] allSearch failed:", e);
     }
 
-    // ✅ 2순위: Playwright 스니핑
+    // ✅ 2순위: m.map (Railway에서 500 나는 케이스가 많음 → 디버그 로그 남김)
     const url = `https://m.map.naver.com/search2/search.naver?query=${encodeURIComponent(q)}`;
 
     const browser = await this.getBrowser();
@@ -153,8 +152,6 @@ export class CompetitorService {
 
     const page = await context.newPage();
 
-    // ⚠️ 지도는 리소스/스크립트 의존이 있어서 너무 과한 abort는 결과 0 만들 수 있음
-    // (현재는 이미지/css 등을 abort하지만 document/script/xhr/fetch는 살려둠)
     await page.route("**/*", (route) => {
       const req = route.request();
       const rtype = req.resourceType();
@@ -178,7 +175,6 @@ export class CompetitorService {
         const text = await res.text().catch(() => "");
         if (!text) return;
 
-        // ✅ /hairshop/123 /restaurant/123 등도 포함
         if (
           !/(placeId|\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/\d{5,12})/.test(
             text
@@ -191,7 +187,6 @@ export class CompetitorService {
       } catch {}
     };
 
-    // ✅ 디버그(차단/403 확인용)
     const onHttpFail = async (res: any) => {
       try {
         const st = res.status?.() ?? 0;
@@ -207,7 +202,6 @@ export class CompetitorService {
       await page.goto(url, { waitUntil: "domcontentloaded" });
       await page.waitForTimeout(1200);
 
-      // ✅ 차단 여부 빠르게 감지(로그)
       try {
         const title = await page.title().catch(() => "");
         const htmlLen = (await page.content().catch(() => "")).length;
@@ -252,6 +246,7 @@ export class CompetitorService {
 
   // ==========================
   // ✅ 2) 메인: 경쟁사 추출 + 대표키워드 크롤링
+  // - 핵심: 키워드 크롤링 실패해도 placeId+name으로 경쟁사 반환
   // ==========================
   public async findTopCompetitorsByKeyword(keyword: string, opts: FindTopCompetitorsOpts = {}): Promise<Competitor[]> {
     const q = String(keyword || "").trim();
@@ -264,52 +259,73 @@ export class CompetitorService {
       7000,
       Math.min(45000, opts.timeoutMs ?? Number(process.env.COMPETITOR_TIMEOUT_MS || 18000))
     );
-
     const deadline = Date.now() + totalTimeoutMs - 350;
 
+    // 1) 지도 시도
     const mapIds = await this.findTopPlaceIdsFromMapRank(q, { excludePlaceId: exclude, limit }).catch(() => []);
-    let candidateIds = mapIds;
 
-    if (!candidateIds.length) {
-      const fallback = await this.__findTopPlaceIdsFromSearchWherePlace(
+    // 2) fallback: where=place HTML에서 id + name 같이 추출
+    let metas: PlaceMeta[] = [];
+    if (!mapIds.length) {
+      metas = await this.__findTopPlaceMetasFromSearchWherePlace(
         q,
         Math.min(12000, Math.max(5000, deadline - Date.now()))
       ).catch(() => []);
-      candidateIds = fallback.filter((x) => !(exclude && x === exclude)).slice(0, limit);
     }
+
+    // 후보 placeId
+    const candidateIds = (mapIds.length ? mapIds.map((id) => ({ placeId: id, name: "" })) : metas)
+      .filter((x) => !(exclude && x.placeId === exclude))
+      .slice(0, limit);
 
     console.log("[COMP] query:", q);
     console.log("[COMP] mapIds:", mapIds);
-    console.log("[COMP] candidateIds:", candidateIds);
+    console.log("[COMP] candidateMetas:", candidateIds);
 
     if (!candidateIds.length) return [];
 
+    // 이름 매핑(키워드 실패 시에도 이름이라도 채워서 반환)
+    const nameMap = new Map<string, string>();
+    for (const m of candidateIds) {
+      if (m.placeId && m.name) nameMap.set(m.placeId, this.__cleanText(m.name));
+    }
+
+    // enrich 병렬 제한
     const enrichConcurrency = Math.max(1, Math.min(4, Number(process.env.COMPETITOR_ENRICH_CONCURRENCY || 2)));
     const runLimited = this.__createLimiter(enrichConcurrency);
 
-    const enrichPromises = candidateIds.map((pid) =>
-      runLimited(() => this.__fetchPlaceHomeAndExtract(pid, Math.min(15000, Math.max(7000, deadline - Date.now()))))
+    const enrichPromises = candidateIds.map((m) =>
+      runLimited(() =>
+        this.__fetchPlaceHomeAndExtract(m.placeId, Math.min(15000, Math.max(7000, deadline - Date.now())))
+      ).catch(() => ({ name: "", keywords: [] }))
     );
 
     const out: Competitor[] = [];
     for (let i = 0; i < candidateIds.length && out.length < limit; i++) {
       if (Date.now() > deadline) break;
 
-      const pid = candidateIds[i];
+      const pid = candidateIds[i].placeId;
       const remaining = Math.max(1, deadline - Date.now());
 
       const enriched = await this.__withTimeout(enrichPromises[i], remaining).catch(() => ({ name: "", keywords: [] }));
 
+      const fallbackName = nameMap.get(pid) || "";
+
+      // ✅ 중요: name이 비면 상위에서 “무효”로 버리는 케이스가 많아서 최소 name 채움
+      const finalName = this.__cleanText(enriched?.name || fallbackName || "");
+
+      const finalKeywords = (enriched?.keywords || [])
+        .map((k) => this.__cleanText(k))
+        .filter(Boolean)
+        .filter((k) => k.length >= 2 && k.length <= 25)
+        .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
+        .slice(0, 5);
+
       out.push({
         placeId: pid,
-        name: this.__cleanText(enriched?.name || ""),
-        keywords: (enriched?.keywords || [])
-          .map((k) => this.__cleanText(k))
-          .filter(Boolean)
-          .filter((k) => k.length >= 2 && k.length <= 25)
-          .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
-          .slice(0, 5),
-        source: "place_home",
+        name: finalName || `place_${pid}`, // ✅ 최후 보루: 이름 완전 공백 방지
+        keywords: finalKeywords,
+        source: finalKeywords.length ? "place_home" : "search_html",
         rank: out.length + 1
       });
     }
@@ -318,15 +334,53 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ fallback: where=place HTML에서 placeId TOP 추출
+  // ✅ fallback: where=place HTML에서 placeId + name TOP 추출
   // ==========================
-  private async __findTopPlaceIdsFromSearchWherePlace(keyword: string, timeoutMs: number): Promise<string[]> {
+  private async __findTopPlaceMetasFromSearchWherePlace(keyword: string, timeoutMs: number): Promise<PlaceMeta[]> {
     const q = String(keyword || "").trim();
     if (!q) return [];
+
     const url = `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`;
     const html = await this.__fetchHtml(url, timeoutMs);
-    const ids = this.__extractPlaceIdsFromAnyTextInOrder(html);
-    return ids.slice(0, 20);
+
+    // 1) 먼저 placeId를 많이 뽑고
+    const ids = this.__extractPlaceIdsFromAnyTextInOrder(html).slice(0, 30);
+
+    // 2) id 주변 텍스트에서 name을 최대한 뽑기(완벽할 필요 없음, name만 채우면 상위에서 안 버림)
+    const metas: PlaceMeta[] = [];
+    const seen = new Set<string>();
+
+    for (const id of ids) {
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+
+      // id가 나오는 위치 근처를 잘라서 name 후보를 찾는다
+      const idx = html.indexOf(id);
+      const chunk = idx >= 0 ? html.slice(Math.max(0, idx - 600), Math.min(html.length, idx + 600)) : "";
+
+      let name = "";
+
+      // (A) title="업체명"
+      const m1 = chunk.match(/title=["']([^"']{2,80})["']/i);
+      if (m1?.[1]) name = m1[1];
+
+      // (B) aria-label="업체명"
+      if (!name) {
+        const m2 = chunk.match(/aria-label=["']([^"']{2,80})["']/i);
+        if (m2?.[1]) name = m2[1];
+      }
+
+      // (C) >업체명< (너무 길거나 태그 섞이면 걸러짐)
+      if (!name) {
+        const m3 = chunk.match(/>\s*([가-힣A-Za-z0-9][^<>]{1,40})\s*</);
+        if (m3?.[1]) name = m3[1];
+      }
+
+      metas.push({ placeId: id, name: this.__cleanText(name) });
+      if (metas.length >= 10) break;
+    }
+
+    return metas;
   }
 
   private async __fetchHtml(url: string, timeoutMs: number): Promise<string> {
@@ -370,7 +424,7 @@ export class CompetitorService {
 
     for (const url of candidates) {
       const r = await this.__renderAndExtractFromPlaceHome(url, Math.max(2500, Math.min(20000, timeoutMs)));
-      if (r.keywords.length) return r;
+      if (r.keywords.length || r.name) return r;
     }
 
     return { name: "", keywords: [] };
@@ -448,6 +502,13 @@ export class CompetitorService {
       page.on("response", onResponse);
 
       await page.goto(url, { waitUntil: "domcontentloaded" });
+
+      // ✅ place 차단/축소 응답 확인용(너무 시끄러우면 나중에 지워도 됨)
+      try {
+        const title = await page.title().catch(() => "");
+        const htmlLen = (await page.content().catch(() => "")).length;
+        if (htmlLen < 500) console.warn("[COMP][placeHome] suspicious htmlLen", htmlLen, "url=", url, "title=", title);
+      } catch {}
 
       const iframeHandle = await page
         .waitForSelector('iframe#entryIframe, iframe[name="entryIframe"]', { timeout: Math.min(8000, timeoutMs) })
@@ -679,23 +740,21 @@ export class CompetitorService {
 
     for (const m of text.matchAll(re1)) {
       const inside = m[1] || "";
-      const strs = [...inside.matchAll(/"([^"]{2,40})"/g)]
-        .map((x) => this.__cleanText(x[1]))
-        .filter(Boolean);
+      const strs = [...inside.matchAll(/"([^"]{2,40})"/g)].map((x) => this.__cleanText(x[1])).filter(Boolean);
       if (strs.length) return Array.from(new Set(strs));
     }
     return [];
   }
 
-  // ✅ 어떤 텍스트든 placeId를 “등장 순서대로” 뽑는 유틸 (map 응답/HTML 공용)
+  // ✅ placeId 추출(등장 순)
   private __extractPlaceIdsFromAnyTextInOrder(text: string): string[] {
     const ids: string[] = [];
     const seen = new Set<string>();
     const s = String(text || "");
 
-    // 1) /{category}/{id}
     const rePath =
       /\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})/g;
+
     for (const m of s.matchAll(rePath)) {
       const id = m[1];
       if (!id || seen.has(id)) continue;
@@ -704,7 +763,6 @@ export class CompetitorService {
       if (ids.length >= 120) break;
     }
 
-    // 2) placeId:"12345"
     if (ids.length < 10) {
       const rePlaceId = /placeId["']?\s*[:=]\s*["'](\d{5,12})["']/g;
       for (const m of s.matchAll(rePlaceId)) {
@@ -716,7 +774,6 @@ export class CompetitorService {
       }
     }
 
-    // 3) "id":"12345"
     if (ids.length < 10) {
       const reId = /["']id["']\s*:\s*["'](\d{5,12})["']/g;
       for (const m of s.matchAll(reId)) {
