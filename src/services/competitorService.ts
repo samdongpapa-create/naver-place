@@ -132,7 +132,7 @@ export class CompetitorService {
       console.warn("[COMP][mapRank] allSearch failed:", e);
     }
 
-    // ✅ 2순위: m.map (Railway에서 500 나는 케이스가 많음 → 디버그 로그 남김)
+    // ✅ 2순위: m.map (Railway에서 500 나는 케이스)
     const url = `https://m.map.naver.com/search2/search.naver?query=${encodeURIComponent(q)}`;
 
     const browser = await this.getBrowser();
@@ -140,7 +140,11 @@ export class CompetitorService {
       userAgent:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
       viewport: { width: 390, height: 844 },
-      locale: "ko-KR"
+      locale: "ko-KR",
+      extraHTTPHeaders: {
+        "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.6,en;q=0.4",
+        referer: "https://m.map.naver.com/"
+      }
     });
 
     await context.addInitScript(() => {
@@ -246,7 +250,7 @@ export class CompetitorService {
 
   // ==========================
   // ✅ 2) 메인: 경쟁사 추출 + 대표키워드 크롤링
-  // - 핵심: 키워드 크롤링 실패해도 placeId+name으로 경쟁사 반환
+  // - 핵심: 키워드 실패해도 경쟁사 반환(0 방지)
   // ==========================
   public async findTopCompetitorsByKeyword(keyword: string, opts: FindTopCompetitorsOpts = {}): Promise<Competitor[]> {
     const q = String(keyword || "").trim();
@@ -273,46 +277,43 @@ export class CompetitorService {
       ).catch(() => []);
     }
 
-    // 후보 placeId
-    const candidateIds = (mapIds.length ? mapIds.map((id) => ({ placeId: id, name: "" })) : metas)
+    const candidateMetas = (mapIds.length ? mapIds.map((id) => ({ placeId: id, name: "" })) : metas)
       .filter((x) => !(exclude && x.placeId === exclude))
       .slice(0, limit);
 
     console.log("[COMP] query:", q);
     console.log("[COMP] mapIds:", mapIds);
-    console.log("[COMP] candidateMetas:", candidateIds);
+    console.log("[COMP] candidateMetas:", candidateMetas);
 
-    if (!candidateIds.length) return [];
+    if (!candidateMetas.length) return [];
 
-    // 이름 매핑(키워드 실패 시에도 이름이라도 채워서 반환)
     const nameMap = new Map<string, string>();
-    for (const m of candidateIds) {
+    for (const m of candidateMetas) {
       if (m.placeId && m.name) nameMap.set(m.placeId, this.__cleanText(m.name));
     }
 
-    // enrich 병렬 제한
     const enrichConcurrency = Math.max(1, Math.min(4, Number(process.env.COMPETITOR_ENRICH_CONCURRENCY || 2)));
     const runLimited = this.__createLimiter(enrichConcurrency);
 
-    const enrichPromises = candidateIds.map((m) =>
+    const enrichPromises = candidateMetas.map((m) =>
       runLimited(() =>
         this.__fetchPlaceHomeAndExtract(m.placeId, Math.min(15000, Math.max(7000, deadline - Date.now())))
       ).catch(() => ({ name: "", keywords: [] }))
     );
 
+    const allowEmpty = String(process.env.ALLOW_EMPTY_COMP_KEYWORDS || "") === "1";
+
     const out: Competitor[] = [];
-    for (let i = 0; i < candidateIds.length && out.length < limit; i++) {
+    for (let i = 0; i < candidateMetas.length && out.length < limit; i++) {
       if (Date.now() > deadline) break;
 
-      const pid = candidateIds[i].placeId;
+      const pid = candidateMetas[i].placeId;
       const remaining = Math.max(1, deadline - Date.now());
 
       const enriched = await this.__withTimeout(enrichPromises[i], remaining).catch(() => ({ name: "", keywords: [] }));
-
       const fallbackName = nameMap.get(pid) || "";
 
-      // ✅ 중요: name이 비면 상위에서 “무효”로 버리는 케이스가 많아서 최소 name 채움
-      const finalName = this.__cleanText(enriched?.name || fallbackName || "");
+      const finalName = this.__cleanText(enriched?.name || fallbackName || "") || `place_${pid}`;
 
       const finalKeywords = (enriched?.keywords || [])
         .map((k) => this.__cleanText(k))
@@ -321,11 +322,14 @@ export class CompetitorService {
         .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
         .slice(0, 5);
 
+      // ✅ 상위에서 keywords.length로 필터하면 0 나와버리니, 기본은 플레이스홀더 1개 넣어줌
+      const safeKeywords = finalKeywords.length ? finalKeywords : allowEmpty ? [] : ["키워드수집실패"];
+
       out.push({
         placeId: pid,
-        name: finalName || `place_${pid}`, // ✅ 최후 보루: 이름 완전 공백 방지
-        keywords: finalKeywords,
-        source: finalKeywords.length ? "place_home" : "search_html",
+        name: finalName,
+        keywords: safeKeywords,
+        source: safeKeywords.length && safeKeywords[0] !== "키워드수집실패" ? "place_home" : "search_html",
         rank: out.length + 1
       });
     }
@@ -334,51 +338,64 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ fallback: where=place HTML에서 placeId + name TOP 추출
+  // ✅ fallback: where=place HTML에서 placeId + name TOP 추출 (강화판)
+  // - m.place / pcmap.place / place.naver.com 등 링크 다양성 대응
+  // - "저장" 같은 버튼 텍스트를 name으로 잡는 문제 방지
   // ==========================
-private async __findTopPlaceMetasFromSearchWherePlace(keyword: string, timeoutMs: number): Promise<{ placeId: string; name: string }[]> {
-  const q = String(keyword || "").trim();
-  if (!q) return [];
+  private async __findTopPlaceMetasFromSearchWherePlace(keyword: string, timeoutMs: number): Promise<PlaceMeta[]> {
+    const q = String(keyword || "").trim();
+    if (!q) return [];
 
-  const url = `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`;
-  const html = await this.__fetchHtml(url, timeoutMs);
+    const url = `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`;
+    const html = await this.__fetchHtml(url, timeoutMs);
 
-  // 1) place 링크를 먼저 찾고 (업종 경로 포함)
-  const reLink =
-    /https?:\/\/m\.place\.naver\.com\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})(?:\/|["'?\s])/g;
+    // place 링크에서 placeId를 잡는다 (다양한 도메인/형태)
+    const reAnyPlaceId =
+      /https?:\/\/(?:m\.place\.naver\.com|pcmap\.place\.naver\.com|place\.naver\.com)\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})/g;
 
-  const metas: { placeId: string; name: string }[] = [];
-  const seen = new Set<string>();
+    const banned = /^(저장|길찾기|예약|전화|공유|블로그|리뷰|사진|홈|메뉴|가격)$/i;
 
-  for (const m of html.matchAll(reLink)) {
-    const pid = m[1];
-    if (!pid || seen.has(pid)) continue;
-    seen.add(pid);
+    const metas: PlaceMeta[] = [];
+    const seen = new Set<string>();
 
-    // 링크 주변 1500자에서 업체명 후보를 뽑는다
-    const idx = m.index ?? -1;
-    const chunk = idx >= 0 ? html.slice(Math.max(0, idx - 800), Math.min(html.length, idx + 800)) : "";
+    for (const m of html.matchAll(reAnyPlaceId)) {
+      const pid = m[1];
+      if (!pid || seen.has(pid)) continue;
+      seen.add(pid);
 
-    // (A) title="업체명" 우선 (저장/길찾기/예약 제외)
-    const titleMatches = [...chunk.matchAll(/title=["']([^"']{2,80})["']/gi)]
-      .map((x) => this.__cleanText(x[1]))
-      .filter(Boolean)
-      .filter((t) => !/^(저장|길찾기|예약|전화|공유|블로그|리뷰|사진)$/i.test(t));
+      const idx = m.index ?? -1;
+      const chunk = idx >= 0 ? html.slice(Math.max(0, idx - 900), Math.min(html.length, idx + 900)) : "";
 
-    // (B) <a ...>텍스트</a> 후보 (저장 제외)
-    const textMatches = [...chunk.matchAll(/>\s*([가-힣A-Za-z0-9][^<>]{1,40})\s*</g)]
-      .map((x) => this.__cleanText(x[1]))
-      .filter(Boolean)
-      .filter((t) => !/^(저장|길찾기|예약|전화|공유|블로그|리뷰|사진)$/i.test(t));
+      const titleMatches = [...chunk.matchAll(/title=["']([^"']{2,80})["']/gi)]
+        .map((x) => this.__cleanText(x[1]))
+        .filter(Boolean)
+        .filter((t) => !banned.test(t));
 
-    const name = titleMatches[0] || textMatches[0] || "";
+      const ariaMatches = [...chunk.matchAll(/aria-label=["']([^"']{2,80})["']/gi)]
+        .map((x) => this.__cleanText(x[1]))
+        .filter(Boolean)
+        .filter((t) => !banned.test(t));
 
-    metas.push({ placeId: pid, name });
-    if (metas.length >= 10) break;
+      const textMatches = [...chunk.matchAll(/>\s*([가-힣A-Za-z0-9][^<>]{1,50})\s*</g)]
+        .map((x) => this.__cleanText(x[1]))
+        .filter(Boolean)
+        .filter((t) => !banned.test(t));
+
+      // 업체명은 title > aria-label > 텍스트 순
+      const name = titleMatches[0] || ariaMatches[0] || textMatches[0] || "";
+
+      metas.push({ placeId: pid, name });
+      if (metas.length >= 10) break;
+    }
+
+    // 마지막 보루: 텍스트 전체에서 placeId만 뽑아서 name 비우고라도 채움
+    if (!metas.length) {
+      const ids = this.__extractPlaceIdsFromAnyTextInOrder(html).slice(0, 10);
+      return ids.map((id) => ({ placeId: id, name: "" }));
+    }
+
+    return metas;
   }
-
-  return metas;
-}
 
   private async __fetchHtml(url: string, timeoutMs: number): Promise<string> {
     const ctrl = new AbortController();
@@ -412,11 +429,12 @@ private async __findTopPlaceMetasFromSearchWherePlace(keyword: string, timeoutMs
     const pid = String(placeId).trim();
     if (!pid) return { name: "", keywords: [] };
 
+    // ✅ universal 먼저 시도(리다이렉트/라우팅되는 케이스가 있음)
     const candidates = [
+      `https://m.place.naver.com/place/${pid}/home`,
       `https://m.place.naver.com/hairshop/${pid}/home`,
       `https://m.place.naver.com/restaurant/${pid}/home`,
-      `https://m.place.naver.com/cafe/${pid}/home`,
-      `https://m.place.naver.com/place/${pid}/home`
+      `https://m.place.naver.com/cafe/${pid}/home`
     ];
 
     for (const url of candidates) {
@@ -476,7 +494,12 @@ private async __findTopPlaceMetasFromSearchWherePlace(keyword: string, timeoutMs
         userAgent:
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         viewport: { width: 390, height: 844 },
-        locale: "ko-KR"
+        locale: "ko-KR",
+        extraHTTPHeaders: {
+          "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.6,en;q=0.4",
+          // ✅ referer 넣어주는 게 차단 확률을 조금이라도 낮춤
+          referer: "https://m.place.naver.com/"
+        }
       });
 
       await context.addInitScript(() => {
@@ -500,24 +523,16 @@ private async __findTopPlaceMetasFromSearchWherePlace(keyword: string, timeoutMs
 
       const resp = await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => null);
 
-const status = resp?.status?.() ?? -1;
-const finalUrl = page.url();
-const outer = await page.content().catch(() => "");
-const title = await page.title().catch(() => "");
+      const status = resp?.status?.() ?? -1;
+      const finalUrl = page.url();
+      const outer = await page.content().catch(() => "");
+      const pageTitle = await page.title().catch(() => "");
 
-console.log("[COMP][placeHome] goto", { status, url, finalUrl, title, htmlLen: outer.length });
-
-// htmlLen 너무 작으면 body 앞부분도 찍어서 차단/에러 페이지인지 확인
-if (outer.length > 0 && outer.length < 300) {
-  console.log("[COMP][placeHome] tinyHtmlHead:", outer.slice(0, 200));
-}
-
-      // ✅ place 차단/축소 응답 확인용(너무 시끄러우면 나중에 지워도 됨)
-      try {
-        const title = await page.title().catch(() => "");
-        const htmlLen = (await page.content().catch(() => "")).length;
-        if (htmlLen < 500) console.warn("[COMP][placeHome] suspicious htmlLen", htmlLen, "url=", url, "title=", title);
-      } catch {}
+      console.log("[COMP][placeHome] goto", { status, url, finalUrl, title: pageTitle, htmlLen: outer.length });
+      if (outer.length > 0 && outer.length < 300) {
+        console.log("[COMP][placeHome] tinyHtmlHead:", outer.slice(0, 200));
+      }
+      if (outer.length < 500) console.warn("[COMP][placeHome] suspicious htmlLen", outer.length, "url=", url, "title=", pageTitle);
 
       const iframeHandle = await page
         .waitForSelector('iframe#entryIframe, iframe[name="entryIframe"]', { timeout: Math.min(8000, timeoutMs) })
@@ -560,7 +575,6 @@ if (outer.length > 0 && outer.length < 300) {
       }
 
       if (!netState.name) {
-        const outer = await page.content().catch(() => "");
         const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
         if (m1?.[1]) netState.name = this.__cleanText(m1[1]);
       }
@@ -755,7 +769,6 @@ if (outer.length > 0 && outer.length < 300) {
     return [];
   }
 
-  // ✅ placeId 추출(등장 순)
   private __extractPlaceIdsFromAnyTextInOrder(text: string): string[] {
     const ids: string[] = [];
     const seen = new Set<string>();
