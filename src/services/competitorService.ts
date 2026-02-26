@@ -98,12 +98,10 @@ export class CompetitorService {
   }
 
   private __cleanName(s: string) {
-    // "더살롱아베다 네이버" 같은 꼬리 제거
     let t = this.__cleanText(s);
+    t = t.replace(/\s*-\s*네이버\s*플레이스\s*$/i, "").trim();
     t = t.replace(/\s*네이버\s*플레이스\s*$/i, "").trim();
     t = t.replace(/\s*네이버\s*$/i, "").trim();
-    // " - 네이버 플레이스" 형태
-    t = t.replace(/\s*-\s*네이버\s*플레이스\s*$/i, "").trim();
     return t;
   }
 
@@ -273,7 +271,6 @@ export class CompetitorService {
     const { x, y } = this.__coordToXY(searchCoord);
     const boundary = String(process.env.NAVER_MAP_BOUNDARY || "").trim();
 
-    // ✅ searchCoord는 반드시 포함(Required). x/y는 "추가로" 붙여도 됨.
     const variants: Array<{ useBoundary: boolean; alsoXY: boolean }> = [
       { useBoundary: true, alsoXY: true },
       { useBoundary: true, alsoXY: false },
@@ -294,7 +291,7 @@ export class CompetitorService {
       // ✅ Required
       url.searchParams.set("searchCoord", searchCoord);
 
-      // ✅ Optional: 일부 환경에서 결과 안정화 되는 경우가 있어 추가
+      // ✅ Optional
       if (v.alsoXY) {
         url.searchParams.set("x", x);
         url.searchParams.set("y", y);
@@ -338,7 +335,9 @@ export class CompetitorService {
           [];
 
         const ids = (Array.isArray(list) ? list : [])
-          .map((x2: any) => (x2?.id ? String(x2.id) : x2?.placeId ? String(x2.placeId) : x2?.bizId ? String(x2.bizId) : ""))
+          .map((x2: any) =>
+            x2?.id ? String(x2.id) : x2?.placeId ? String(x2.placeId) : x2?.bizId ? String(x2.bizId) : ""
+          )
           .map((id: string) => this.__normPlaceId(id))
           .filter((id: string) => this.__isValidPlaceId(id));
 
@@ -394,7 +393,7 @@ export class CompetitorService {
       console.warn("[COMP][mapRank] allSearch failed:", e);
     }
 
-    // 2) m.map (Railway 500 자주) — 남은 예산만
+    // 2) m.map fallback (Railway 500 자주) — 남은 예산만
     const left = remaining();
     if (left < 700) return [];
 
@@ -772,7 +771,6 @@ export class CompetitorService {
     const context = await this.__newContext("https://m.place.naver.com/");
     const page = await this.__newLightPage(context, timeoutMs);
 
-    // ✅ 네트워크 JSON이면 URL/키워드 문자열 매칭 없이도 "일단 파싱→deep scan"
     const onResponseKw = async (res: any) => {
       try {
         const req = res.request?.();
@@ -828,7 +826,6 @@ export class CompetitorService {
       loaded = status === 200 && outer.length > 500;
       console.log("[COMP][placeHome] goto", { status, url, finalUrl, title: pageTitle, htmlLen: outer.length });
 
-      // 네트워크 늦게 오는 경우 조금만
       await page.waitForTimeout(350).catch(() => {});
 
       // (A) NEXT_DATA (outer)
@@ -865,7 +862,6 @@ export class CompetitorService {
         if (byRe.length) state.keywords = byRe;
       }
 
-      // entry frame
       const frame = await this.__resolveEntryFrame(page, timeoutMs);
 
       if (!frame) {
@@ -1010,7 +1006,7 @@ export class CompetitorService {
     const steps = 14;
     for (let i = 0; i < steps; i++) {
       try {
-        await frame.evaluate((ratio) => {
+        await frame.evaluate((ratio: number) => {
           const d: any = (globalThis as any).document;
           if (!d) return;
 
@@ -1169,18 +1165,13 @@ export class CompetitorService {
       return uniq.slice(0, 10);
     });
 
-    return outNormalize(raw => raw); // placeholder to keep structure
+    return this.__finalizeKeywords(raw);
   }
-
-  // 👇 위 함수 마지막 줄 교체: ts/런타임 안전 위해 그냥 아래로 대체
-  // (실수 방지용: 상단 함수에서 return outNormalize(...) 넣지 말고, 아래 2줄로 끝나야 함)
-  // return this.__finalizeKeywords(raw);
 
   private __finalizeKeywords(keywords: string[]) {
     const cleaned = (keywords || [])
       .map((k) => this.__normalizeKeyword(k))
       .filter(Boolean)
-      .filter((k) => k.length >= 2 && k.length <= 25)
       .filter((k) => !this.__isNoiseKeyword(k));
 
     const uniq: string[] = [];
