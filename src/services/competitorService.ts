@@ -33,7 +33,29 @@ export class CompetitorService {
     });
     return this.browser;
   }
+  // ✅ JSON/NextData에서 place name 찾기
+  private __deepFindName(obj: any): string {
+    const keyCandidates = ["name", "placeName", "businessName", "title"];
 
+    const hits = this.__deepCollect(
+      obj,
+      (x) => x && typeof x === "object" && keyCandidates.some((k) => typeof (x as any)[k] === "string"),
+      []
+    );
+
+    for (const h of hits) {
+      for (const k of keyCandidates) {
+        const v = (h as any)[k];
+        if (typeof v === "string") {
+          const t = this.__cleanText(v);
+          if (!t) continue;
+          if (this.__isBannedName(t)) continue;
+          if (t.length >= 2 && t.length <= 60) return t;
+        }
+      }
+    }
+    return "";
+  }
   async close() {
     try {
       await this.browser?.close();
