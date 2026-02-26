@@ -35,7 +35,16 @@ export class CompetitorService {
   }
   // ✅ JSON/NextData에서 place name 찾기
   private __deepFindName(obj: any): string {
-    const keyCandidates = ["name", "placeName", "businessName", "title"];
+    const keyCandidates = [
+  "name",
+  "placeName",
+  "businessName",
+  "bizName",
+  "displayName",
+  "storeName",
+  "partnerName",
+  "title"
+];
 
     const hits = this.__deepCollect(
       obj,
@@ -254,23 +263,67 @@ export class CompetitorService {
     const page = await this.__newLightPage(context, Number(process.env.MAP_GOTO_TIMEOUT_MS || 25000));
 
     const buf: string[] = [];
-    const onResponse = async (res: any) => {
+        const onResponse = async (res: any) => {
       try {
         const req = res.request();
         const rt = req.resourceType();
         if (rt !== "xhr" && rt !== "fetch") return;
 
+        const u = String(res.url?.() || "");
         const ct = (await res.headerValue("content-type")) || "";
-        if (!/json|javascript/i.test(ct)) return;
 
-        const text = await res.text().catch(() => "");
-        if (!text) return;
+        // ✅ (중요) content-type이 json이 아니어도 키워드 payload가 text/plain으로 오는 경우가 있음
+        // ✅ URL/본문 키워드 시그널로 판단
+        const looksLikeKeywordApi =
+          /(keywordList|representKeywordList|representKeywords|keywords)/i.test(u) ||
+          /place|entry|home|keyword/i.test(u);
 
-        if (!/(placeId|\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/\d{5,12})/.test(text))
+        const txt = await res.text().catch(() => "");
+        if (!txt || txt.length < 20) return;
+
+        // 본문에 키워드 시그널이 없으면 버림 (노이즈 컷)
+        if (!/(keywordList|representKeywordList|representKeywords|keywords)/.test(txt) && !looksLikeKeywordApi) return;
+
+        // 1) JSON 파싱 시도 (content-type이 json이거나, 그냥 될 때도 있음)
+        let j: any = null;
+        if (/json|javascript/i.test(ct) || txt.trim().startsWith("{") || txt.trim().startsWith("[")) {
+          try {
+            j = JSON.parse(txt);
+          } catch {
+            j = null;
+          }
+        }
+
+        if (j) {
+          if (!netState.name) {
+            const nm = this.__deepFindName(j);
+            if (nm && !this.__isBannedName(nm)) netState.name = nm;
+          }
+
+          if (!netState.keywords.length) {
+            for (const k of ["keywordList", "representKeywordList", "representKeywords", "keywords"]) {
+              const arr = this.__deepFindStringArray(j, k);
+              if (arr.length) {
+                netState.keywords = arr;
+                break;
+              }
+            }
+          }
           return;
+        }
 
-        buf.push(text);
-        if (buf.length > 50) buf.shift();
+        // 2) ✅ JSON 파싱 실패하면 regex로라도 keywords 뽑기 (실제 여기서 많이 살음)
+        if (!netState.keywords.length) {
+          const fallback = this.__extractKeywordArrayByRegex(txt);
+          if (fallback.length) netState.keywords = fallback;
+        }
+
+        // 3) name도 혹시 남아있으면 og/title 류라도 뽑기
+        if (!netState.name) {
+          const m = txt.match(/"name"\s*:\s*"([^"]{2,80})"/);
+          const nm = m?.[1] ? this.__cleanText(m[1]) : "";
+          if (nm && !this.__isBannedName(nm)) netState.name = nm;
+        }
       } catch {}
     };
 
