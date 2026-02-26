@@ -703,31 +703,60 @@ export class CompetitorService {
   // ✅ lazy-load 유도: 더보기/펼치기 클릭 + 스크롤
   // ==========================
   private async __expandAndScrollFrame(frame: Frame, timeoutMs: number) {
-    // 버튼 클릭 몇 번
-    const clickTexts = ["더보기", "정보 더보기", "펼치기", "접기", "전체보기"];
+  // ✅ “더보기/펼치기/정보 더보기” 류 버튼 최대한 클릭
+  const clickTexts = ["더보기", "정보 더보기", "펼치기", "전체보기", "자세히", "더보기 버튼"];
+  for (let round = 0; round < 2; round++) {
     for (const t of clickTexts) {
       try {
         const loc = frame.locator(`text=${t}`).first();
         if ((await loc.count().catch(() => 0)) > 0) {
-          await loc.click({ timeout: Math.min(1500, timeoutMs) }).catch(() => {});
-          await frame.waitForTimeout(180).catch(() => {});
+          await loc.click({ timeout: Math.min(1200, timeoutMs) }).catch(() => {});
+          await frame.waitForTimeout(200).catch(() => {});
         }
       } catch {}
     }
+  }
 
-    // 스크롤 (lazy-load)
-    const steps = 10;
-    for (let i = 0; i < steps; i++) {
-      try {
-        await frame.evaluate((n) => {
-          const d: any = (globalThis as any).document;
-          const el = d?.scrollingElement || d?.documentElement || d?.body;
-          if (!el) return;
-          el.scrollTop = Math.floor((el.scrollHeight || 0) * (n / 10));
-        }, i + 1);
-      } catch {}
-      await frame.waitForTimeout(220).catch(() => {});
-    }
+  // ✅ lazy-load 유도: document 스크롤 + "스크롤 가능한 컨테이너"도 같이 스크롤
+  const steps = 14;
+  for (let i = 0; i < steps; i++) {
+    try {
+      await frame.evaluate((ratio) => {
+        const d: any = (globalThis as any).document;
+        if (!d) return;
+
+        // 1) 기본 스크롤
+        const root = d.scrollingElement || d.documentElement || d.body;
+        if (root && root.scrollHeight) {
+          root.scrollTop = Math.floor(root.scrollHeight * ratio);
+        }
+
+        // 2) overflow scroll 컨테이너들 스크롤
+        const els = Array.from(d.querySelectorAll("div, main, section")) as any[];
+        for (const el of els) {
+          try {
+            const st = (globalThis as any).getComputedStyle?.(el);
+            const oy = st?.overflowY || "";
+            const canScroll = (oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 50;
+            if (!canScroll) continue;
+            el.scrollTop = Math.floor(el.scrollHeight * ratio);
+          } catch {}
+        }
+      }, (i + 1) / steps);
+    } catch {}
+    await frame.waitForTimeout(220).catch(() => {});
+  }
+
+  // 상단 복귀
+  try {
+    await frame.evaluate(() => {
+      const d: any = (globalThis as any).document;
+      const root = d?.scrollingElement || d?.documentElement || d?.body;
+      if (root) root.scrollTop = 0;
+    });
+  } catch {}
+  await frame.waitForTimeout(150).catch(() => {});
+}
 
     // 최상단으로 한 번 복귀
     try {
@@ -762,42 +791,103 @@ export class CompetitorService {
   // ✅ DOM: 대표키워드 “칩/검색링크” 추출
   // ==========================
   private async __extractKeywordsFromDomSmart(frame: any): Promise<string[]> {
-    const raw: string[] = await frame.evaluate(() => {
-      const out: string[] = [];
-      const d: any = (globalThis as any).document;
-      if (!d || !d.querySelectorAll) return out;
+  const raw: string[] = await frame.evaluate(() => {
+    const out: string[] = [];
+    const d: any = (globalThis as any).document;
+    if (!d) return out;
 
-      const push = (t: any) => {
-        const s = String(t ?? "").replace(/\s+/g, " ").trim();
-        if (!s) return;
-        if (s.length < 2 || s.length > 25) return;
-        out.push(s.replace(/^#/, ""));
-      };
+    const clean = (t: any) => String(t ?? "").replace(/\s+/g, " ").trim();
 
-      const nodes: any[] = Array.from(d.querySelectorAll('a[href*="search?query="], a[href*="/search?query="]'));
-      for (const a of nodes) {
-        const t = String(a?.innerText || a?.textContent || "").replace(/\s+/g, " ").trim();
-        if (!t) continue;
-        if (t.length > 25) continue;
-        push(t);
-        if (out.length >= 20) break;
-      }
+    const push = (t: any) => {
+      const s = clean(t);
+      if (!s) return;
+      if (s.length < 2 || s.length > 25) return;
+      // 해시태그 제거
+      out.push(s.replace(/^#/, ""));
+    };
 
-      if (out.length < 3) {
-        const tags: any[] = Array.from(d.querySelectorAll("span, a, button"));
-        for (const el of tags) {
-          const t = String(el?.innerText || el?.textContent || "").trim();
-          if (!t || !t.startsWith("#")) continue;
-          push(t);
-          if (out.length >= 20) break;
-        }
-      }
-
-      return out;
+    // ✅ 1) “대표키워드” 라벨/헤더 찾기
+    const allNodes = Array.from(d.querySelectorAll("span, strong, h2, h3, div, p")) as any[];
+    const header = allNodes.find((el) => {
+      const t = clean(el?.innerText || el?.textContent);
+      return t && t.includes("대표") && t.includes("키워드");
     });
 
-    return this.__finalizeKeywords(raw);
-  }
+    // ✅ 1-1) 헤더 근처(부모/형제)에서 짧은 칩 텍스트 수집
+    const collectNear = (root: any) => {
+      if (!root || !root.querySelectorAll) return;
+      const nodes = Array.from(root.querySelectorAll("a, button, span")) as any[];
+      for (const el of nodes) {
+        const t = clean(el?.innerText || el?.textContent);
+        if (!t) continue;
+        if (t.length < 2 || t.length > 25) continue;
+        // 버튼류/잡음 제거(최소)
+        if (/^(저장|공유|길찾기|전화|예약|리뷰|사진|홈|메뉴|가격|더보기)$/i.test(t)) continue;
+        push(t);
+        if (out.length >= 15) break;
+      }
+    };
+
+    if (header) {
+      // 부모 2단계까지 올려서 탐색
+      let root: any = header;
+      for (let i = 0; i < 2; i++) root = root?.parentElement || root;
+      collectNear(root);
+
+      // 형제/다음 섹션 탐색
+      collectNear(header?.parentElement?.nextElementSibling);
+      collectNear(header?.nextElementSibling);
+    }
+
+    // ✅ 2) 링크 기반(대표키워드가 검색 링크로 붙는 경우) — 패턴 확장
+    if (out.length < 3) {
+      const links = Array.from(
+        d.querySelectorAll(
+          'a[href*="query="], a[href*="search.naver.com"], a[href*="m.search.naver.com"], a[href*="map.naver.com"]'
+        )
+      ) as any[];
+
+      for (const a of links) {
+        const href = String(a?.getAttribute?.("href") || a?.href || "");
+        if (!href) continue;
+        // 검색/쿼리 링크로 보이는 것만
+        if (!/(query=|search\.naver\.com|m\.search\.naver\.com|map\.naver\.com)/i.test(href)) continue;
+
+        const t = clean(a?.innerText || a?.textContent);
+        if (!t) continue;
+        if (t.length < 2 || t.length > 25) continue;
+        if (/^(저장|공유|길찾기|전화|예약|리뷰|사진|홈|메뉴|가격|더보기)$/i.test(t)) continue;
+        push(t);
+        if (out.length >= 15) break;
+      }
+    }
+
+    // ✅ 3) 해시태그(#) 형태 fallback
+    if (out.length < 3) {
+      const tags = Array.from(d.querySelectorAll("span, a, button")) as any[];
+      for (const el of tags) {
+        const t = clean(el?.innerText || el?.textContent);
+        if (!t || !t.startsWith("#")) continue;
+        if (t.length < 2 || t.length > 25) continue;
+        push(t);
+        if (out.length >= 15) break;
+      }
+    }
+
+    // 중복 제거(원시)
+    const uniq: string[] = [];
+    const seen = new Set<string>();
+    for (const s of out) {
+      const k = s.replace(/\s+/g, "");
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      uniq.push(s);
+    }
+    return uniq.slice(0, 10);
+  });
+
+  return this.__finalizeKeywords(raw);
+}
 
   private async __extractKeywordsFromDomWide(frame: any): Promise<string[]> {
     const raw: string[] = await frame.evaluate(() => {
