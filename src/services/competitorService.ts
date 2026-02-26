@@ -4,6 +4,7 @@ import { chromium, type Browser, type BrowserContext, type Page, type Frame } fr
 type FindTopIdsOptions = {
   excludePlaceId?: string;
   limit?: number;
+  timeoutMs?: number; // ✅ map rank 단계 예산
 };
 
 type Competitor = {
@@ -283,100 +284,114 @@ export class CompetitorService {
   // ✅ 1) 지도 TOP placeId
   // ==========================
   async findTopPlaceIdsFromMapRank(keyword: string, opts: FindTopIdsOptions = {}) {
-    const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
-    const exclude = this.__normPlaceId(opts.excludePlaceId || "");
-    const q = String(keyword || "").trim();
-    if (!q) return [];
+  const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
+  const exclude = this.__normPlaceId(opts.excludePlaceId || "");
+  const q = String(keyword || "").trim();
+  if (!q) return [];
 
-    // 1) allSearch
-    const ids0 = await this.__findTopPlaceIdsViaAllSearch(q, limit + 5, 4500).catch(() => []);
-    if (ids0.length) {
-      const out: string[] = [];
-      const seen = new Set<string>();
-      for (const id of ids0) {
-        if (!id) continue;
-        if (exclude && id === exclude) continue;
-        if (seen.has(id)) continue;
-        seen.add(id);
-        out.push(id);
-        if (out.length >= limit) break;
-      }
-      if (out.length) return out;
+  // ✅ 이 단계 전체 예산(기본 6초): 바깥 perTry보다 작게
+  const budget = Math.max(2500, Math.min(9000, Number(opts.timeoutMs ?? 6000)));
+  const started = Date.now();
+  const remaining = () => Math.max(400, budget - (Date.now() - started));
+
+  // 1) allSearch (최대 3초)
+  try {
+    const ids = await this.__findTopPlaceIdsViaAllSearch(q, limit + 5, Math.min(3000, remaining()));
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const id of ids) {
+      if (!id) continue;
+      if (exclude && id === exclude) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+      if (out.length >= limit) break;
     }
-
-    // 2) m.map (막힐 수 있음)
-    const url = `https://m.map.naver.com/search2/search.naver?query=${encodeURIComponent(q)}`;
-
-    const context = await this.__newContext("https://m.map.naver.com/");
-    const page = await this.__newLightPage(context, Number(process.env.MAP_GOTO_TIMEOUT_MS || 25000));
-
-    const buf: string[] = [];
-    const onResponse = async (res: any) => {
-      try {
-        const rt = res.request().resourceType();
-        if (rt !== "xhr" && rt !== "fetch" && rt !== "script") return;
-
-        const text = await res.text().catch(() => "");
-        if (!text) return;
-        if (!/(placeId|\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/\d{5,12})/.test(text))
-          return;
-
-        buf.push(text);
-        if (buf.length > 60) buf.shift();
-      } catch {}
-    };
-
-    const onHttpFail = async (res: any) => {
-      try {
-        const st = res.status?.() ?? 0;
-        const u = res.url?.() ?? "";
-        if (st >= 400 && /naver\.com/.test(u)) console.warn("[COMP][mapRank][HTTP]", st, u);
-      } catch {}
-    };
-
-    page.on("response", onResponse);
-    page.on("response", onHttpFail);
-
-    try {
-      const resp = await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => null);
-      const st = resp?.status?.() ?? -1;
-      if (st >= 400) console.warn("[COMP][mapRank] m.map goto status", st, url);
-
-      await page.waitForTimeout(1000);
-
-      const mergedText = buf.join("\n");
-      let ids = this.__extractPlaceIdsFromAnyTextInOrder(mergedText);
-
-      if (ids.length < 5) {
-        const html = await page.content().catch(() => "");
-        ids = this.__mergeInOrder(ids, this.__extractPlaceIdsFromAnyTextInOrder(html));
-      }
-
-      const out: string[] = [];
-      const seen = new Set<string>();
-      for (const id of ids) {
-        if (!id) continue;
-        if (exclude && id === exclude) continue;
-        if (seen.has(id)) continue;
-        seen.add(id);
-        out.push(id);
-        if (out.length >= limit) break;
-      }
-
-      return out;
-    } finally {
-      try {
-        page.off("response", onResponse);
-        page.off("response", onHttpFail);
-      } catch {}
-      try {
-        await page.close();
-      } catch {}
-      try {
-        await context.close();
-      } catch {}
-    }
+    if (out.length) return out;
+  } catch (e) {
+    console.warn("[COMP][mapRank] allSearch failed:", e);
   }
+
+  // 2) m.map (막힐 확률 높음) — ✅ 여기서 25초 쓰면 바깥 timeout에 잘림
+  //    그래서 남은 예산만큼만 시도
+  const left = remaining();
+  if (left < 700) return [];
+
+  const url = `https://m.map.naver.com/search2/search.naver?query=${encodeURIComponent(q)}`;
+
+  const context = await this.__newContext("https://m.map.naver.com/");
+  const page = await this.__newLightPage(context, Math.min(left, 6000));
+
+  const buf: string[] = [];
+  const onResponse = async (res: any) => {
+    try {
+      const req = res.request();
+      const rt = req.resourceType();
+      if (rt !== "xhr" && rt !== "fetch" && rt !== "script") return;
+
+      const text = await res.text().catch(() => "");
+      if (!text) return;
+
+      if (!/(placeId|\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/\d{5,12})/.test(text))
+        return;
+
+      buf.push(text);
+      if (buf.length > 60) buf.shift();
+    } catch {}
+  };
+
+  const onHttpFail = async (res: any) => {
+    try {
+      const st = res.status?.() ?? 0;
+      const u = res.url?.() ?? "";
+      if (st >= 400 && /naver\.com/.test(u)) console.warn("[COMP][mapRank][HTTP]", st, u);
+    } catch {}
+  };
+
+  page.on("response", onResponse);
+  page.on("response", onHttpFail);
+
+  try {
+    const gotoBudget = Math.min(remaining(), 5500);
+    const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: gotoBudget }).catch(() => null);
+    const st = resp?.status?.() ?? -1;
+    if (st >= 400) console.warn("[COMP][mapRank] m.map goto status", st, url);
+
+    await page.waitForTimeout(Math.min(800, remaining()));
+
+    const mergedText = buf.join("\n");
+    let ids = this.__extractPlaceIdsFromAnyTextInOrder(mergedText);
+
+    if (ids.length < 5) {
+      const html = await page.content().catch(() => "");
+      ids = this.__mergeInOrder(ids, this.__extractPlaceIdsFromAnyTextInOrder(html));
+    }
+
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const id of ids) {
+      if (!id) continue;
+      if (exclude && id === exclude) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+      if (out.length >= limit) break;
+    }
+
+    return out;
+  } finally {
+    try {
+      page.off("response", onResponse);
+      page.off("response", onHttpFail);
+    } catch {}
+    try {
+      await page.close();
+    } catch {}
+    try {
+      await context.close();
+    } catch {}
+  }
+}
 
   // ==========================
   // ✅ 2) 메인
@@ -395,7 +410,11 @@ export class CompetitorService {
     const deadline = this.__deadlineMs(totalTimeoutMs);
 
     // 1) map rank
-    const mapIds = await this.findTopPlaceIdsFromMapRank(q, { excludePlaceId: exclude, limit }).catch(() => []);
+    const mapIds = await this.findTopPlaceIdsFromMapRank(q, {
+  excludePlaceId: exclude,
+  limit,
+  timeoutMs: Math.min(6500, Math.max(2500, this.__remaining(deadline))) // ✅ perTry 예산 안에서 끝내기
+}).catch(() => []);
 
     // 2) fallback: search where=place
     let metas: PlaceMeta[] = [];
@@ -448,6 +467,7 @@ export class CompetitorService {
         .filter(Boolean)
         .filter((k) => k.length >= 2 && k.length <= 25)
         .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
+        .filter((k) => !/(이전\s*페이지|다음\s*페이지|동영상|이미지|갯수|페이지|홈\s*으로|공지|업데이트)/.test(k))
         .slice(0, 5);
 
       const safeKeywords = finalKeywords.length ? finalKeywords : ["대표키워드없음"];
