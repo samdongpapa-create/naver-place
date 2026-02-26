@@ -1,5 +1,5 @@
 // src/services/competitorService.ts
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page, type Frame } from "playwright";
 
 type FindTopIdsOptions = {
   excludePlaceId?: string;
@@ -96,7 +96,6 @@ export class CompetitorService {
       .trim();
   }
 
-  // ✅ “업체명”으로 쓰면 안되는 텍스트들 강하게 차단
   private __isBannedName(name: string) {
     const n = this.__cleanText(name);
     if (!n) return true;
@@ -205,13 +204,13 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 0) allSearch JSON (가능하면)
+  // ✅ 0) allSearch JSON
   // ==========================
   private async __findTopPlaceIdsViaAllSearch(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
     const q = String(keyword || "").trim();
     if (!q) return [];
 
-    const searchCoord = this.__normalizeSearchCoord(); // ✅ 필수
+    const searchCoord = this.__normalizeSearchCoord();
     const boundary = String(process.env.NAVER_MAP_BOUNDARY || "").trim();
 
     const tryOnce = async (useBoundary: boolean, ms: number) => {
@@ -219,7 +218,7 @@ export class CompetitorService {
       url.searchParams.set("query", q);
       url.searchParams.set("type", "all");
       url.searchParams.set("page", "1");
-      url.searchParams.set("searchCoord", searchCoord); // ✅ 필수
+      url.searchParams.set("searchCoord", searchCoord);
       if (useBoundary && boundary) url.searchParams.set("boundary", boundary);
 
       const ctrl = new AbortController();
@@ -279,7 +278,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 1) 지도 TOP placeId (우선순위: allSearch → m.map(있으면))
+  // ✅ 1) 지도 TOP placeId (allSearch → m.map)
   // ==========================
   async findTopPlaceIdsFromMapRank(keyword: string, opts: FindTopIdsOptions = {}) {
     const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
@@ -287,7 +286,6 @@ export class CompetitorService {
     const q = String(keyword || "").trim();
     if (!q) return [];
 
-    // 1) allSearch
     const ids0 = await this.__findTopPlaceIdsViaAllSearch(q, limit + 5, 4500).catch(() => []);
     if (ids0.length) {
       const out: string[] = [];
@@ -303,7 +301,6 @@ export class CompetitorService {
       if (out.length) return out;
     }
 
-    // 2) m.map (막히면 500)
     const url = `https://m.map.naver.com/search2/search.naver?query=${encodeURIComponent(q)}`;
 
     const context = await this.__newContext("https://m.map.naver.com/");
@@ -318,7 +315,6 @@ export class CompetitorService {
 
         const text = await res.text().catch(() => "");
         if (!text) return;
-
         if (!/(placeId|\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/\d{5,12})/.test(text))
           return;
 
@@ -458,7 +454,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ place home: 대표키워드/이름 추출 (DOM 기반 보강)
+  // ✅ place home: 대표키워드/이름 추출 (lazy-load 대응: 더보기 + 스크롤)
   // ==========================
   private async __fetchPlaceHomeAndExtract(
     placeId: string,
@@ -486,7 +482,7 @@ export class CompetitorService {
     url: string,
     timeoutMs: number
   ): Promise<{ name: string; keywords: string[]; loaded: boolean }> {
-    const netState = { name: "", keywords: [] as string[] };
+    const state = { name: "", keywords: [] as string[] };
     let loaded = false;
 
     const context = await this.__newContext("https://m.place.naver.com/");
@@ -501,7 +497,6 @@ export class CompetitorService {
         const txt = await res.text().catch(() => "");
         if (!txt || txt.length < 20) return;
 
-        // 키워드 관련 endpoint는 content-type이 애매한 경우가 많아서 URL/본문 키워드로만 필터링
         const looksLikeKeyword =
           /(keywordList|representKeywordList|representKeywords|keywords|representative)/i.test(u) ||
           /(keywordList|representKeywordList|representKeywords|keywords|representative)/.test(txt);
@@ -511,12 +506,12 @@ export class CompetitorService {
         const j = this.__safeJsonParse(txt);
         if (!j) return;
 
-        if (!netState.name) {
+        if (!state.name) {
           const nm = this.__deepFindName(j);
-          if (nm && !this.__isBannedName(nm)) netState.name = nm;
+          if (nm && !this.__isBannedName(nm)) state.name = nm;
         }
 
-        if (!netState.keywords.length) {
+        if (!state.keywords.length) {
           for (const k of [
             "keywordList",
             "representKeywordList",
@@ -527,7 +522,7 @@ export class CompetitorService {
           ]) {
             const arr = this.__deepFindStringArray(j, k);
             if (arr.length) {
-              netState.keywords = arr;
+              state.keywords = arr;
               break;
             }
           }
@@ -539,8 +534,8 @@ export class CompetitorService {
 
     try {
       const resp = await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => null);
-
       const status = resp?.status?.() ?? -1;
+
       const finalUrl = page.url();
       const outer = await page.content().catch(() => "");
       const pageTitle = await page.title().catch(() => "");
@@ -549,48 +544,50 @@ export class CompetitorService {
 
       console.log("[COMP][placeHome] goto", { status, url, finalUrl, title: pageTitle, htmlLen: outer.length });
 
-      // 1) outer에서 name 후보 먼저
-      if (!netState.name) {
+      // 이름 보강 (outer)
+      if (!state.name) {
         const og = this.__extractOgTitle(outer);
-        if (og && !this.__isBannedName(og)) netState.name = og;
+        if (og && !this.__isBannedName(og)) state.name = og;
       }
-      if (!netState.name) {
-        const ldName = this.__extractNameFromLdJson(outer);
-        if (ldName && !this.__isBannedName(ldName)) netState.name = ldName;
-      }
-
-      // 2) entryIframe 진입
-      const iframeHandle = await page
-        .waitForSelector('iframe#entryIframe, iframe[name="entryIframe"]', { timeout: Math.min(8000, timeoutMs) })
-        .catch(() => null);
-
-      let frame: any = null;
-      if (iframeHandle) frame = await iframeHandle.contentFrame().catch(() => null);
-
-      if (frame) {
-        await frame.waitForLoadState("domcontentloaded").catch(() => {});
-        await frame.waitForTimeout(300).catch(() => {});
+      if (!state.name) {
+        const ld = this.__extractNameFromLdJson(outer);
+        if (ld && !this.__isBannedName(ld)) state.name = ld;
       }
 
-      const frameHtml = frame ? await frame.content().catch(() => "") : "";
+      // iframe 찾기 (더 robust)
+      const frame = await this.__resolveEntryFrame(page, timeoutMs);
+      if (!frame) {
+        // iframe이 없으면 page DOM에서라도 키워드 시도
+        const domFallback = await this.__extractKeywordsFromPageDomSmart(page).catch(() => []);
+        if (domFallback.length) state.keywords = domFallback;
 
-      // 3) frame에서 name 보강
-      if (frameHtml && !netState.name) {
+        const cleanedKeywords = this.__finalizeKeywords(state.keywords);
+        return { name: this.__cleanText(state.name), keywords: cleanedKeywords, loaded };
+      }
+
+      // ✅ lazy-load 대응 (핵심): 더보기 클릭 + 자동 스크롤
+      await this.__expandAndScrollFrame(frame, timeoutMs).catch(() => {});
+
+      // frame HTML
+      const frameHtml = await frame.content().catch(() => "");
+
+      // 이름 보강 (frame)
+      if (frameHtml && !state.name) {
         const og = this.__extractOgTitle(frameHtml);
-        if (og && !this.__isBannedName(og)) netState.name = og;
+        if (og && !this.__isBannedName(og)) state.name = og;
       }
-      if (frameHtml && !netState.name) {
-        const ldName = this.__extractNameFromLdJson(frameHtml);
-        if (ldName && !this.__isBannedName(ldName)) netState.name = ldName;
+      if (frameHtml && !state.name) {
+        const ld = this.__extractNameFromLdJson(frameHtml);
+        if (ld && !this.__isBannedName(ld)) state.name = ld;
       }
 
-      // 4) __NEXT_DATA__ 파싱 시도 (outer / frame)
+      // NEXT_DATA 보강 (outer/frame)
       const nextOuter = this.__parseNextData(outer);
-      if (nextOuter && !netState.name) {
+      if (nextOuter && !state.name) {
         const nm = this.__deepFindName(nextOuter);
-        if (nm && !this.__isBannedName(nm)) netState.name = nm;
+        if (nm && !this.__isBannedName(nm)) state.name = nm;
       }
-      if (nextOuter && !netState.keywords.length) {
+      if (nextOuter && !state.keywords.length) {
         for (const k of [
           "keywordList",
           "representKeywordList",
@@ -601,7 +598,7 @@ export class CompetitorService {
         ]) {
           const arr = this.__deepFindStringArray(nextOuter, k);
           if (arr.length) {
-            netState.keywords = arr;
+            state.keywords = arr;
             break;
           }
         }
@@ -609,11 +606,11 @@ export class CompetitorService {
 
       if (frameHtml) {
         const nextFrame = this.__parseNextData(frameHtml);
-        if (nextFrame && !netState.name) {
+        if (nextFrame && !state.name) {
           const nm = this.__deepFindName(nextFrame);
-          if (nm && !this.__isBannedName(nm)) netState.name = nm;
+          if (nm && !this.__isBannedName(nm)) state.name = nm;
         }
-        if (nextFrame && !netState.keywords.length) {
+        if (nextFrame && !state.keywords.length) {
           for (const k of [
             "keywordList",
             "representKeywordList",
@@ -624,38 +621,40 @@ export class CompetitorService {
           ]) {
             const arr = this.__deepFindStringArray(nextFrame, k);
             if (arr.length) {
-              netState.keywords = arr;
+              state.keywords = arr;
               break;
             }
           }
         }
 
-        // regex fallback
-        if (!netState.keywords.length) {
+        if (!state.keywords.length) {
           const fallback = this.__extractKeywordArrayByRegex(frameHtml);
-          if (fallback.length) netState.keywords = fallback;
+          if (fallback.length) state.keywords = fallback;
         }
       }
 
-      // ✅ 5) 최종 보루: DOM에서 “대표 키워드 칩” 직접 추출 (가장 중요)
-      // - 실제 화면에서 대표키워드는 보통 "a[href*='search?query=']" 형태로 존재
-      if (frame && !netState.keywords.length) {
+      // ✅ DOM smart (대표키워드 칩)
+      if (!state.keywords.length) {
         const domSmart = await this.__extractKeywordsFromDomSmart(frame).catch(() => []);
-        if (domSmart.length) netState.keywords = domSmart;
+        if (domSmart.length) state.keywords = domSmart;
       }
-      if (!netState.keywords.length && frame) {
+
+      // 마지막 보루: 광범위 DOM
+      if (!state.keywords.length) {
         const domWide = await this.__extractKeywordsFromDomWide(frame).catch(() => []);
-        if (domWide.length) netState.keywords = domWide;
+        if (domWide.length) state.keywords = domWide;
       }
 
-      const cleanedKeywords = (netState.keywords || [])
-        .map((k) => this.__cleanText(k))
-        .filter(Boolean)
-        .filter((k) => k.length >= 2 && k.length <= 25)
-        .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
-        .slice(0, 5);
+      const cleanedKeywords = this.__finalizeKeywords(state.keywords);
 
-      return { name: this.__cleanText(netState.name), keywords: cleanedKeywords, loaded };
+      console.log("[COMP][placeHome] extracted", {
+        finalUrl,
+        name: this.__cleanText(state.name),
+        kwCount: cleanedKeywords.length,
+        keywords: cleanedKeywords
+      });
+
+      return { name: this.__cleanText(state.name), keywords: cleanedKeywords, loaded };
     } catch {
       return { name: "", keywords: [], loaded: false };
     } finally {
@@ -671,7 +670,97 @@ export class CompetitorService {
     }
   }
 
-  // ✅ 대표키워드 “칩/링크”를 정확히 노리는 DOM 추출
+  // ==========================
+  // ✅ frame 찾기 강화
+  // ==========================
+  private async __resolveEntryFrame(page: Page, timeoutMs: number): Promise<Frame | null> {
+    // 1) 표준 entryIframe
+    const h1 = await page.waitForSelector('iframe#entryIframe, iframe[name="entryIframe"]', { timeout: Math.min(7000, timeoutMs) }).catch(() => null);
+    const f1 = h1 ? await h1.contentFrame().catch(() => null) : null;
+    if (f1) return f1;
+
+    // 2) iframe 여러개 중 “place/hairshop/restaurant/cafe” 관련 src 가진 것
+    const handles = await page.$$("iframe").catch(() => []);
+    for (const h of handles) {
+      const src = (await h.getAttribute("src").catch(() => "")) || "";
+      if (/(place|hairshop|restaurant|cafe)/i.test(src)) {
+        const f = await h.contentFrame().catch(() => null);
+        if (f) return f;
+      }
+    }
+
+    // 3) 그래도 없으면 page.frames()에서 후보 찾기
+    const frames = page.frames();
+    for (const f of frames) {
+      const u = f.url() || "";
+      if (/(place|hairshop|restaurant|cafe)/i.test(u)) return f;
+    }
+
+    return null;
+  }
+
+  // ==========================
+  // ✅ lazy-load 유도: 더보기/펼치기 클릭 + 스크롤
+  // ==========================
+  private async __expandAndScrollFrame(frame: Frame, timeoutMs: number) {
+    // 버튼 클릭 몇 번
+    const clickTexts = ["더보기", "정보 더보기", "펼치기", "접기", "전체보기"];
+    for (const t of clickTexts) {
+      try {
+        const loc = frame.locator(`text=${t}`).first();
+        if ((await loc.count().catch(() => 0)) > 0) {
+          await loc.click({ timeout: Math.min(1500, timeoutMs) }).catch(() => {});
+          await frame.waitForTimeout(180).catch(() => {});
+        }
+      } catch {}
+    }
+
+    // 스크롤 (lazy-load)
+    const steps = 10;
+    for (let i = 0; i < steps; i++) {
+      try {
+        await frame.evaluate((n) => {
+          const d: any = (globalThis as any).document;
+          const el = d?.scrollingElement || d?.documentElement || d?.body;
+          if (!el) return;
+          el.scrollTop = Math.floor((el.scrollHeight || 0) * (n / 10));
+        }, i + 1);
+      } catch {}
+      await frame.waitForTimeout(220).catch(() => {});
+    }
+
+    // 최상단으로 한 번 복귀
+    try {
+      await frame.evaluate(() => {
+        const d: any = (globalThis as any).document;
+        const el = d?.scrollingElement || d?.documentElement || d?.body;
+        if (el) el.scrollTop = 0;
+      });
+    } catch {}
+    await frame.waitForTimeout(120).catch(() => {});
+  }
+
+  private __finalizeKeywords(keywords: string[]) {
+    const cleaned = (keywords || [])
+      .map((k) => this.__cleanText(k))
+      .filter(Boolean)
+      .filter((k) => k.length >= 2 && k.length <= 25)
+      .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k));
+
+    const uniq: string[] = [];
+    const seen = new Set<string>();
+    for (const s of cleaned) {
+      const key = s.replace(/\s+/g, "");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      uniq.push(s);
+    }
+    return uniq.slice(0, 5);
+  }
+
+  // ==========================
+  // ✅ DOM: 대표키워드 “칩/검색링크” 추출
+  // ==========================
   private async __extractKeywordsFromDomSmart(frame: any): Promise<string[]> {
     const raw: string[] = await frame.evaluate(() => {
       const out: string[] = [];
@@ -685,24 +774,20 @@ export class CompetitorService {
         out.push(s.replace(/^#/, ""));
       };
 
-      // 대표키워드 칩은 대개 검색링크로 연결됨
       const nodes: any[] = Array.from(d.querySelectorAll('a[href*="search?query="], a[href*="/search?query="]'));
       for (const a of nodes) {
         const t = String(a?.innerText || a?.textContent || "").replace(/\s+/g, " ").trim();
         if (!t) continue;
-        // "대표 키워드" 섹션 근처에서만 잡히도록 너무 긴 문장은 제외
         if (t.length > 25) continue;
         push(t);
         if (out.length >= 20) break;
       }
 
-      // 혹시 해시태그로만 존재할 때 대비
       if (out.length < 3) {
         const tags: any[] = Array.from(d.querySelectorAll("span, a, button"));
         for (const el of tags) {
           const t = String(el?.innerText || el?.textContent || "").trim();
-          if (!t) continue;
-          if (!t.startsWith("#")) continue;
+          if (!t || !t.startsWith("#")) continue;
           push(t);
           if (out.length >= 20) break;
         }
@@ -711,24 +796,9 @@ export class CompetitorService {
       return out;
     });
 
-    const cleaned = raw
-      .map((x) => this.__cleanText(x))
-      .filter(Boolean)
-      .filter((x) => x.length >= 2 && x.length <= 25)
-      .filter((x) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천|영업|휴무|길찾기|전화)/.test(x));
-
-    const uniq: string[] = [];
-    const seen = new Set<string>();
-    for (const s of cleaned) {
-      const k = s.replace(/\s+/g, "");
-      if (seen.has(k)) continue;
-      seen.add(k);
-      uniq.push(s);
-    }
-    return uniq.slice(0, 5);
+    return this.__finalizeKeywords(raw);
   }
 
-  // ✅ 광범위 DOM 추출 (보조)
   private async __extractKeywordsFromDomWide(frame: any): Promise<string[]> {
     const raw: string[] = await frame.evaluate(() => {
       const texts: string[] = [];
@@ -750,37 +820,40 @@ export class CompetitorService {
       return texts;
     });
 
-    const cleaned = raw
-      .map((x) => this.__cleanText(x))
-      .filter(Boolean)
-      .filter((x) => x.length >= 2 && x.length <= 25)
-      .filter((x) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천|영업|휴무|길찾기|전화)/.test(x));
+    // 넓게 긁은 건 잡음이 많으니 finalize에서 중복/금칙만 정리
+    return this.__finalizeKeywords(raw);
+  }
 
-    const uniq: string[] = [];
-    const seen = new Set<string>();
-    const score = (s: string) => {
-      let sc = 0;
-      if (/(역|동|구|로|길)/.test(s)) sc += 2;
-      if (/(미용실|헤어|살롱|펌|염색|커트|컷|클리닉|카페|맛집|식당|브런치|디저트)/.test(s)) sc += 2;
-      if (/[가-힣]/.test(s)) sc += 1;
-      if (/^(리뷰|사진|예약|문의|가격|메뉴)$/.test(s)) sc -= 3;
-      return sc;
-    };
+  // iframe 못 잡았을 때, page DOM에서라도 칩 추출
+  private async __extractKeywordsFromPageDomSmart(page: Page): Promise<string[]> {
+    const raw: string[] = await page.evaluate(() => {
+      const out: string[] = [];
+      const d: any = (globalThis as any).document;
+      if (!d || !d.querySelectorAll) return out;
 
-    cleaned
-      .sort((a, b) => score(b) - score(a))
-      .forEach((s) => {
-        const k = s.replace(/\s+/g, "");
-        if (seen.has(k)) return;
-        seen.add(k);
-        uniq.push(s);
-      });
+      const push = (t: any) => {
+        const s = String(t ?? "").replace(/\s+/g, " ").trim();
+        if (!s) return;
+        if (s.length < 2 || s.length > 25) return;
+        out.push(s.replace(/^#/, ""));
+      };
 
-    return uniq.slice(0, 5);
+      const nodes: any[] = Array.from(d.querySelectorAll('a[href*="search?query="], a[href*="/search?query="]'));
+      for (const a of nodes) {
+        const t = String(a?.innerText || a?.textContent || "").replace(/\s+/g, " ").trim();
+        if (!t) continue;
+        if (t.length > 25) continue;
+        push(t);
+        if (out.length >= 20) break;
+      }
+      return out;
+    });
+
+    return this.__finalizeKeywords(raw);
   }
 
   // ==========================
-  // helpers
+  // generic helpers
   // ==========================
   private async __withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
     const t = new Promise<T>((_, reject) => {
@@ -830,7 +903,6 @@ export class CompetitorService {
   private __extractOgTitle(html: string): string {
     const m1 = String(html || "").match(/property=["']og:title["'][^>]*content=["']([^"']{2,120})["']/i);
     if (!m1?.[1]) return "";
-    // "상호 : 네이버" 형태일 때 상호만 남기기
     const t = String(m1[1]).replace(/\s*:\s*네이버.*$/i, "").trim();
     return this.__cleanText(t);
   }
@@ -919,16 +991,13 @@ export class CompetitorService {
       const inside = m[1] || "";
       const parsed = this.__safeJsonParse(inside);
       if (Array.isArray(parsed)) {
-        const out = parsed
-          .map((v) => (typeof v === "string" ? this.__cleanText(v) : this.__cleanText(v?.keyword ?? v?.name ?? v?.text ?? "")))
-          .filter(Boolean)
-          .filter((s) => s.length >= 2 && s.length <= 25)
-          .filter((s) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(s));
-        if (out.length) return Array.from(new Set(out));
+        return this.__finalizeKeywords(
+          parsed.map((v) => (typeof v === "string" ? v : v?.keyword ?? v?.name ?? v?.text ?? ""))
+        );
       }
 
-      const strs = [...inside.matchAll(/"([^"]{2,40})"/g)].map((x) => this.__cleanText(x[1])).filter(Boolean);
-      if (strs.length) return Array.from(new Set(strs));
+      const strs = [...inside.matchAll(/"([^"]{2,40})"/g)].map((x) => x[1]).filter(Boolean);
+      if (strs.length) return this.__finalizeKeywords(strs);
     }
 
     return [];
