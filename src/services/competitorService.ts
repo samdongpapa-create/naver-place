@@ -728,186 +728,200 @@ export class CompetitorService {
   }
 
   private async __renderAndExtractFromPlaceHome(
-    url: string,
-    timeoutMs: number
-  ): Promise<{ name: string; keywords: string[]; loaded: boolean }> {
-    const netState = { name: "", keywords: [] as string[] };
-let loaded = false;
+  url: string,
+  timeoutMs: number
+): Promise<{ name: string; keywords: string[]; loaded: boolean }> {
+  const netState = { name: "", keywords: [] as string[] };
+  let loaded = false;
 
-// ✅ 여기 추가
-const state = netState;
+  const context = await this.__newContext("https://m.place.naver.com/");
+  const page = await this.__newLightPage(context, timeoutMs);
 
-const onResponse = async (res:any) => {
-  // ... state.name / state.keywords 사용 ...
-}
-    const context = await this.__newContext("https://m.place.naver.com/");
-    const page = await this.__newLightPage(context, timeoutMs);
-
-    const onResponse = async (res: any) => {
-      try {
-        const rt = res.request().resourceType();
-        if (rt !== "xhr" && rt !== "fetch" && rt !== "script") return;
-
-        const txt = await res.text().catch(() => "");
-        if (!txt || txt.length < 20) return;
-
-        if (!/(keywordList|representKeywordList|representKeywords|keywords|representativeKeywords|representativeKeywordList)/.test(txt))
-          return;
-
-        const j = this.__safeJsonParse(txt);
-        if (!j) return;
-
-        if (!state.name) {
-          const nm = this.__deepFindName(j);
-          if (nm && !this.__isBannedName(nm)) state.name = nm;
-        }
-
-        if (!state.keywords.length) {
-          for (const k of [
-            "keywordList",
-            "representKeywordList",
-            "representKeywords",
-            "keywords",
-            "representativeKeywords",
-            "representativeKeywordList"
-          ]) {
-            const arr = this.__deepFindStringArray(j, k);
-            if (arr.length) {
-              state.keywords = arr;
-              break;
-            }
-          }
-        }
-      } catch {}
-    };
-
-    page.on("response", onResponse);
-
+  // ✅ 이름 충돌 방지: onResponse 변수명 고유화
+  const onResponseKw = async (res: any) => {
     try {
-      const resp = await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => null);
+      const req = res.request();
+      const rt = req.resourceType();
+      if (rt !== "xhr" && rt !== "fetch") return;
 
-      const status = resp?.status?.() ?? -1;
-      const finalUrl = page.url();
-      const outer = await page.content().catch(() => "");
-      const pageTitle = await page.title().catch(() => "");
+      const u = String(res.url?.() || "");
+      // ✅ 너무 무관한 응답 제외 (잡음 줄이기)
+      if (!/m\.place\.naver\.com/.test(u)) return;
 
-      loaded = status === 200 && outer.length > 500;
+      const ct = (await res.headerValue("content-type")) || "";
+      if (!/json|javascript/i.test(ct)) return;
 
-      console.log("[COMP][placeHome] goto", { status, url, finalUrl, title: pageTitle, htmlLen: outer.length });
+      const txt = await res.text().catch(() => "");
+      if (!txt || txt.length < 20) return;
 
-      // iframe 찾기
-      const frame = await this.__resolveEntryFrame(page, timeoutMs);
+      // ✅ 키워드 힌트 없으면 패스
+      if (!/(keywordList|representKeyword|representativeKeyword|representKeywordList|keywords)/i.test(txt)) return;
 
-      if (!frame) {
-        // iframe이 없으면 page DOM에서라도 시도
-        const domFallback = await this.__extractKeywordsFromPageDomSmart(page).catch(() => []);
-        if (domFallback.length) state.keywords = domFallback;
+      const j = this.__safeJsonParse(txt);
+      if (!j) return;
 
-        const cleanedKeywords = this.__finalizeKeywords(state.keywords);
-        return { name: this.__cleanText(state.name), keywords: cleanedKeywords, loaded };
+      // name
+      if (!netState.name) {
+        const nm = this.__deepFindName(j);
+        if (nm && !this.__isBannedName(nm)) netState.name = nm;
       }
 
-      // ✅ lazy-load 유도: 더보기 + 스크롤 (핵심)
-      await this.__expandAndScrollFrame(frame, timeoutMs).catch(() => {});
-
-      // ✅ (중요) 스크롤 직후 DOM smart 1차 시도
-      if (!state.keywords.length) {
-        const early = await this.__extractKeywordsFromDomSmart(frame).catch(() => []);
-        if (early.length) state.keywords = early;
-      }
-
-      const frameHtml = await frame.content().catch(() => "");
-
-      // NEXT_DATA 파싱 (outer + frame)
-      const nextOuter = this.__parseNextData(outer);
-      if (nextOuter) {
-        if (!state.name) {
-          const nm = this.__deepFindName(nextOuter);
-          if (nm && !this.__isBannedName(nm)) state.name = nm;
-        }
-        if (!state.keywords.length) {
-          for (const k of [
-            "keywordList",
-            "representKeywordList",
-            "representKeywords",
-            "keywords",
-            "representativeKeywords",
-            "representativeKeywordList"
-          ]) {
-            const arr = this.__deepFindStringArray(nextOuter, k);
-            if (arr.length) {
-              state.keywords = arr;
-              break;
-            }
+      // keywords
+      if (!netState.keywords.length) {
+        for (const k of [
+          "representKeywordList",
+          "representativeKeywordList",
+          "representKeywords",
+          "representativeKeywords",
+          "keywordList",
+          "keywords"
+        ]) {
+          const arr = this.__deepFindStringArray(j, k);
+          if (arr.length) {
+            netState.keywords = arr;
+            break;
           }
         }
       }
+    } catch {}
+  };
 
-      if (frameHtml) {
-        const nextFrame = this.__parseNextData(frameHtml);
-        if (nextFrame) {
-          if (!state.name) {
-            const nm = this.__deepFindName(nextFrame);
-            if (nm && !this.__isBannedName(nm)) state.name = nm;
-          }
-          if (!state.keywords.length) {
-            for (const k of [
-              "keywordList",
-              "representKeywordList",
-              "representKeywords",
-              "keywords",
-              "representativeKeywords",
-              "representativeKeywordList"
-            ]) {
-              const arr = this.__deepFindStringArray(nextFrame, k);
-              if (arr.length) {
-                state.keywords = arr;
-                break;
-              }
-            }
+  page.on("response", onResponseKw);
+
+  try {
+    const resp = await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => null);
+
+    const status = resp?.status?.() ?? -1;
+    const finalUrl = page.url();
+    const outer = await page.content().catch(() => "");
+    const pageTitle = await page.title().catch(() => "");
+
+    loaded = status === 200 && outer.length > 500;
+
+    console.log("[COMP][placeHome] goto", { status, url, finalUrl, title: pageTitle, htmlLen: outer.length });
+
+    // ✅ entry iframe/frame 얻기
+    const frame = await this.__resolveEntryFrame(page, timeoutMs);
+
+    // 1) outer NEXT_DATA에서도 한번 시도
+    const nextOuter = this.__parseNextData(outer);
+    if (nextOuter) {
+      if (!netState.name) {
+        const nm = this.__deepFindName(nextOuter);
+        if (nm && !this.__isBannedName(nm)) netState.name = nm;
+      }
+      if (!netState.keywords.length) {
+        for (const k of [
+          "representKeywordList",
+          "representativeKeywordList",
+          "representKeywords",
+          "representativeKeywords",
+          "keywordList",
+          "keywords"
+        ]) {
+          const arr = this.__deepFindStringArray(nextOuter, k);
+          if (arr.length) {
+            netState.keywords = arr;
+            break;
           }
         }
-
-        if (!state.keywords.length) {
-          const byRe = this.__extractKeywordArrayByRegex(frameHtml);
-          if (byRe.length) state.keywords = byRe;
-        }
       }
+    }
 
-      // DOM smart / wide
-      if (!state.keywords.length) {
-        const domSmart = await this.__extractKeywordsFromDomSmart(frame).catch(() => []);
-        if (domSmart.length) state.keywords = domSmart;
-      }
-      if (!state.keywords.length) {
-        const domWide = await this.__extractKeywordsFromDomWide(frame).catch(() => []);
-        if (domWide.length) state.keywords = domWide;
-      }
+    // ✅ 프레임이 없으면 페이지 DOM에서라도 시도하고 끝
+    if (!frame) {
+      const domFallback = await this.__extractKeywordsFromPageDomSmart(page).catch(() => []);
+      if (!netState.keywords.length && domFallback.length) netState.keywords = domFallback;
 
-      const cleanedKeywords = this.__finalizeKeywords(state.keywords);
-
+      const cleaned = this.__finalizeKeywords(netState.keywords);
       console.log("[COMP][placeHome] extracted", {
         finalUrl,
-        name: this.__cleanText(state.name),
-        kwCount: cleanedKeywords.length,
-        keywords: cleanedKeywords
+        name: this.__cleanText(netState.name),
+        kwCount: cleaned.length,
+        keywords: cleaned
       });
-
-      return { name: this.__cleanText(state.name), keywords: cleanedKeywords, loaded };
-    } catch {
-      return { name: "", keywords: [], loaded: false };
-    } finally {
-      try {
-        page.off("response", onResponse);
-      } catch {}
-      try {
-        await page.close();
-      } catch {}
-      try {
-        await context.close();
-      } catch {}
+      return { name: this.__cleanText(netState.name), keywords: cleaned, loaded };
     }
+
+    // ✅ lazy-load: 더보기/스크롤
+    await this.__expandAndScrollFrame(frame, timeoutMs).catch(() => {});
+
+    // 2) 스크롤 직후 DOM smart 우선
+    if (!netState.keywords.length) {
+      const early = await this.__extractKeywordsFromDomSmart(frame).catch(() => []);
+      if (early.length) netState.keywords = early;
+    }
+
+    // 3) frame html의 NEXT_DATA/regex
+    const frameHtml = await frame.content().catch(() => "");
+    if (frameHtml) {
+      const nextFrame = this.__parseNextData(frameHtml);
+      if (nextFrame) {
+        if (!netState.name) {
+          const nm = this.__deepFindName(nextFrame);
+          if (nm && !this.__isBannedName(nm)) netState.name = nm;
+        }
+        if (!netState.keywords.length) {
+          for (const k of [
+            "representKeywordList",
+            "representativeKeywordList",
+            "representKeywords",
+            "representativeKeywords",
+            "keywordList",
+            "keywords"
+          ]) {
+            const arr = this.__deepFindStringArray(nextFrame, k);
+            if (arr.length) {
+              netState.keywords = arr;
+              break;
+            }
+          }
+        }
+      }
+
+      if (!netState.keywords.length) {
+        const byRe = this.__extractKeywordArrayByRegex(frameHtml);
+        if (byRe.length) netState.keywords = byRe;
+      }
+    }
+
+    // 4) DOM wide 마지막 보루
+    if (!netState.keywords.length) {
+      const domWide = await this.__extractKeywordsFromDomWide(frame).catch(() => []);
+      if (domWide.length) netState.keywords = domWide;
+    }
+
+    // og:title fallback name
+    if (!netState.name) {
+      const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
+      const og = m1?.[1] ? this.__cleanText(m1[1]) : "";
+      if (og && !this.__isBannedName(og)) netState.name = og;
+    }
+
+    const cleanedKeywords = this.__finalizeKeywords(netState.keywords);
+
+    console.log("[COMP][placeHome] extracted", {
+      finalUrl,
+      name: this.__cleanText(netState.name),
+      kwCount: cleanedKeywords.length,
+      keywords: cleanedKeywords
+    });
+
+    return { name: this.__cleanText(netState.name), keywords: cleanedKeywords, loaded };
+  } catch {
+    return { name: "", keywords: [], loaded: false };
+  } finally {
+    try {
+      page.off("response", onResponseKw);
+    } catch {}
+    try {
+      await page.close();
+    } catch {}
+    try {
+      await context.close();
+    } catch {}
   }
+}
 
   private async __resolveEntryFrame(page: Page, timeoutMs: number): Promise<Frame | null> {
     // 1) 표준 entryIframe
