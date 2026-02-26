@@ -778,13 +778,24 @@ export class CompetitorService {
         if (rt !== "xhr" && rt !== "fetch" && rt !== "script") return;
 
         const ct = (await res.headerValue?.("content-type").catch(() => "")) || "";
-        if (!/json|javascript/i.test(ct)) return;
+const txt = await res.text().catch(() => "");
 
-        const txt = await res.text().catch(() => "");
-        if (!txt || txt.length < 20) return;
+if (!txt || txt.length < 20) return;
 
-        const j = this.__safeJsonParse(txt);
-        if (!j) return;
+// keywordList 관련 내용이 있으면 content-type 상관없이 파싱 시도
+const looksLikeKeywordPayload =
+  /(keywordList|representKeyword|representativeKeyword|hashTagList|hashTags|tags)/i.test(txt);
+
+const looksJsonish =
+  /json|javascript/i.test(ct) ||
+  /^\s*[\[{]/.test(txt) ||
+  txt.includes('{"') ||
+  txt.includes('["');
+
+if (!looksLikeKeywordPayload && !looksJsonish) return;
+
+const j = this.__safeJsonParse(txt);
+if (!j) return;
 
         if (!state.name) {
           const nm = this.__deepFindName(j);
@@ -1293,34 +1304,56 @@ export class CompetitorService {
   }
 
   private __extractKeywordArrayByRegex(html: string): string[] {
-    const text = String(html || "");
-    const re =
-      /"(?:representKeywordList|keywordList|representKeywords|keywords|representativeKeywords|representativeKeywordList|tags|hashTags|hashTagList)"\s*:\s*(\[[\s\S]*?\])/gi;
+  const text = String(html || "");
 
-    for (const m of text.matchAll(re)) {
-      const inside = m[1] || "";
-      const parsed = this.__safeJsonParse(inside);
+  const keyGroup =
+    "(?:representKeywordList|keywordList|representKeywords|keywords|representativeKeywords|representativeKeywordList|tags|hashTags|hashTagList)";
 
-      if (Array.isArray(parsed)) {
-        const picked = parsed
-          .map((v: any) => {
-            if (typeof v === "string") return v;
-            if (v && typeof v === "object") return v.keyword ?? v.name ?? v.text ?? v.title ?? "";
-            return "";
-          })
-          .filter(Boolean);
+  const patterns = [
+    // "keywordList": [...]
+    new RegExp(`"${keyGroup}"\\s*:\\s*(\\[[\\s\\S]*?\\])`, "gi"),
 
-        const fin = this.__finalizeKeywords(picked);
-        if (fin.length) return fin;
-      }
+    // keywordList: [...]
+    new RegExp(`${keyGroup}\\s*:\\s*(\\[[\\s\\S]*?\\])`, "gi"),
 
-      const strs = [...inside.matchAll(/"([^"]{2,40})"/g)].map((x) => x[1]).filter(Boolean);
-      const fin = this.__finalizeKeywords(strs);
-      if (fin.length) return fin;
+    // \"keywordList\": [...]
+    new RegExp(`\\\\\\"${keyGroup}\\\\\\"\\s*:\\s*(\\[[\\s\\S]*?\\])`, "gi")
+  ];
+
+  const tryParseArray = (inside: string): string[] => {
+    const parsed = this.__safeJsonParse(inside);
+
+    if (Array.isArray(parsed)) {
+      const picked = parsed
+        .map((v: any) => {
+          if (typeof v === "string") return v;
+          if (v && typeof v === "object")
+            return v.keyword ?? v.name ?? v.text ?? v.title ?? v.value ?? v.label ?? "";
+          return "";
+        })
+        .filter(Boolean);
+
+      return this.__finalizeKeywords(picked);
     }
 
-    return [];
+    // JSON parse 실패 시 문자열만 추출
+    const strs = [...inside.matchAll(/"([^"]{2,40})"/g)]
+      .map((x) => x[1])
+      .filter(Boolean);
+
+    return this.__finalizeKeywords(strs);
+  };
+
+  for (const re of patterns) {
+    for (const m of text.matchAll(re)) {
+      const inside = m[1] || "";
+      const fin = tryParseArray(inside);
+      if (fin.length) return fin;
+    }
   }
+
+  return [];
+}
 
   private __extractPlaceIdsFromAnyTextInOrder(text: string): string[] {
     const ids: string[] = [];
