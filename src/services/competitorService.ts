@@ -96,58 +96,62 @@ export class CompetitorService {
       .trim();
   }
 
+  // ✅ “업체명”으로 쓰면 안되는 텍스트들 강하게 차단
   private __isBannedName(name: string) {
     const n = this.__cleanText(name);
     if (!n) return true;
+
+    // 버튼/라벨류
     if (/^(광고|저장|길찾기|예약|전화|공유|블로그|리뷰|사진|홈|메뉴|가격)$/i.test(n)) return true;
+
+    // 공통 타이틀
     if (/^네이버\s*플레이스$/i.test(n)) return true;
     if (/네이버\s*플레이스/i.test(n) && n.length <= 12) return true;
+
+    // 리뷰/거리/카운트류(여기가 지금 니 로그의 “방문자리뷰 318” 문제)
+    if (/^방문\s*리뷰\s*\d+/i.test(n)) return true;
+    if (/^블로그\s*리뷰\s*\d+/i.test(n)) return true;
+    if (/리뷰\s*\d+/i.test(n) && n.length <= 15) return true;
+
+    // 거리/시간 등
+    if (/^\d+(\.\d+)?\s*(m|km)$/i.test(n)) return true;
+    if (/^\d+\s*분$/.test(n)) return true;
+
+    // “서대문역미용실” 같은 키워드 덩어리는 업체명으로 부적합한 경우 많음 → 너무 짧거나 정보성 문구면 컷
+    if (/^(서대문역|교대역|강남역|홍대입구역|종로|광화문)/.test(n) && /미용실|맛집|카페/.test(n) && n.length <= 10)
+      return true;
+
     return false;
   }
 
   // ==========================
-  // ✅ searchCoord 정규화 (필수!)
-  // - allSearch는 searchCoord 없으면 400
-  // - 형식은 "lng;lat"
+  // ✅ searchCoord 정규화 (allSearch 필수)
   // ==========================
   private __normalizeSearchCoord(): string {
     const raw = String(process.env.NAVER_MAP_SEARCH_COORD || "").trim();
-
-    // 기본값: 서울 시청 근처
-    const fallback = "126.9780;37.5665";
-
+    const fallback = "126.9780;37.5665"; // 서울 시청 근처 lng;lat
     if (!raw) return fallback;
 
-    // 허용: "126.97;37.56" / "126.97,37.56" / "37.56;126.97" 등
     const cleaned = raw.replace(/\s+/g, "");
 
-    // 케이스1: "lng;lat"
+    const parsePair = (a: string, b: string) => {
+      const n1 = Number(a);
+      const n2 = Number(b);
+      if (!Number.isFinite(n1) || !Number.isFinite(n2)) return fallback;
+      // 대략 lng(120~130), lat(33~38) → abs 기준으로 swap 방어
+      const looksLngLat = Math.abs(n1) > Math.abs(n2);
+      return looksLngLat ? `${n1};${n2}` : `${n2};${n1}`;
+    };
+
     if (/^-?\d+(\.\d+)?;-?\d+(\.\d+)?$/.test(cleaned)) {
       const [a, b] = cleaned.split(";");
-      const n1 = Number(a);
-      const n2 = Number(b);
-      if (Number.isFinite(n1) && Number.isFinite(n2)) {
-        // a=lng(대략 120~130), b=lat(대략 33~38)
-        const looksLngLat = Math.abs(n1) > Math.abs(n2);
-        if (looksLngLat) return `${n1};${n2}`;
-        // 반대로 들어왔을 수도 있으니 swap 시도
-        return `${n2};${n1}`;
-      }
+      return parsePair(a, b);
     }
-
-    // 케이스2: "lng,lat"
     if (/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/.test(cleaned)) {
       const [a, b] = cleaned.split(",");
-      const n1 = Number(a);
-      const n2 = Number(b);
-      if (Number.isFinite(n1) && Number.isFinite(n2)) {
-        const looksLngLat = Math.abs(n1) > Math.abs(n2);
-        if (looksLngLat) return `${n1};${n2}`;
-        return `${n2};${n1}`;
-      }
+      return parsePair(a, b);
     }
 
-    // 케이스3: 다른 형식이면 fallback
     return fallback;
   }
 
@@ -190,7 +194,28 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 0) allSearch JSON (searchCoord 필수)
+  // ✅ anti-XSSI prefix 제거 후 JSON 파싱
+  // ==========================
+  private __safeJsonParse(text: string): any | null {
+    const s0 = String(text || "").trim();
+    if (!s0) return null;
+
+    const s = s0
+      .replace(/^\)\]\}',?\s*\n?/, "")
+      .replace(/^for\s*\(\s*;\s*;\s*\)\s*;?\s*/, "")
+      .trim();
+
+    if (!(s.startsWith("{") || s.startsWith("["))) return null;
+
+    try {
+      return JSON.parse(s);
+    } catch {
+      return null;
+    }
+  }
+
+  // ==========================
+  // ✅ 0) allSearch JSON (가능하면)
   // ==========================
   private async __findTopPlaceIdsViaAllSearch(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
     const q = String(keyword || "").trim();
@@ -204,11 +229,7 @@ export class CompetitorService {
       url.searchParams.set("query", q);
       url.searchParams.set("type", "all");
       url.searchParams.set("page", "1");
-
-      // ✅ 필수
-      url.searchParams.set("searchCoord", searchCoord);
-
-      // ✅ boundary는 값 있을 때만
+      url.searchParams.set("searchCoord", searchCoord); // ✅ 필수
       if (useBoundary && boundary) url.searchParams.set("boundary", boundary);
 
       const ctrl = new AbortController();
@@ -250,7 +271,7 @@ export class CompetitorService {
     const budget = Math.max(1400, Math.min(4500, timeoutMs));
     const step = Math.floor(budget / 2);
 
-    // 1) boundary 포함(값 있을 때만 의미) → 2) boundary 없이
+    // boundary가 있으면 포함 시도 → 없으면 그냥 skip 느낌
     try {
       const ids1 = await tryOnce(true, step);
       if (ids1.length) return ids1;
@@ -269,7 +290,85 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 1) 지도 TOP placeId
+  // ✅ A) m.place 검색 (Playwright 렌더링) - Railway에서 제일 잘 살아남는 fallback
+  // ==========================
+  private async __findTopPlaceIdsFromMobilePlaceSearchRendered(
+    keyword: string,
+    limit: number,
+    timeoutMs: number
+  ): Promise<string[]> {
+    const q = String(keyword || "").trim();
+    if (!q) return [];
+
+    const url = `https://m.place.naver.com/search?query=${encodeURIComponent(q)}`;
+
+    const context = await this.__newContext("https://m.place.naver.com/");
+    const page = await this.__newLightPage(context, timeoutMs);
+
+    const buf: string[] = [];
+    const onResponse = async (res: any) => {
+      try {
+        const rt = res.request().resourceType();
+        if (rt !== "xhr" && rt !== "fetch" && rt !== "script") return;
+
+        const ct = (await res.headerValue("content-type")) || "";
+        if (!/json|javascript|text\/plain|html/i.test(ct)) return;
+
+        const text = await res.text().catch(() => "");
+        if (!text) return;
+
+        if (!/(placeId|\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/\d{5,12})/.test(text))
+          return;
+
+        buf.push(text);
+        if (buf.length > 80) buf.shift();
+      } catch {}
+    };
+
+    page.on("response", onResponse);
+
+    try {
+      const resp = await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => null);
+      const st = resp?.status?.() ?? -1;
+      if (st >= 400) console.warn("[COMP][mplaceSearch] goto status", st, url);
+
+      await page.waitForTimeout(1200);
+
+      let ids = this.__extractPlaceIdsFromAnyTextInOrder(buf.join("\n"));
+
+      // HTML에도 한 번 더
+      if (ids.length < limit) {
+        const html = await page.content().catch(() => "");
+        ids = this.__mergeInOrder(ids, this.__extractPlaceIdsFromAnyTextInOrder(html));
+      }
+
+      const out: string[] = [];
+      const seen = new Set<string>();
+      for (const id of ids) {
+        const pid = this.__normPlaceId(id);
+        if (!this.__isValidPlaceId(pid)) continue;
+        if (seen.has(pid)) continue;
+        seen.add(pid);
+        out.push(pid);
+        if (out.length >= limit) break;
+      }
+
+      return out;
+    } finally {
+      try {
+        page.off("response", onResponse);
+      } catch {}
+      try {
+        await page.close();
+      } catch {}
+      try {
+        await context.close();
+      } catch {}
+    }
+  }
+
+  // ==========================
+  // ✅ 1) 지도 TOP placeId (우선순위: allSearch → m.place 렌더링 → m.map(있으면))
   // ==========================
   async findTopPlaceIdsFromMapRank(keyword: string, opts: FindTopIdsOptions = {}) {
     const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
@@ -277,7 +376,7 @@ export class CompetitorService {
     const q = String(keyword || "").trim();
     if (!q) return [];
 
-    // 1순위 allSearch
+    // 1) allSearch
     const ids0 = await this.__findTopPlaceIdsViaAllSearch(q, limit + 5, 4500).catch(() => []);
     if (ids0.length) {
       const out: string[] = [];
@@ -293,7 +392,23 @@ export class CompetitorService {
       if (out.length) return out;
     }
 
-    // 2순위 m.map (500 자주 뜸)
+    // 2) m.place 렌더링 fallback (Railway에서 안정적으로 ids 잘 나옴)
+    const idsM = await this.__findTopPlaceIdsFromMobilePlaceSearchRendered(q, limit + 8, 9000).catch(() => []);
+    if (idsM.length) {
+      const out: string[] = [];
+      const seen = new Set<string>();
+      for (const id of idsM) {
+        if (!id) continue;
+        if (exclude && id === exclude) continue;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push(id);
+        if (out.length >= limit) break;
+      }
+      if (out.length) return out;
+    }
+
+    // 3) m.map (막히면 500)
     const url = `https://m.map.naver.com/search2/search.naver?query=${encodeURIComponent(q)}`;
 
     const context = await this.__newContext("https://m.map.naver.com/");
@@ -395,10 +510,11 @@ export class CompetitorService {
     if (!mapIds.length) {
       const remain = Math.min(15000, Math.max(4000, this.__remaining(deadline)));
 
+      // where=place는 이제 “id 확보용” 느낌으로만 쓰되, name은 더 엄격히 필터됨
       metas = await this.__findTopPlaceMetasFromSearchWherePlaceFetch(q, remain).catch(() => []);
       if (!metas.length) metas = await this.__findTopPlaceMetasFromSearchWherePlaceRendered(q, remain).catch(() => []);
 
-      // 마지막 보루: m.place 검색(fetch)
+      // 마지막 보루: m.place fetch
       if (!metas.length) {
         const ids = await this.__findTopPlaceIdsFromMobilePlaceSearchFetch(q, limit + 8, remain).catch(() => []);
         if (ids.length) metas = ids.map((id) => ({ placeId: id, name: "" }));
@@ -409,6 +525,10 @@ export class CompetitorService {
       .map((x) => ({ placeId: this.__normPlaceId(x.placeId), name: this.__cleanText(x.name || "") }))
       .filter((x) => this.__isValidPlaceId(x.placeId))
       .filter((x) => !(exclude && x.placeId === exclude))
+      .map((x) => ({
+        placeId: x.placeId,
+        name: this.__isBannedName(x.name) ? "" : x.name // ✅ 여기서 한 번 더 name 정리
+      }))
       .slice(0, limit);
 
     console.log("[COMP] query:", q);
@@ -482,10 +602,7 @@ export class CompetitorService {
     if (!q) return [];
 
     const url = `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`;
-    const html = await this.__fetchHtml(url, timeoutMs, "https://search.naver.com/").catch((e) => {
-      console.warn("[COMP][where=place][fetch] failed:", e);
-      return "";
-    });
+    const html = await this.__fetchHtml(url, timeoutMs, "https://search.naver.com/").catch(() => "");
     if (!html) return [];
 
     const reAnyPlaceId =
@@ -519,8 +636,8 @@ export class CompetitorService {
         .filter((t) => !this.__isBannedName(t));
 
       const name = titleMatches[0] || ariaMatches[0] || textMatches[0] || "";
-      metas.push({ placeId: pid, name });
-      if (metas.length >= 12) break;
+      metas.push({ placeId: pid, name: this.__isBannedName(name) ? "" : name });
+      if (metas.length >= 15) break;
     }
 
     return metas;
@@ -594,7 +711,7 @@ export class CompetitorService {
           const name = pickNameFromContainer(a);
           out.push({ placeId: pid, name });
 
-          if (out.length >= 200) break;
+          if (out.length >= 220) break;
         }
 
         return out;
@@ -609,22 +726,17 @@ export class CompetitorService {
         if (seen.has(pid)) continue;
 
         const name = this.__cleanText(it.name || "");
-        if (name && this.__isBannedName(name)) {
-          seen.add(pid);
-          metas.push({ placeId: pid, name: "" });
-        } else {
-          seen.add(pid);
-          metas.push({ placeId: pid, name });
-        }
+        metas.push({ placeId: pid, name: this.__isBannedName(name) ? "" : name });
 
-        if (metas.length >= 12) break;
+        seen.add(pid);
+        if (metas.length >= 15) break;
       }
 
       if (!metas.length) {
         const ids = items
           .map((x) => this.__normPlaceId(x.placeId))
           .filter((id) => this.__isValidPlaceId(id));
-        const uniq = Array.from(new Set(ids)).slice(0, 12);
+        const uniq = Array.from(new Set(ids)).slice(0, 15);
         return uniq.map((id) => ({ placeId: id, name: "" }));
       }
 
@@ -642,7 +754,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 마지막 보루: m.place 검색(fetch)
+  // ✅ m.place 검색 (fetch) - shell 페이지면 ids 안나올 수 있음
   // ==========================
   private async __findTopPlaceIdsFromMobilePlaceSearchFetch(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
     const q = String(keyword || "").trim();
@@ -657,11 +769,11 @@ export class CompetitorService {
     const out: string[] = [];
     const seen = new Set<string>();
     for (const id of ids) {
-      if (!id) continue;
-      if (!this.__isValidPlaceId(id)) continue;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      out.push(id);
+      const pid = this.__normPlaceId(id);
+      if (!this.__isValidPlaceId(pid)) continue;
+      if (seen.has(pid)) continue;
+      seen.add(pid);
+      out.push(pid);
       if (out.length >= limit) break;
     }
     return out;
@@ -769,10 +881,6 @@ export class CompetitorService {
             }
           }
 
-          if (!netState.keywords.length) {
-            const loose = this.__deepFindKeywordsLoose(j);
-            if (loose.length) netState.keywords = loose;
-          }
           return;
         }
 
@@ -811,82 +919,23 @@ export class CompetitorService {
 
       const frameHtml = frame ? await frame.content().catch(() => "") : "";
 
-      const nextFromOuter = this.__parseNextData(outer);
-      if (nextFromOuter) {
-        const nm = this.__deepFindName(nextFromOuter);
-        if (!netState.name && nm && !this.__isBannedName(nm)) netState.name = nm;
-
-        if (!netState.keywords.length) {
-          for (const k of [
-            "keywordList",
-            "representKeywordList",
-            "representKeywords",
-            "keywords",
-            "representativeKeywords",
-            "representativeKeywordList"
-          ]) {
-            const arr = this.__deepFindStringArray(nextFromOuter, k);
-            if (arr.length) {
-              netState.keywords = arr;
-              break;
-            }
-          }
-        }
-        if (!netState.keywords.length) {
-          const loose = this.__deepFindKeywordsLoose(nextFromOuter);
-          if (loose.length) netState.keywords = loose;
-        }
-      }
-
-      if (frameHtml) {
-        const next = this.__parseNextData(frameHtml);
-
-        const nm = this.__deepFindName(next);
-        if (!netState.name && nm && !this.__isBannedName(nm)) netState.name = nm;
-
-        if (!netState.keywords.length) {
-          for (const k of [
-            "keywordList",
-            "representKeywordList",
-            "representKeywords",
-            "keywords",
-            "representativeKeywords",
-            "representativeKeywordList"
-          ]) {
-            const arr = this.__deepFindStringArray(next, k);
-            if (arr.length) {
-              netState.keywords = arr;
-              break;
-            }
-          }
-        }
-
-        if (!netState.keywords.length) {
-          const loose = this.__deepFindKeywordsLoose(next);
-          if (loose.length) netState.keywords = loose;
-        }
-
-        if (!netState.keywords.length) {
-          const fallback = this.__extractKeywordArrayByRegex(frameHtml);
-          if (fallback.length) netState.keywords = fallback;
-        }
-      }
-
-      if (frame && !netState.keywords.length) {
-        const domKeywords = await this.__extractKeywordsFromDom(frame).catch(() => []);
-        if (domKeywords.length) netState.keywords = domKeywords;
-      }
-
+      // outer에서 og:title로 name 보강
       if (!netState.name) {
         const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
         const og = m1?.[1] ? this.__cleanText(m1[1]) : "";
         if (og && !this.__isBannedName(og)) netState.name = og;
       }
 
-      if (!netState.name && frameHtml) {
-        const m1 = frameHtml.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
-        const og = m1?.[1] ? this.__cleanText(m1[1]) : "";
-        if (og && !this.__isBannedName(og)) netState.name = og;
+      // frameHtml에서 regex 보강
+      if (frameHtml && !netState.keywords.length) {
+        const fallback = this.__extractKeywordArrayByRegex(frameHtml);
+        if (fallback.length) netState.keywords = fallback;
+      }
+
+      // DOM fallback
+      if (frame && !netState.keywords.length) {
+        const domKeywords = await this.__extractKeywordsFromDom(frame).catch(() => []);
+        if (domKeywords.length) netState.keywords = domKeywords;
       }
 
       const cleanedKeywords = (netState.keywords || [])
@@ -1005,30 +1054,6 @@ export class CompetitorService {
     };
   }
 
-  private __safeJsonParse(text: string): any | null {
-    const s0 = String(text || "").trim();
-    if (!s0) return null;
-
-    const s = s0
-      .replace(/^\)\]\}',?\s*\n?/, "")
-      .replace(/^for\s*\(\s*;\s*;\s*\)\s*;?\s*/, "")
-      .trim();
-
-    if (!(s.startsWith("{") || s.startsWith("["))) return null;
-
-    try {
-      return JSON.parse(s);
-    } catch {
-      return null;
-    }
-  }
-
-  private __parseNextData(html: string): any | null {
-    const m = String(html || "").match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
-    if (!m?.[1]) return null;
-    return this.__safeJsonParse(m[1]);
-  }
-
   private __deepCollect(obj: any, predicate: (x: any) => boolean, out: any[] = []) {
     if (!obj || typeof obj !== "object") return out;
     if (predicate(obj)) out.push(obj);
@@ -1040,56 +1065,14 @@ export class CompetitorService {
     return out;
   }
 
-  private __deepFindKeywordsLoose(obj: any): string[] {
-    const out: string[] = [];
-    const seen = new Set<string>();
-
-    const push = (v: any) => {
-      const t = this.__cleanText(String(v ?? ""));
-      if (!t) return;
-      if (t.length < 2 || t.length > 25) return;
-      if (/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천|길찾기|전화|공유|블로그|리뷰|사진|홈|메뉴)/.test(t))
-        return;
-      const key = t.replace(/\s+/g, "");
-      if (seen.has(key)) return;
-      seen.add(key);
-      out.push(t);
-    };
-
-    const hits = this.__deepCollect(obj, (x) => x && typeof x === "object" && !Array.isArray(x), []);
-    for (const h of hits) {
-      for (const k of ["keyword", "name", "text", "title", "value", "label", "displayName", "storeName"]) {
-        if (typeof (h as any)[k] === "string") push((h as any)[k]);
-      }
-    }
-
-    const score = (s: string) => {
-      let sc = 0;
-      if (/(역|동|구|로|길)/.test(s)) sc += 3;
-      if (/(미용실|헤어|살롱|펌|염색|커트|컷|클리닉|카페|맛집|식당|브런치|디저트)/.test(s)) sc += 3;
-      if (/[가-힣]/.test(s)) sc += 1;
-      return sc;
-    };
-
-    return out.sort((a, b) => score(b) - score(a)).slice(0, 5);
-  }
-
   private __deepFindStringArray(obj: any, keyName: string): string[] {
     const hits = this.__deepCollect(obj, (x) => x && typeof x === "object" && Array.isArray((x as any)[keyName]), []);
 
     const pickFromItem = (it: any): string => {
       if (typeof it === "string") return this.__cleanText(it);
-
       if (it && typeof it === "object") {
         const candKeys = ["keyword", "name", "text", "title", "value", "label"];
         for (const k of candKeys) {
-          const v = (it as any)[k];
-          if (typeof v === "string") {
-            const t = this.__cleanText(v);
-            if (t) return t;
-          }
-        }
-        for (const k of Object.keys(it)) {
           const v = (it as any)[k];
           if (typeof v === "string") {
             const t = this.__cleanText(v);
@@ -1107,7 +1090,6 @@ export class CompetitorService {
         .filter(Boolean)
         .filter((s) => s.length >= 2 && s.length <= 25)
         .filter((s) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(s));
-
       if (strs.length) return Array.from(new Set(strs));
     }
     return [];
@@ -1115,7 +1097,6 @@ export class CompetitorService {
 
   private __deepFindName(obj: any): string {
     const keyCandidates = ["name", "placeName", "businessName", "bizName", "displayName", "storeName", "partnerName", "title"];
-
     const hits = this.__deepCollect(
       obj,
       (x) => x && typeof x === "object" && keyCandidates.some((k) => typeof (x as any)[k] === "string"),
@@ -1141,27 +1122,12 @@ export class CompetitorService {
     const re1 =
       /"(?:representKeywordList|keywordList|representKeywords|keywords|representativeKeywords|representativeKeywordList)"\s*:\s*(\[[\s\S]*?\])/g;
 
-    const pickFromItem = (it: any): string => {
-      if (typeof it === "string") return this.__cleanText(it);
-      if (it && typeof it === "object") {
-        for (const k of ["keyword", "name", "text", "title", "value", "label"]) {
-          const v = (it as any)[k];
-          if (typeof v === "string") {
-            const t = this.__cleanText(v);
-            if (t) return t;
-          }
-        }
-      }
-      return "";
-    };
-
     for (const m of text.matchAll(re1)) {
       const inside = m[1] || "";
-
       const parsed = this.__safeJsonParse(inside);
       if (Array.isArray(parsed)) {
         const out = parsed
-          .map((v) => pickFromItem(v))
+          .map((v) => (typeof v === "string" ? this.__cleanText(v) : this.__cleanText(v?.keyword ?? v?.name ?? v?.text ?? "")))
           .filter(Boolean)
           .filter((s) => s.length >= 2 && s.length <= 25)
           .filter((s) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(s));
@@ -1187,7 +1153,7 @@ export class CompetitorService {
       if (!this.__isValidPlaceId(id)) continue;
       seen.add(id);
       ids.push(id);
-      if (ids.length >= 120) break;
+      if (ids.length >= 150) break;
     }
 
     if (ids.length < 10) {
@@ -1198,7 +1164,7 @@ export class CompetitorService {
         if (!this.__isValidPlaceId(id)) continue;
         seen.add(id);
         ids.push(id);
-        if (ids.length >= 120) break;
+        if (ids.length >= 150) break;
       }
     }
 
@@ -1210,7 +1176,7 @@ export class CompetitorService {
         if (!this.__isValidPlaceId(id)) continue;
         seen.add(id);
         ids.push(id);
-        if (ids.length >= 120) break;
+        if (ids.length >= 150) break;
       }
     }
 
