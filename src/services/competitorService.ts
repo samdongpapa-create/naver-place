@@ -106,6 +106,52 @@ export class CompetitorService {
   }
 
   // ==========================
+  // ✅ searchCoord 정규화 (필수!)
+  // - allSearch는 searchCoord 없으면 400
+  // - 형식은 "lng;lat"
+  // ==========================
+  private __normalizeSearchCoord(): string {
+    const raw = String(process.env.NAVER_MAP_SEARCH_COORD || "").trim();
+
+    // 기본값: 서울 시청 근처
+    const fallback = "126.9780;37.5665";
+
+    if (!raw) return fallback;
+
+    // 허용: "126.97;37.56" / "126.97,37.56" / "37.56;126.97" 등
+    const cleaned = raw.replace(/\s+/g, "");
+
+    // 케이스1: "lng;lat"
+    if (/^-?\d+(\.\d+)?;-?\d+(\.\d+)?$/.test(cleaned)) {
+      const [a, b] = cleaned.split(";");
+      const n1 = Number(a);
+      const n2 = Number(b);
+      if (Number.isFinite(n1) && Number.isFinite(n2)) {
+        // a=lng(대략 120~130), b=lat(대략 33~38)
+        const looksLngLat = Math.abs(n1) > Math.abs(n2);
+        if (looksLngLat) return `${n1};${n2}`;
+        // 반대로 들어왔을 수도 있으니 swap 시도
+        return `${n2};${n1}`;
+      }
+    }
+
+    // 케이스2: "lng,lat"
+    if (/^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/.test(cleaned)) {
+      const [a, b] = cleaned.split(",");
+      const n1 = Number(a);
+      const n2 = Number(b);
+      if (Number.isFinite(n1) && Number.isFinite(n2)) {
+        const looksLngLat = Math.abs(n1) > Math.abs(n2);
+        if (looksLngLat) return `${n1};${n2}`;
+        return `${n2};${n1}`;
+      }
+    }
+
+    // 케이스3: 다른 형식이면 fallback
+    return fallback;
+  }
+
+  // ==========================
   // ✅ Playwright Context 생성
   // ==========================
   private async __newContext(baseReferer: string): Promise<BrowserContext> {
@@ -144,24 +190,26 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 0) allSearch JSON (안정화: boundary 빈값이면 넣지 말기 + 2회 재시도)
+  // ✅ 0) allSearch JSON (searchCoord 필수)
   // ==========================
   private async __findTopPlaceIdsViaAllSearch(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
     const q = String(keyword || "").trim();
     if (!q) return [];
 
-    const searchCoordEnv = String(process.env.NAVER_MAP_SEARCH_COORD || "126.9780;37.5665"); // lng;lat
-    const boundaryEnv = String(process.env.NAVER_MAP_BOUNDARY || "");
+    const searchCoord = this.__normalizeSearchCoord(); // ✅ 필수
+    const boundary = String(process.env.NAVER_MAP_BOUNDARY || "").trim();
 
-    const tryOnce = async (useCoord: boolean, useBoundary: boolean, ms: number) => {
+    const tryOnce = async (useBoundary: boolean, ms: number) => {
       const url = new URL("https://map.naver.com/p/api/search/allSearch");
       url.searchParams.set("query", q);
       url.searchParams.set("type", "all");
       url.searchParams.set("page", "1");
 
-      if (useCoord && searchCoordEnv) url.searchParams.set("searchCoord", searchCoordEnv);
-      // ✅ boundary는 "빈 문자열"이면 넣지 말아야 함 (여기서 깨지는 케이스가 있음)
-      if (useBoundary && boundaryEnv) url.searchParams.set("boundary", boundaryEnv);
+      // ✅ 필수
+      url.searchParams.set("searchCoord", searchCoord);
+
+      // ✅ boundary는 값 있을 때만
+      if (useBoundary && boundary) url.searchParams.set("boundary", boundary);
 
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), Math.max(1, ms));
@@ -182,7 +230,7 @@ export class CompetitorService {
 
         if (!res.ok) {
           const txt = await res.text().catch(() => "");
-          throw new Error(`[allSearch] status=${res.status} body=${txt.slice(0, 180)}`);
+          throw new Error(`[allSearch] status=${res.status} body=${txt.slice(0, 220)}`);
         }
 
         const data: any = await res.json().catch(() => null);
@@ -199,25 +247,24 @@ export class CompetitorService {
       }
     };
 
-    // ✅ 1) coord+boundary(있으면) → 2) coord만 → 3) 둘 다 없이
-    const budget = Math.max(1200, Math.min(4500, timeoutMs));
-    const step = Math.floor(budget / 3);
+    const budget = Math.max(1400, Math.min(4500, timeoutMs));
+    const step = Math.floor(budget / 2);
 
-    let lastErr: any = null;
-    for (const [useCoord, useBoundary] of [
-      [true, true],
-      [true, false],
-      [false, false]
-    ] as Array<[boolean, boolean]>) {
-      try {
-        const ids = await tryOnce(useCoord, useBoundary, step);
-        if (ids.length) return ids;
-      } catch (e) {
-        lastErr = e;
-      }
+    // 1) boundary 포함(값 있을 때만 의미) → 2) boundary 없이
+    try {
+      const ids1 = await tryOnce(true, step);
+      if (ids1.length) return ids1;
+    } catch (e) {
+      console.warn("[COMP][mapRank] allSearch failed:", e);
     }
 
-    if (lastErr) console.warn("[COMP][mapRank] allSearch failed:", lastErr);
+    try {
+      const ids2 = await tryOnce(false, step);
+      if (ids2.length) return ids2;
+    } catch (e) {
+      console.warn("[COMP][mapRank] allSearch failed:", e);
+    }
+
     return [];
   }
 
@@ -230,7 +277,7 @@ export class CompetitorService {
     const q = String(keyword || "").trim();
     if (!q) return [];
 
-    // 1순위 allSearch (가장 빠르고 안정적으로 만들기)
+    // 1순위 allSearch
     const ids0 = await this.__findTopPlaceIdsViaAllSearch(q, limit + 5, 4500).catch(() => []);
     if (ids0.length) {
       const out: string[] = [];
@@ -351,7 +398,7 @@ export class CompetitorService {
       metas = await this.__findTopPlaceMetasFromSearchWherePlaceFetch(q, remain).catch(() => []);
       if (!metas.length) metas = await this.__findTopPlaceMetasFromSearchWherePlaceRendered(q, remain).catch(() => []);
 
-      // 마지막 보루: m.place 검색(fetch)에서 placeId 확보
+      // 마지막 보루: m.place 검색(fetch)
       if (!metas.length) {
         const ids = await this.__findTopPlaceIdsFromMobilePlaceSearchFetch(q, limit + 8, remain).catch(() => []);
         if (ids.length) metas = ids.map((id) => ({ placeId: id, name: "" }));
@@ -602,7 +649,6 @@ export class CompetitorService {
     if (!q) return [];
 
     const url = `https://m.place.naver.com/search?query=${encodeURIComponent(q)}`;
-    // ✅ m.place 쪽은 referer도 m.place로
     const html = await this.__fetchHtml(url, timeoutMs, "https://m.place.naver.com/").catch(() => "");
     if (!html) return [];
 
@@ -621,7 +667,6 @@ export class CompetitorService {
     return out;
   }
 
-  // ✅ referer 주입 가능하게 변경 (차단/빈결과 방어)
   private async __fetchHtml(url: string, timeoutMs: number, referer = "https://search.naver.com/"): Promise<string> {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), Math.max(1, timeoutMs));
@@ -641,7 +686,7 @@ export class CompetitorService {
 
       if (!res.ok) {
         const txt = await res.text().catch(() => "");
-        throw new Error(`fetch status=${res.status} body=${txt.slice(0, 120)}`);
+        throw new Error(`fetch status=${res.status} body=${txt.slice(0, 140)}`);
       }
       return (await res.text()) || "";
     } finally {
@@ -686,10 +731,7 @@ export class CompetitorService {
 
     const onResponse = async (res: any) => {
       try {
-        const req = res.request();
-        const rt = req.resourceType();
-
-        // ✅ xhr/fetch + script
+        const rt = res.request().resourceType();
         if (rt !== "xhr" && rt !== "fetch" && rt !== "script") return;
 
         const u = String(res.url?.() || "");
@@ -754,7 +796,6 @@ export class CompetitorService {
       loaded = status === 200 && outer.length > 500;
 
       console.log("[COMP][placeHome] goto", { status, url, finalUrl, title: pageTitle, htmlLen: outer.length });
-      if (outer.length < 500) console.warn("[COMP][placeHome] suspicious htmlLen", outer.length, "url=", url, "title=", pageTitle);
 
       const iframeHandle = await page
         .waitForSelector('iframe#entryIframe, iframe[name="entryIframe"]', { timeout: Math.min(8000, timeoutMs) })
@@ -964,7 +1005,6 @@ export class CompetitorService {
     };
   }
 
-  // ✅ anti-XSSI prefix 제거 후 JSON 파싱
   private __safeJsonParse(text: string): any | null {
     const s0 = String(text || "").trim();
     if (!s0) return null;
@@ -981,6 +1021,23 @@ export class CompetitorService {
     } catch {
       return null;
     }
+  }
+
+  private __parseNextData(html: string): any | null {
+    const m = String(html || "").match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+    if (!m?.[1]) return null;
+    return this.__safeJsonParse(m[1]);
+  }
+
+  private __deepCollect(obj: any, predicate: (x: any) => boolean, out: any[] = []) {
+    if (!obj || typeof obj !== "object") return out;
+    if (predicate(obj)) out.push(obj);
+    if (Array.isArray(obj)) {
+      for (const it of obj) this.__deepCollect(it, predicate, out);
+      return out;
+    }
+    for (const k of Object.keys(obj)) this.__deepCollect((obj as any)[k], predicate, out);
+    return out;
   }
 
   private __deepFindKeywordsLoose(obj: any): string[] {
@@ -1015,23 +1072,6 @@ export class CompetitorService {
     };
 
     return out.sort((a, b) => score(b) - score(a)).slice(0, 5);
-  }
-
-  private __parseNextData(html: string): any | null {
-    const m = String(html || "").match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
-    if (!m?.[1]) return null;
-    return this.__safeJsonParse(m[1]);
-  }
-
-  private __deepCollect(obj: any, predicate: (x: any) => boolean, out: any[] = []) {
-    if (!obj || typeof obj !== "object") return out;
-    if (predicate(obj)) out.push(obj);
-    if (Array.isArray(obj)) {
-      for (const it of obj) this.__deepCollect(it, predicate, out);
-      return out;
-    }
-    for (const k of Object.keys(obj)) this.__deepCollect((obj as any)[k], predicate, out);
-    return out;
   }
 
   private __deepFindStringArray(obj: any, keyName: string): string[] {
