@@ -324,21 +324,58 @@ export class CompetitorService {
 
   const buf: string[] = [];
   const onResponse = async (res: any) => {
-    try {
-      const req = res.request();
-      const rt = req.resourceType();
-      if (rt !== "xhr" && rt !== "fetch" && rt !== "script") return;
+  try {
+    const req = res.request();
+    const rt = req.resourceType();
+    if (rt !== "xhr" && rt !== "fetch") return;
 
-      const text = await res.text().catch(() => "");
-      if (!text) return;
+    const u = String(res.url?.() || "");
 
-      if (!/(placeId|\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/\d{5,12})/.test(text))
-        return;
+    // ✅ 대표키워드가 뜨는 API만 우선적으로 잡기 (잡음 제거)
+    // 네이버가 종종 /api/graphql, /api/v3, /api/search 등으로 내려줌
+    const looksRelevant =
+      /m\.place\.naver\.com/.test(u) &&
+      /(graphql|api|_next\/data|keyword|home|place)/i.test(u);
 
-      buf.push(text);
-      if (buf.length > 60) buf.shift();
-    } catch {}
-  };
+    if (!looksRelevant) return;
+
+    const ct = (await res.headerValue("content-type")) || "";
+    if (!/json|javascript/i.test(ct)) return;
+
+    const txt = await res.text().catch(() => "");
+    if (!txt || txt.length < 20) return;
+
+    // ✅ 키워드 관련 단어가 아예 없으면 패스
+    if (!/(keywordList|representKeyword|representativeKeyword|representKeywordList|keywords)/i.test(txt)) return;
+
+    const j = this.__safeJsonParse(txt);
+    if (!j) return;
+
+    // ✅ name
+    if (!state.name) {
+      const nm = this.__deepFindName(j);
+      if (nm && !this.__isBannedName(nm)) state.name = nm;
+    }
+
+    // ✅ keywords: string[] 뿐 아니라 object[]도 처리 (현재 deepFindStringArray가 이미 처리)
+    if (!state.keywords.length) {
+      for (const k of [
+        "representKeywordList",
+        "representativeKeywordList",
+        "representKeywords",
+        "representativeKeywords",
+        "keywordList",
+        "keywords"
+      ]) {
+        const arr = this.__deepFindStringArray(j, k);
+        if (arr.length) {
+          state.keywords = arr;
+          break;
+        }
+      }
+    }
+  } catch {}
+};
 
   const onHttpFail = async (res: any) => {
     try {
@@ -1226,27 +1263,38 @@ export class CompetitorService {
     }
     return "";
   }
+private __extractKeywordArrayByRegex(html: string): string[] {
+  const text = String(html || "");
+  const re =
+    /"(?:representKeywordList|keywordList|representKeywords|keywords|representativeKeywords|representativeKeywordList)"\s*:\s*(\[[\s\S]*?\])/gi;
 
-  private __extractKeywordArrayByRegex(html: string): string[] {
-    const text = String(html || "");
-    const re1 =
-      /"(?:representKeywordList|keywordList|representKeywords|keywords|representativeKeywords|representativeKeywordList)"\s*:\s*(\[[\s\S]*?\])/g;
+  for (const m of text.matchAll(re)) {
+    const inside = m[1] || "";
+    const parsed = this.__safeJsonParse(inside);
 
-    for (const m of text.matchAll(re1)) {
-      const inside = m[1] || "";
-      const parsed = this.__safeJsonParse(inside);
-      if (Array.isArray(parsed)) {
-        return this.__finalizeKeywords(
-          parsed.map((v) => (typeof v === "string" ? v : v?.keyword ?? v?.name ?? v?.text ?? ""))
-        );
-      }
+    // ✅ 배열이 JSON으로 파싱되면 object[]까지 처리
+    if (Array.isArray(parsed)) {
+      const picked = parsed
+        .map((v: any) => {
+          if (typeof v === "string") return v;
+          if (v && typeof v === "object") return v.keyword ?? v.name ?? v.text ?? v.title ?? "";
+          return "";
+        })
+        .filter(Boolean);
 
-      const strs = [...inside.matchAll(/"([^"]{2,40})"/g)].map((x) => x[1]).filter(Boolean);
-      if (strs.length) return this.__finalizeKeywords(strs);
+      const fin = this.__finalizeKeywords(picked);
+      if (fin.length) return fin;
     }
 
-    return [];
+    // fallback: 문자열만 뽑기
+    const strs = [...inside.matchAll(/"([^"]{2,40})"/g)].map((x) => x[1]).filter(Boolean);
+    const fin = this.__finalizeKeywords(strs);
+    if (fin.length) return fin;
   }
+
+  return [];
+}
+  
 
   private __extractPlaceIdsFromAnyTextInOrder(text: string): string[] {
     const ids: string[] = [];
