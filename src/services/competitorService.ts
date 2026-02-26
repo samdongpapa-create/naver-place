@@ -33,38 +33,7 @@ export class CompetitorService {
     });
     return this.browser;
   }
-  // ✅ JSON/NextData에서 place name 찾기
-  private __deepFindName(obj: any): string {
-    const keyCandidates = [
-  "name",
-  "placeName",
-  "businessName",
-  "bizName",
-  "displayName",
-  "storeName",
-  "partnerName",
-  "title"
-];
 
-    const hits = this.__deepCollect(
-      obj,
-      (x) => x && typeof x === "object" && keyCandidates.some((k) => typeof (x as any)[k] === "string"),
-      []
-    );
-
-    for (const h of hits) {
-      for (const k of keyCandidates) {
-        const v = (h as any)[k];
-        if (typeof v === "string") {
-          const t = this.__cleanText(v);
-          if (!t) continue;
-          if (this.__isBannedName(t)) continue;
-          if (t.length >= 2 && t.length <= 60) return t;
-        }
-      }
-    }
-    return "";
-  }
   async close() {
     try {
       await this.browser?.close();
@@ -191,7 +160,7 @@ export class CompetitorService {
     url.searchParams.set("page", "1");
     url.searchParams.set("searchCoord", searchCoord);
 
-    // ✅ (중요) boundary는 빈 값이어도 파라미터 자체는 항상 넣음 (일부 환경에서 안정화)
+    // ✅ boundary는 빈 값이어도 파라미터 자체는 넣음 (환경별 안정화)
     url.searchParams.set("boundary", boundary);
 
     const ctrl = new AbortController();
@@ -263,67 +232,25 @@ export class CompetitorService {
     const page = await this.__newLightPage(context, Number(process.env.MAP_GOTO_TIMEOUT_MS || 25000));
 
     const buf: string[] = [];
-        const onResponse = async (res: any) => {
+    const onResponse = async (res: any) => {
       try {
         const req = res.request();
         const rt = req.resourceType();
         if (rt !== "xhr" && rt !== "fetch") return;
 
-        const u = String(res.url?.() || "");
         const ct = (await res.headerValue("content-type")) || "";
+        // json이 아니어도 payload가 들어올 수 있어 URL/본문으로도 거름
+        const text = await res.text().catch(() => "");
+        if (!text) return;
 
-        // ✅ (중요) content-type이 json이 아니어도 키워드 payload가 text/plain으로 오는 경우가 있음
-        // ✅ URL/본문 키워드 시그널로 판단
-        const looksLikeKeywordApi =
-          /(keywordList|representKeywordList|representKeywords|keywords)/i.test(u) ||
-          /place|entry|home|keyword/i.test(u);
+        const seemsUseful =
+          /json|javascript/i.test(ct) ||
+          /(placeId|\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/\d{5,12})/.test(text);
 
-        const txt = await res.text().catch(() => "");
-        if (!txt || txt.length < 20) return;
+        if (!seemsUseful) return;
 
-        // 본문에 키워드 시그널이 없으면 버림 (노이즈 컷)
-        if (!/(keywordList|representKeywordList|representKeywords|keywords)/.test(txt) && !looksLikeKeywordApi) return;
-
-        // 1) JSON 파싱 시도 (content-type이 json이거나, 그냥 될 때도 있음)
-        let j: any = null;
-        if (/json|javascript/i.test(ct) || txt.trim().startsWith("{") || txt.trim().startsWith("[")) {
-          try {
-            j = JSON.parse(txt);
-          } catch {
-            j = null;
-          }
-        }
-
-        if (j) {
-          if (!netState.name) {
-            const nm = this.__deepFindName(j);
-            if (nm && !this.__isBannedName(nm)) netState.name = nm;
-          }
-
-          if (!netState.keywords.length) {
-            for (const k of ["keywordList", "representKeywordList", "representKeywords", "keywords"]) {
-              const arr = this.__deepFindStringArray(j, k);
-              if (arr.length) {
-                netState.keywords = arr;
-                break;
-              }
-            }
-          }
-          return;
-        }
-
-        // 2) ✅ JSON 파싱 실패하면 regex로라도 keywords 뽑기 (실제 여기서 많이 살음)
-        if (!netState.keywords.length) {
-          const fallback = this.__extractKeywordArrayByRegex(txt);
-          if (fallback.length) netState.keywords = fallback;
-        }
-
-        // 3) name도 혹시 남아있으면 og/title 류라도 뽑기
-        if (!netState.name) {
-          const m = txt.match(/"name"\s*:\s*"([^"]{2,80})"/);
-          const nm = m?.[1] ? this.__cleanText(m[1]) : "";
-          if (nm && !this.__isBannedName(nm)) netState.name = nm;
-        }
+        buf.push(text);
+        if (buf.length > 50) buf.shift();
       } catch {}
     };
 
@@ -400,7 +327,7 @@ export class CompetitorService {
       metas = await this.__findTopPlaceMetasFromSearchWherePlaceFetch(q, remain).catch(() => []);
       if (!metas.length) metas = await this.__findTopPlaceMetasFromSearchWherePlaceRendered(q, remain).catch(() => []);
 
-      // ✅ 마지막 보루: m.place 검색 HTML(fetch)에서 placeId만이라도 확보
+      // 마지막 보루: m.place 검색(fetch)에서 placeId 확보
       if (!metas.length) {
         const ids = await this.__findTopPlaceIdsFromMobilePlaceSearchFetch(q, limit + 5, remain).catch(() => []);
         if (ids.length) metas = ids.map((id) => ({ placeId: id, name: "" }));
@@ -419,7 +346,7 @@ export class CompetitorService {
 
     if (!candidateMetas.length) return [];
 
-    // ✅ 광고/저장 같은 name은 nameMap에 넣지 않는다
+    // name 힌트
     const nameMap = new Map<string, string>();
     for (const m of candidateMetas) {
       const nm = this.__cleanText(m.name || "");
@@ -463,7 +390,6 @@ export class CompetitorService {
         .slice(0, 5);
 
       const safeKeywords = finalKeywords.length ? finalKeywords : ["대표키워드없음"];
-
       const source: Competitor["source"] = enriched.loaded ? "place_home" : "search_html";
 
       out.push({
@@ -717,182 +643,179 @@ export class CompetitorService {
   }
 
   private async __renderAndExtractFromPlaceHome(
-  url: string,
-  timeoutMs: number
-): Promise<{ name: string; keywords: string[]; loaded: boolean }> {
-  const netState = { name: "", keywords: [] as string[] };
-  let loaded = false;
+    url: string,
+    timeoutMs: number
+  ): Promise<{ name: string; keywords: string[]; loaded: boolean }> {
+    const netState = { name: "", keywords: [] as string[] };
+    let loaded = false;
 
-  const context = await this.__newContext("https://m.place.naver.com/");
-  const page = await this.__newLightPage(context, timeoutMs);
+    const context = await this.__newContext("https://m.place.naver.com/");
+    const page = await this.__newLightPage(context, timeoutMs);
 
-  const onResponse = async (res: any) => {
-    try {
-      const req = res.request();
-      const rt = req.resourceType();
-      if (rt !== "xhr" && rt !== "fetch") return;
+    const onResponse = async (res: any) => {
+      try {
+        const req = res.request();
+        const rt = req.resourceType();
+        if (rt !== "xhr" && rt !== "fetch") return;
 
-      const u = String(res.url?.() || "");
-      const ct = (await res.headerValue("content-type")) || "";
+        const u = String(res.url?.() || "");
+        const ct = (await res.headerValue("content-type")) || "";
 
-      // ✅ content-type이 json이 아니어도 키워드 payload가 text/plain으로 오는 경우가 있음
-      const looksLikeKeywordApi =
-        /(keywordList|representKeywordList|representKeywords|keywords)/i.test(u) ||
-        /place|entry|home|keyword/i.test(u);
+        // ✅ content-type이 json이 아니어도 키워드 payload가 text/plain으로 오는 경우가 있음
+        const looksLikeKeywordApi =
+          /(keywordList|representKeywordList|representKeywords|keywords)/i.test(u) ||
+          /place|entry|home|keyword/i.test(u);
 
-      const txt = await res.text().catch(() => "");
-      if (!txt || txt.length < 20) return;
+        const txt = await res.text().catch(() => "");
+        if (!txt || txt.length < 20) return;
 
-      // 본문에 키워드 시그널이 없으면 버림
-      if (!/(keywordList|representKeywordList|representKeywords|keywords)/.test(txt) && !looksLikeKeywordApi) return;
+        // 본문에 키워드 시그널이 없으면 버림
+        if (!/(keywordList|representKeywordList|representKeywords|keywords)/.test(txt) && !looksLikeKeywordApi) return;
 
-      // 1) JSON 파싱 시도
-      let j: any = null;
-      if (/json|javascript/i.test(ct) || txt.trim().startsWith("{") || txt.trim().startsWith("[")) {
-        try {
-          j = JSON.parse(txt);
-        } catch {
-          j = null;
+        // 1) JSON 파싱 시도
+        let j: any = null;
+        if (/json|javascript/i.test(ct) || txt.trim().startsWith("{") || txt.trim().startsWith("[")) {
+          try {
+            j = JSON.parse(txt);
+          } catch {
+            j = null;
+          }
         }
-      }
 
-      if (j) {
+        if (j) {
+          if (!netState.name) {
+            const nm = this.__deepFindName(j);
+            if (nm && !this.__isBannedName(nm)) netState.name = nm;
+          }
+
+          if (!netState.keywords.length) {
+            for (const k of ["keywordList", "representKeywordList", "representKeywords", "keywords"]) {
+              const arr = this.__deepFindStringArray(j, k);
+              if (arr.length) {
+                netState.keywords = arr;
+                break;
+              }
+            }
+          }
+          return;
+        }
+
+        // 2) JSON 파싱 실패 시 regex fallback
+        if (!netState.keywords.length) {
+          const fallback = this.__extractKeywordArrayByRegex(txt);
+          if (fallback.length) netState.keywords = fallback;
+        }
+
+        // 3) name fallback
         if (!netState.name) {
-          const nm = this.__deepFindName(j);
+          const m = txt.match(/"name"\s*:\s*"([^"]{2,80})"/);
+          const nm = m?.[1] ? this.__cleanText(m[1]) : "";
           if (nm && !this.__isBannedName(nm)) netState.name = nm;
         }
+      } catch {}
+    };
+
+    page.on("response", onResponse);
+
+    try {
+      const resp = await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => null);
+
+      const status = resp?.status?.() ?? -1;
+      const finalUrl = page.url();
+      const outer = await page.content().catch(() => "");
+      const pageTitle = await page.title().catch(() => "");
+
+      loaded = status === 200 && outer.length > 500;
+
+      console.log("[COMP][placeHome] goto", { status, url, finalUrl, title: pageTitle, htmlLen: outer.length });
+      if (outer.length < 500) console.warn("[COMP][placeHome] suspicious htmlLen", outer.length, "url=", url, "title=", pageTitle);
+
+      const iframeHandle = await page
+        .waitForSelector('iframe#entryIframe, iframe[name="entryIframe"]', { timeout: Math.min(8000, timeoutMs) })
+        .catch(() => null);
+
+      let frame: any = null;
+      if (iframeHandle) frame = await iframeHandle.contentFrame().catch(() => null);
+
+      if (frame) {
+        await frame.waitForLoadState("domcontentloaded").catch(() => {});
+        await frame.waitForSelector('script#__NEXT_DATA__', { timeout: Math.min(6500, timeoutMs) }).catch(() => {});
+      }
+
+      const frameHtml = frame ? await frame.content().catch(() => "") : "";
+
+      // ✅ outer에서도 __NEXT_DATA__ 한번 더
+      const nextFromOuter = this.__parseNextData(outer);
+      if (nextFromOuter) {
+        const nm = this.__deepFindName(nextFromOuter);
+        if (!netState.name && nm && !this.__isBannedName(nm)) netState.name = nm;
 
         if (!netState.keywords.length) {
           for (const k of ["keywordList", "representKeywordList", "representKeywords", "keywords"]) {
-            const arr = this.__deepFindStringArray(j, k);
+            const arr = this.__deepFindStringArray(nextFromOuter, k);
             if (arr.length) {
               netState.keywords = arr;
               break;
             }
           }
         }
-        return;
       }
 
-      // 2) JSON 파싱 실패 시 regex fallback
-      if (!netState.keywords.length) {
-        const fallback = this.__extractKeywordArrayByRegex(txt);
-        if (fallback.length) netState.keywords = fallback;
+      if (frameHtml) {
+        const next = this.__parseNextData(frameHtml);
+
+        const nm = this.__deepFindName(next);
+        if (!netState.name && nm && !this.__isBannedName(nm)) netState.name = nm;
+
+        if (!netState.keywords.length) {
+          for (const k of ["keywordList", "representKeywordList", "representKeywords", "keywords"]) {
+            const arr = this.__deepFindStringArray(next, k);
+            if (arr.length) {
+              netState.keywords = arr;
+              break;
+            }
+          }
+        }
+
+        if (!netState.keywords.length) {
+          const fallback = this.__extractKeywordArrayByRegex(frameHtml);
+          if (fallback.length) netState.keywords = fallback;
+        }
       }
 
-      // 3) name fallback
+      if (frame && !netState.keywords.length) {
+        const domKeywords = await this.__extractKeywordsFromDom(frame).catch(() => []);
+        if (domKeywords.length) netState.keywords = domKeywords;
+      }
+
       if (!netState.name) {
-        const m = txt.match(/"name"\s*:\s*"([^"]{2,80})"/);
-        const nm = m?.[1] ? this.__cleanText(m[1]) : "";
-        if (nm && !this.__isBannedName(nm)) netState.name = nm;
-      }
-    } catch {}
-  };
-
-  page.on("response", onResponse);
-
-  try {
-    const resp = await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => null);
-
-    const status = resp?.status?.() ?? -1;
-    const finalUrl = page.url();
-    const outer = await page.content().catch(() => "");
-    const pageTitle = await page.title().catch(() => "");
-
-    loaded = status === 200 && outer.length > 500;
-
-    console.log("[COMP][placeHome] goto", { status, url, finalUrl, title: pageTitle, htmlLen: outer.length });
-    if (outer.length < 500) console.warn("[COMP][placeHome] suspicious htmlLen", outer.length, "url=", url, "title=", pageTitle);
-
-    const iframeHandle = await page
-      .waitForSelector('iframe#entryIframe, iframe[name="entryIframe"]', { timeout: Math.min(8000, timeoutMs) })
-      .catch(() => null);
-
-    let frame: any = null;
-    if (iframeHandle) frame = await iframeHandle.contentFrame().catch(() => null);
-
-    if (frame) {
-      await frame.waitForLoadState("domcontentloaded").catch(() => {});
-      await frame.waitForSelector('script#__NEXT_DATA__', { timeout: Math.min(6500, timeoutMs) }).catch(() => {});
-    }
-
-    const frameHtml = frame ? await frame.content().catch(() => "") : "";
-
-    // ✅ outer에서도 __NEXT_DATA__ 한번 더
-    const nextFromOuter = this.__parseNextData(outer);
-    if (nextFromOuter) {
-      const nm = this.__deepFindName(nextFromOuter);
-      if (!netState.name && nm && !this.__isBannedName(nm)) netState.name = nm;
-
-      if (!netState.keywords.length) {
-        for (const k of ["keywordList", "representKeywordList", "representKeywords", "keywords"]) {
-          const arr = this.__deepFindStringArray(nextFromOuter, k);
-          if (arr.length) {
-            netState.keywords = arr;
-            break;
-          }
-        }
-      }
-    }
-
-    if (frameHtml) {
-      const next = this.__parseNextData(frameHtml);
-
-      const nm = this.__deepFindName(next);
-      if (!netState.name && nm && !this.__isBannedName(nm)) netState.name = nm;
-
-      if (!netState.keywords.length) {
-        for (const k of ["keywordList", "representKeywordList", "representKeywords", "keywords"]) {
-          const arr = this.__deepFindStringArray(next, k);
-          if (arr.length) {
-            netState.keywords = arr;
-            break;
-          }
-        }
+        const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
+        const og = m1?.[1] ? this.__cleanText(m1[1]) : "";
+        if (og && !this.__isBannedName(og)) netState.name = og;
       }
 
-      if (!netState.keywords.length) {
-        const fallback = this.__extractKeywordArrayByRegex(frameHtml);
-        if (fallback.length) netState.keywords = fallback;
-      }
+      const cleanedKeywords = (netState.keywords || [])
+        .map((k) => this.__cleanText(k))
+        .filter(Boolean)
+        .filter((k) => k.length >= 2 && k.length <= 25)
+        .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
+        .slice(0, 5);
+
+      return { name: this.__cleanText(netState.name), keywords: cleanedKeywords, loaded };
+    } catch {
+      return { name: "", keywords: [], loaded: false };
+    } finally {
+      try {
+        page.off("response", onResponse);
+      } catch {}
+      try {
+        await page.close();
+      } catch {}
+      try {
+        await context.close();
+      } catch {}
     }
-
-    if (frame && !netState.keywords.length) {
-      const domKeywords = await this.__extractKeywordsFromDom(frame).catch(() => []);
-      if (domKeywords.length) netState.keywords = domKeywords;
-    }
-
-    if (!netState.name) {
-      const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
-      const og = m1?.[1] ? this.__cleanText(m1[1]) : "";
-      if (og && !this.__isBannedName(og)) netState.name = og;
-    }
-
-    const cleanedKeywords = (netState.keywords || [])
-      .map((k) => this.__cleanText(k))
-      .filter(Boolean)
-      .filter((k) => k.length >= 2 && k.length <= 25)
-      .filter((k) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(k))
-      .slice(0, 5);
-
-    // (선택) 디버그
-    // console.log("[COMP][placeHome] extracted", { url, loaded, name: netState.name, keywords: netState.keywords });
-
-    return { name: this.__cleanText(netState.name), keywords: cleanedKeywords, loaded };
-  } catch {
-    return { name: "", keywords: [], loaded: false };
-  } finally {
-    try {
-      page.off("response", onResponse);
-    } catch {}
-    try {
-      await page.close();
-    } catch {}
-    try {
-      await context.close();
-    } catch {}
   }
-}
 
   private async __extractKeywordsFromDom(frame: any): Promise<string[]> {
     const raw: string[] = await frame.evaluate(() => {
@@ -1008,14 +931,14 @@ export class CompetitorService {
     return out;
   }
 
-   private __deepFindStringArray(obj: any, keyName: string): string[] {
+  // ✅ (중요) 문자열 배열 + 객체 배열 모두 지원
+  private __deepFindStringArray(obj: any, keyName: string): string[] {
     const hits = this.__deepCollect(obj, (x) => x && typeof x === "object" && Array.isArray((x as any)[keyName]), []);
 
     const pickFromItem = (it: any): string => {
       if (typeof it === "string") return this.__cleanText(it);
 
       if (it && typeof it === "object") {
-        // 네이버에서 자주 나오는 키 후보들
         const candKeys = ["keyword", "name", "text", "title", "value", "label"];
         for (const k of candKeys) {
           const v = (it as any)[k];
@@ -1024,7 +947,6 @@ export class CompetitorService {
             if (t) return t;
           }
         }
-        // 혹시 nested
         for (const k of Object.keys(it)) {
           const v = (it as any)[k];
           if (typeof v === "string") {
@@ -1049,7 +971,41 @@ export class CompetitorService {
     return [];
   }
 
-    private __extractKeywordArrayByRegex(html: string): string[] {
+  // ✅ name 키 후보 확장
+  private __deepFindName(obj: any): string {
+    const keyCandidates = [
+      "name",
+      "placeName",
+      "businessName",
+      "bizName",
+      "displayName",
+      "storeName",
+      "partnerName",
+      "title"
+    ];
+
+    const hits = this.__deepCollect(
+      obj,
+      (x) => x && typeof x === "object" && keyCandidates.some((k) => typeof (x as any)[k] === "string"),
+      []
+    );
+
+    for (const h of hits) {
+      for (const k of keyCandidates) {
+        const v = (h as any)[k];
+        if (typeof v === "string") {
+          const t = this.__cleanText(v);
+          if (!t) continue;
+          if (this.__isBannedName(t)) continue;
+          if (t.length >= 2 && t.length <= 60) return t;
+        }
+      }
+    }
+    return "";
+  }
+
+  // ✅ 문자열 배열/객체 배열 모두 regex+JSON 파싱으로 대응
+  private __extractKeywordArrayByRegex(html: string): string[] {
     const text = String(html || "");
     const re1 = /"(?:representKeywordList|keywordList|representKeywords|keywords)"\s*:\s*(\[[\s\S]*?\])/g;
 
@@ -1069,7 +1025,7 @@ export class CompetitorService {
 
     for (const m of text.matchAll(re1)) {
       const inside = m[1] || "";
-      // 1) JSON으로 한번 파싱 시도
+
       try {
         const arr = JSON.parse(inside);
         if (Array.isArray(arr)) {
@@ -1081,13 +1037,13 @@ export class CompetitorService {
           if (out.length) return Array.from(new Set(out));
         }
       } catch {
-        // 2) fallback: 문자열만이라도 긁기
         const strs = [...inside.matchAll(/"([^"]{2,40})"/g)]
           .map((x) => this.__cleanText(x[1]))
           .filter(Boolean);
         if (strs.length) return Array.from(new Set(strs));
       }
     }
+
     return [];
   }
 
