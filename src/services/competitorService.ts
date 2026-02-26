@@ -566,7 +566,11 @@ export class CompetitorService {
       }
 
       // ✅ lazy-load 대응 (핵심): 더보기 클릭 + 자동 스크롤
-      await this.__expandAndScrollFrame(frame, timeoutMs).catch(() => {});
+      // ✅ 스크롤/펼치기 직후 1차 DOM smart로 먼저 시도(렌더 타이밍 때문에 중요)
+if (!state.keywords.length) {
+  const early = await this.__extractKeywordsFromDomSmart(frame).catch(() => []);
+  if (early.length) state.keywords = early;
+}
 
       // frame HTML
       const frameHtml = await frame.content().catch(() => "");
