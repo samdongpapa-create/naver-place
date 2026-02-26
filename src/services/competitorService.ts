@@ -159,8 +159,6 @@ export class CompetitorService {
     url.searchParams.set("type", "all");
     url.searchParams.set("page", "1");
     url.searchParams.set("searchCoord", searchCoord);
-
-    // ✅ boundary는 빈 값이어도 파라미터 자체는 넣음 (환경별 안정화)
     url.searchParams.set("boundary", boundary);
 
     const ctrl = new AbortController();
@@ -236,10 +234,9 @@ export class CompetitorService {
       try {
         const req = res.request();
         const rt = req.resourceType();
-        if (rt !== "xhr" && rt !== "fetch") return;
+        if (rt !== "xhr" && rt !== "fetch" && rt !== "script") return;
 
         const ct = (await res.headerValue("content-type")) || "";
-        // json이 아니어도 payload가 들어올 수 있어 URL/본문으로도 거름
         const text = await res.text().catch(() => "");
         if (!text) return;
 
@@ -656,31 +653,23 @@ export class CompetitorService {
       try {
         const req = res.request();
         const rt = req.resourceType();
-        if (rt !== "xhr" && rt !== "fetch") return;
+
+        // ✅ xhr/fetch만 보지 말고 script도 봄
+        if (rt !== "xhr" && rt !== "fetch" && rt !== "script") return;
 
         const u = String(res.url?.() || "");
-        const ct = (await res.headerValue("content-type")) || "";
-
-        // ✅ content-type이 json이 아니어도 키워드 payload가 text/plain으로 오는 경우가 있음
-        const looksLikeKeywordApi =
-          /(keywordList|representKeywordList|representKeywords|keywords)/i.test(u) ||
-          /place|entry|home|keyword/i.test(u);
-
         const txt = await res.text().catch(() => "");
         if (!txt || txt.length < 20) return;
 
-        // 본문에 키워드 시그널이 없으면 버림
-        if (!/(keywordList|representKeywordList|representKeywords|keywords)/.test(txt) && !looksLikeKeywordApi) return;
+        // ✅ URL/본문에 시그널이 없으면 skip
+        const looksLikeKeyword =
+          /(keywordList|representKeywordList|representKeywords|keywords|representative)/i.test(u) ||
+          /(keywordList|representKeywordList|representKeywords|keywords|representative)/.test(txt);
 
-        // 1) JSON 파싱 시도
-        let j: any = null;
-        if (/json|javascript/i.test(ct) || txt.trim().startsWith("{") || txt.trim().startsWith("[")) {
-          try {
-            j = JSON.parse(txt);
-          } catch {
-            j = null;
-          }
-        }
+        if (!looksLikeKeyword) return;
+
+        // ✅ anti-XSSI 포함 safe parse
+        const j = this.__safeJsonParse(txt);
 
         if (j) {
           if (!netState.name) {
@@ -688,8 +677,16 @@ export class CompetitorService {
             if (nm && !this.__isBannedName(nm)) netState.name = nm;
           }
 
+          // 1) 표준 키들로 먼저
           if (!netState.keywords.length) {
-            for (const k of ["keywordList", "representKeywordList", "representKeywords", "keywords"]) {
+            for (const k of [
+              "keywordList",
+              "representKeywordList",
+              "representKeywords",
+              "keywords",
+              "representativeKeywords",
+              "representativeKeywordList"
+            ]) {
               const arr = this.__deepFindStringArray(j, k);
               if (arr.length) {
                 netState.keywords = arr;
@@ -697,20 +694,19 @@ export class CompetitorService {
               }
             }
           }
+
+          // 2) 그래도 없으면 loose 훑기
+          if (!netState.keywords.length) {
+            const loose = this.__deepFindKeywordsLoose(j);
+            if (loose.length) netState.keywords = loose;
+          }
           return;
         }
 
-        // 2) JSON 파싱 실패 시 regex fallback
+        // ✅ JSON이 아니면 regex fallback
         if (!netState.keywords.length) {
           const fallback = this.__extractKeywordArrayByRegex(txt);
           if (fallback.length) netState.keywords = fallback;
-        }
-
-        // 3) name fallback
-        if (!netState.name) {
-          const m = txt.match(/"name"\s*:\s*"([^"]{2,80})"/);
-          const nm = m?.[1] ? this.__cleanText(m[1]) : "";
-          if (nm && !this.__isBannedName(nm)) netState.name = nm;
         }
       } catch {}
     };
@@ -751,13 +747,24 @@ export class CompetitorService {
         if (!netState.name && nm && !this.__isBannedName(nm)) netState.name = nm;
 
         if (!netState.keywords.length) {
-          for (const k of ["keywordList", "representKeywordList", "representKeywords", "keywords"]) {
+          for (const k of [
+            "keywordList",
+            "representKeywordList",
+            "representKeywords",
+            "keywords",
+            "representativeKeywords",
+            "representativeKeywordList"
+          ]) {
             const arr = this.__deepFindStringArray(nextFromOuter, k);
             if (arr.length) {
               netState.keywords = arr;
               break;
             }
           }
+        }
+        if (!netState.keywords.length) {
+          const loose = this.__deepFindKeywordsLoose(nextFromOuter);
+          if (loose.length) netState.keywords = loose;
         }
       }
 
@@ -768,13 +775,25 @@ export class CompetitorService {
         if (!netState.name && nm && !this.__isBannedName(nm)) netState.name = nm;
 
         if (!netState.keywords.length) {
-          for (const k of ["keywordList", "representKeywordList", "representKeywords", "keywords"]) {
+          for (const k of [
+            "keywordList",
+            "representKeywordList",
+            "representKeywords",
+            "keywords",
+            "representativeKeywords",
+            "representativeKeywordList"
+          ]) {
             const arr = this.__deepFindStringArray(next, k);
             if (arr.length) {
               netState.keywords = arr;
               break;
             }
           }
+        }
+
+        if (!netState.keywords.length) {
+          const loose = this.__deepFindKeywordsLoose(next);
+          if (loose.length) netState.keywords = loose;
         }
 
         if (!netState.keywords.length) {
@@ -788,8 +807,16 @@ export class CompetitorService {
         if (domKeywords.length) netState.keywords = domKeywords;
       }
 
+      // ✅ name: outer og:title
       if (!netState.name) {
         const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
+        const og = m1?.[1] ? this.__cleanText(m1[1]) : "";
+        if (og && !this.__isBannedName(og)) netState.name = og;
+      }
+
+      // ✅ name: frame og:title도 한번 더
+      if (!netState.name && frameHtml) {
+        const m1 = frameHtml.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
         const og = m1?.[1] ? this.__cleanText(m1[1]) : "";
         if (og && !this.__isBannedName(og)) netState.name = og;
       }
@@ -910,14 +937,65 @@ export class CompetitorService {
     };
   }
 
-  private __parseNextData(html: string): any | null {
-    const m = html.match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
-    if (!m?.[1]) return null;
+  // ✅ anti-XSSI prefix 제거 후 JSON 파싱
+  private __safeJsonParse(text: string): any | null {
+    const s0 = String(text || "").trim();
+    if (!s0) return null;
+
+    const s = s0
+      .replace(/^\)\]\}',?\s*\n?/, "") // )]}',
+      .replace(/^for\s*\(\s*;\s*;\s*\)\s*;?\s*/, "") // for(;;);
+      .trim();
+
+    if (!(s.startsWith("{") || s.startsWith("["))) return null;
+
     try {
-      return JSON.parse(m[1]);
+      return JSON.parse(s);
     } catch {
       return null;
     }
+  }
+
+  // ✅ 키 배열 키가 안 보일 때: 객체들 안의 keyword/name/text를 싹 훑어서 추출
+  private __deepFindKeywordsLoose(obj: any): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+
+    const push = (v: any) => {
+      const t = this.__cleanText(String(v ?? ""));
+      if (!t) return;
+      if (t.length < 2 || t.length > 25) return;
+      if (/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천|길찾기|전화|공유|블로그|리뷰|사진|홈|메뉴)/.test(t))
+        return;
+      const key = t.replace(/\s+/g, "");
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(t);
+    };
+
+    const hits = this.__deepCollect(obj, (x) => x && typeof x === "object" && !Array.isArray(x), []);
+
+    for (const h of hits) {
+      for (const k of ["keyword", "name", "text", "title", "value", "label", "displayName", "storeName"]) {
+        if (typeof (h as any)[k] === "string") push((h as any)[k]);
+      }
+    }
+
+    const score = (s: string) => {
+      let sc = 0;
+      if (/(역|동|구|로|길)/.test(s)) sc += 3;
+      if (/(미용실|헤어|살롱|펌|염색|커트|컷|클리닉|카페|맛집|식당|브런치|디저트)/.test(s)) sc += 3;
+      if (/[가-힣]/.test(s)) sc += 1;
+      return sc;
+    };
+
+    return out.sort((a, b) => score(b) - score(a)).slice(0, 5);
+  }
+
+  private __parseNextData(html: string): any | null {
+    const m = String(html || "").match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+    if (!m?.[1]) return null;
+    return this.__safeJsonParse(m[1]);
   }
 
   private __deepCollect(obj: any, predicate: (x: any) => boolean, out: any[] = []) {
@@ -1007,7 +1085,7 @@ export class CompetitorService {
   // ✅ 문자열 배열/객체 배열 모두 regex+JSON 파싱으로 대응
   private __extractKeywordArrayByRegex(html: string): string[] {
     const text = String(html || "");
-    const re1 = /"(?:representKeywordList|keywordList|representKeywords|keywords)"\s*:\s*(\[[\s\S]*?\])/g;
+    const re1 = /"(?:representKeywordList|keywordList|representKeywords|keywords|representativeKeywords|representativeKeywordList)"\s*:\s*(\[[\s\S]*?\])/g;
 
     const pickFromItem = (it: any): string => {
       if (typeof it === "string") return this.__cleanText(it);
@@ -1026,22 +1104,20 @@ export class CompetitorService {
     for (const m of text.matchAll(re1)) {
       const inside = m[1] || "";
 
-      try {
-        const arr = JSON.parse(inside);
-        if (Array.isArray(arr)) {
-          const out = arr
-            .map((v) => pickFromItem(v))
-            .filter(Boolean)
-            .filter((s) => s.length >= 2 && s.length <= 25)
-            .filter((s) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(s));
-          if (out.length) return Array.from(new Set(out));
-        }
-      } catch {
-        const strs = [...inside.matchAll(/"([^"]{2,40})"/g)]
-          .map((x) => this.__cleanText(x[1]))
-          .filter(Boolean);
-        if (strs.length) return Array.from(new Set(strs));
+      // 먼저 JSON 파싱(anti-XSSI 포함)
+      const parsed = this.__safeJsonParse(inside);
+      if (Array.isArray(parsed)) {
+        const out = parsed
+          .map((v) => pickFromItem(v))
+          .filter(Boolean)
+          .filter((s) => s.length >= 2 && s.length <= 25)
+          .filter((s) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(s));
+        if (out.length) return Array.from(new Set(out));
       }
+
+      // fallback: 문자열만
+      const strs = [...inside.matchAll(/"([^"]{2,40})"/g)].map((x) => this.__cleanText(x[1])).filter(Boolean);
+      if (strs.length) return Array.from(new Set(strs));
     }
 
     return [];
