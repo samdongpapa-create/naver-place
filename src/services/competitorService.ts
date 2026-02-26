@@ -731,9 +731,15 @@ export class CompetitorService {
     url: string,
     timeoutMs: number
   ): Promise<{ name: string; keywords: string[]; loaded: boolean }> {
-    const state = { name: "", keywords: [] as string[] };
-    let loaded = false;
+    const netState = { name: "", keywords: [] as string[] };
+let loaded = false;
 
+// ✅ 여기 추가
+const state = netState;
+
+const onResponse = async (res:any) => {
+  // ... state.name / state.keywords 사용 ...
+}
     const context = await this.__newContext("https://m.place.naver.com/");
     const page = await this.__newLightPage(context, timeoutMs);
 
