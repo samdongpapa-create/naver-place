@@ -904,46 +904,85 @@ export class CompetitorService {
     return out;
   }
 
-  private __deepFindStringArray(obj: any, keyName: string): string[] {
+   private __deepFindStringArray(obj: any, keyName: string): string[] {
     const hits = this.__deepCollect(obj, (x) => x && typeof x === "object" && Array.isArray((x as any)[keyName]), []);
+
+    const pickFromItem = (it: any): string => {
+      if (typeof it === "string") return this.__cleanText(it);
+
+      if (it && typeof it === "object") {
+        // 네이버에서 자주 나오는 키 후보들
+        const candKeys = ["keyword", "name", "text", "title", "value", "label"];
+        for (const k of candKeys) {
+          const v = (it as any)[k];
+          if (typeof v === "string") {
+            const t = this.__cleanText(v);
+            if (t) return t;
+          }
+        }
+        // 혹시 nested
+        for (const k of Object.keys(it)) {
+          const v = (it as any)[k];
+          if (typeof v === "string") {
+            const t = this.__cleanText(v);
+            if (t) return t;
+          }
+        }
+      }
+      return "";
+    };
+
     for (const h of hits) {
-      const arr = (h as any)[keyName];
-      const strs = arr.map((v: any) => this.__cleanText(String(v ?? ""))).filter(Boolean);
+      const arr = (h as any)[keyName] as any[];
+      const strs = arr
+        .map((v) => pickFromItem(v))
+        .filter(Boolean)
+        .filter((s) => s.length >= 2 && s.length <= 25)
+        .filter((s) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(s));
+
       if (strs.length) return Array.from(new Set(strs));
     }
     return [];
   }
 
-  private __deepFindName(obj: any): string {
-    const keyCandidates = ["name", "placeName", "businessName", "title"];
-    const hits = this.__deepCollect(
-      obj,
-      (x) => x && typeof x === "object" && keyCandidates.some((k) => typeof (x as any)[k] === "string"),
-      []
-    );
+    private __extractKeywordArrayByRegex(html: string): string[] {
+    const text = String(html || "");
+    const re1 = /"(?:representKeywordList|keywordList|representKeywords|keywords)"\s*:\s*(\[[\s\S]*?\])/g;
 
-    for (const h of hits) {
-      for (const k of keyCandidates) {
-        const v = (h as any)[k];
-        if (typeof v === "string") {
-          const t = this.__cleanText(v);
-          if (!t) continue;
-          if (this.__isBannedName(t)) continue;
-          if (t.length >= 2 && t.length <= 60) return t;
+    const pickFromItem = (it: any): string => {
+      if (typeof it === "string") return this.__cleanText(it);
+      if (it && typeof it === "object") {
+        for (const k of ["keyword", "name", "text", "title", "value", "label"]) {
+          const v = (it as any)[k];
+          if (typeof v === "string") {
+            const t = this.__cleanText(v);
+            if (t) return t;
+          }
         }
       }
-    }
-    return "";
-  }
-
-  private __extractKeywordArrayByRegex(html: string): string[] {
-    const text = String(html || "");
-    const re1 = /"(?:representKeywordList|keywordList|representKeywords|keywords)"\s*:\s*\[([^\]]{1,2000})\]/g;
+      return "";
+    };
 
     for (const m of text.matchAll(re1)) {
       const inside = m[1] || "";
-      const strs = [...inside.matchAll(/"([^"]{2,40})"/g)].map((x) => this.__cleanText(x[1])).filter(Boolean);
-      if (strs.length) return Array.from(new Set(strs));
+      // 1) JSON으로 한번 파싱 시도
+      try {
+        const arr = JSON.parse(inside);
+        if (Array.isArray(arr)) {
+          const out = arr
+            .map((v) => pickFromItem(v))
+            .filter(Boolean)
+            .filter((s) => s.length >= 2 && s.length <= 25)
+            .filter((s) => !/(네이버|플레이스|예약|문의|할인|이벤트|가격|베스트|추천)/.test(s));
+          if (out.length) return Array.from(new Set(out));
+        }
+      } catch {
+        // 2) fallback: 문자열만이라도 긁기
+        const strs = [...inside.matchAll(/"([^"]{2,40})"/g)]
+          .map((x) => this.__cleanText(x[1]))
+          .filter(Boolean);
+        if (strs.length) return Array.from(new Set(strs));
+      }
     }
     return [];
   }
