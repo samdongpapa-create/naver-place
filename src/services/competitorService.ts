@@ -1,17 +1,10 @@
 // src/services/competitorService.ts
-import {
-  chromium,
-  type Browser,
-  type BrowserContext,
-  type Page,
-  type Frame,
-  type Response
-} from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page, type Frame, type Response } from "playwright";
 
 type FindTopIdsOptions = {
   excludePlaceId?: string;
   limit?: number;
-  timeoutMs?: number; // ✅ map rank 단계 예산
+  timeoutMs?: number;
 };
 
 type Competitor = {
@@ -25,11 +18,10 @@ type Competitor = {
 type FindTopCompetitorsOpts = {
   excludePlaceId?: string;
   limit?: number;
-  timeoutMs?: number; // 전체 예산(상한)
+  timeoutMs?: number;
 };
 
 type PlaceMeta = { placeId: string; name: string };
-
 type PlaceHomeExtract = { name: string; keywords: string[]; loaded: boolean };
 
 export class CompetitorService {
@@ -143,7 +135,6 @@ export class CompetitorService {
       const n2 = Number(b);
       if (!Number.isFinite(n1) || !Number.isFinite(n2)) return fallback;
 
-      // lng: 120~130 / lat: 33~38 (KR)
       const looksLngLat = Math.abs(n1) > Math.abs(n2);
       return looksLngLat ? `${n1};${n2}` : `${n2};${n1}`;
     };
@@ -269,8 +260,6 @@ export class CompetitorService {
 
   // ==========================
   // ✅ 0) allSearch JSON (map rank)
-  // - 반드시 searchCoord 보장
-  // - 503/HTML 응답은 JSON으로 안 보고 실패 처리
   // ==========================
   private async __findTopPlaceIdsViaAllSearch(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
     const q = String(keyword || "").trim();
@@ -354,22 +343,20 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ fallback A: m.place 검색 페이지(HTML)에서 placeId 추출
+  // ✅ fallback A: m.place 검색 HTML
   // ==========================
   private async __findTopPlaceIdsViaMPlaceSearchHtml(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
     const q = String(keyword || "").trim();
     if (!q) return [];
-
     const url = `https://m.place.naver.com/search?query=${encodeURIComponent(q)}`;
     const html = await this.__fetchHtml(url, timeoutMs).catch(() => "");
     if (!html) return [];
-
     const ids = this.__extractPlaceIdsFromAnyTextInOrder(html);
     return ids.slice(0, limit);
   }
 
   // ==========================
-  // ✅ fallback B: place.naver.com 검색 HTML에서 placeId 추출
+  // ✅ fallback B: place.naver.com 검색 HTML
   // ==========================
   private async __findTopPlaceIdsViaPcPlaceSearchHtml(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
     const q = String(keyword || "").trim();
@@ -524,14 +511,12 @@ export class CompetitorService {
     );
     const deadline = this.__deadlineMs(totalTimeoutMs);
 
-    // 1) map rank
     const mapIds = await this.findTopPlaceIdsFromMapRank(q, {
       excludePlaceId: exclude,
       limit,
       timeoutMs: Math.min(8500, Math.max(2500, this.__remaining(deadline)))
     }).catch(() => []);
 
-    // 2) where=place (부족분만)
     let metas: PlaceMeta[] = [];
     const needMore = Math.max(0, limit - mapIds.length);
 
@@ -542,7 +527,6 @@ export class CompetitorService {
       metas = (m1.length ? m1 : m2).slice(0, 18);
     }
 
-    // 3) 후보 합치기
     const candidateMetas: PlaceMeta[] = [];
     const seenPid = new Set<string>();
 
@@ -836,9 +820,15 @@ export class CompetitorService {
           if (nm && !this.__isBannedName(nm)) netState.name = nm;
         }
 
-        // ✅ 키워드는 네트워크에서도 받을 수 있지만, 최종은 query 링크 기반으로 정제됨
         if (!netState.keywords.length) {
-          for (const k of ["representKeywordList", "representativeKeywordList", "representKeywords", "representativeKeywords", "keywordList", "keywords"]) {
+          for (const k of [
+            "representKeywordList",
+            "representativeKeywordList",
+            "representKeywords",
+            "representativeKeywords",
+            "keywordList",
+            "keywords"
+          ]) {
             const arr = this.__deepFindStringArray(j, k);
             if (arr.length) {
               netState.keywords = arr;
@@ -996,7 +986,8 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 대표키워드 추출: "query=" 링크 기반 (location 사용 금지)
+  // ✅ 대표키워드 추출: query= 링크 기반
+  // - TS lib dom 없어도 컴파일되도록 document 직접참조 금지
   // ==========================
   private async __extractKeywordsFromQueryLinks(frame: Frame): Promise<string[]> {
     const raw: string[] = await frame.evaluate(() => {
@@ -1019,11 +1010,10 @@ export class CompetitorService {
         out.push(s);
       };
 
-      // ✅ location 대신 document.baseURI 사용 (TS/런타임 모두 안전)
       const parseQueryParam = (href: string): string => {
         const base = (() => {
           try {
-            return String((document as any)?.baseURI || "");
+            return String(d?.baseURI || "");
           } catch {
             return "";
           }
@@ -1044,6 +1034,7 @@ export class CompetitorService {
         }
       };
 
+      // 대표키워드 헤더 주변 우선
       const nodes = Array.from(d.querySelectorAll("span, strong, h2, h3, div, p")) as any[];
       const header = nodes.find((el) => {
         const t = clean(el?.innerText || el?.textContent);
@@ -1060,12 +1051,12 @@ export class CompetitorService {
 
           const t1 = clean(a?.innerText || a?.textContent);
           if (t1 && !isNoise(t1)) tryPush(t1);
-          if (out.length >= 12) break;
 
-          if (!t1 || isNoise(t1)) {
+          if ((!t1 || isNoise(t1)) && out.length < 12) {
             const qp = parseQueryParam(href);
             if (qp && !isNoise(qp)) tryPush(qp);
           }
+
           if (out.length >= 12) break;
         }
       };
@@ -1115,11 +1106,10 @@ export class CompetitorService {
         out.push(s);
       };
 
-      // ✅ location 대신 document.baseURI
       const parseQueryParam = (href: string): string => {
         const base = (() => {
           try {
-            return String((document as any)?.baseURI || "");
+            return String(d?.baseURI || "");
           } catch {
             return "";
           }
@@ -1148,12 +1138,12 @@ export class CompetitorService {
 
         const t1 = clean(a?.innerText || a?.textContent);
         if (t1 && !isNoise(t1)) tryPush(t1);
-        if (out.length >= 12) break;
 
-        if (!t1 || isNoise(t1)) {
+        if ((!t1 || isNoise(t1)) && out.length < 12) {
           const qp = parseQueryParam(href);
           if (qp && !isNoise(qp)) tryPush(qp);
         }
+
         if (out.length >= 12) break;
       }
 
