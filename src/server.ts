@@ -464,6 +464,9 @@ function buildMenuGuidance(params: {
  *   finally에서 browser close 이후 백그라운드 에러가 터질 수 있음
  *
  * ✅ 대신 SOFT timeout 사용: 시간 지나면 fallback 반환 (절대 throw X)
+ *
+ * ⚠️ 하지만 경쟁사 수집(Playwright)은 여기서 race로 끊으면 “0개 반환” 레이스가 생김.
+ * 그래서 competitor 쪽에서는 이 함수를 쓰지 않고, 서비스 내부 timeoutMs로만 끊는다.
  */
 async function withSoftTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
   let timer: NodeJS.Timeout | null = null;
@@ -493,6 +496,15 @@ function getCompetitorTimeouts() {
   return { safeTotal, safePerTry };
 }
 
+/**
+ * ✅ 경쟁사 수집 (중요 변경)
+ * - 여기서는 withSoftTimeout(Promise.race) 사용 금지
+ * - 이유: race로 먼저 [] 반환되면 "no competitors"가 찍히고,
+ *   실제 크롤러는 취소 안 되어 뒤에서 keyword snapshot이 늦게 찍히는 레이스가 발생
+ *
+ * ✅ 해결: competitorService.findTopCompetitorsByKeyword(...) 를 "항상 await"하고,
+ *    timeoutMs는 service 내부 deadline로만 처리
+ */
 async function getCompetitorsSafe(params: {
   compSvc: CompetitorService;
   placeId: string;
@@ -503,29 +515,46 @@ async function getCompetitorsSafe(params: {
   const { compSvc, placeId, queries, limit, totalTimeoutMs } = params;
 
   const started = Date.now();
-  const perTryCap = getCompetitorTimeouts().safePerTry;
+  const { safePerTry } = getCompetitorTimeouts();
+
+  const collected: any[] = [];
+  const seen = new Set<string>();
+
+  const pushMany = (arr: any[]) => {
+    for (const c of arr || []) {
+      const pid = String(c?.placeId || "").trim();
+      if (!pid) continue;
+      if (seen.has(pid)) continue;
+      if (pid === String(placeId || "").trim()) continue;
+      seen.add(pid);
+      collected.push(c);
+      if (collected.length >= limit) break;
+    }
+  };
 
   for (const q of queries) {
-    const remainingMs = totalTimeoutMs - (Date.now() - started);
-    if (remainingMs <= 200) break;
+    const elapsed = Date.now() - started;
+    const remainingMs = totalTimeoutMs - elapsed;
+    if (remainingMs <= 500) break;
+    if (!q || !String(q).trim()) continue;
 
-    // ✅ perTry는 "서비스에 전달할 예산"이고, 바깥에서 kill하지 않는다
-    const perTryTimeoutMs = Math.min(remainingMs, Math.max(3000, Math.min(perTryCap, remainingMs)));
+    // ✅ perTry 예산은 "서비스에 전달"만 한다 (바깥에서 race로 자르지 않음)
+    // - 너무 짧으면 성공률이 급락하니 최소 3500ms 보장
+    const perTryTimeoutMs = Math.max(3500, Math.min(safePerTry, remainingMs));
 
     console.log("[PAID][COMP] try query:", q, "remainingMs:", remainingMs, "perTryTimeoutMs:", perTryTimeoutMs);
 
-    // ✅ 핵심 변경:
-    // - 기존: withTimeout(..., "compTop-timeout") -> reject 발생
-    // - 변경: withSoftTimeout(..., []) -> 시간 지나면 그냥 [] 반환(throw 없음)
-    const comps = await withSoftTimeout(
-      compSvc.findTopCompetitorsByKeyword(q, {
+    let comps: any[] = [];
+    try {
+      comps = await compSvc.findTopCompetitorsByKeyword(q, {
         excludePlaceId: placeId,
         limit,
         timeoutMs: perTryTimeoutMs
-      }),
-      perTryTimeoutMs + 300, // 네트워크 상황 감안해 약간 여유
-      [] as any[]
-    );
+      });
+    } catch (e: any) {
+      console.warn("[PAID][COMP] findTopCompetitorsByKeyword failed:", e?.message || String(e));
+      comps = [];
+    }
 
     if (Array.isArray(comps) && comps.length) {
       try {
@@ -539,13 +568,14 @@ async function getCompetitorsSafe(params: {
         console.log("[PAID][COMP] keyword snapshot:", JSON.stringify(snap));
       } catch {}
 
-      return comps.slice(0, limit);
+      pushMany(comps);
+      if (collected.length >= limit) break;
     } else {
       console.log("[PAID][COMP] no competitors from query:", q);
     }
   }
 
-  return [];
+  return collected.slice(0, limit);
 }
 
 /** FREE */
