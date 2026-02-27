@@ -276,7 +276,7 @@ export class CompetitorService {
     const q = String(keyword || "").trim();
     if (!q) return [];
 
-    const searchCoord = this.__normalizeSearchCoord(); // ✅ 무조건 값 반환
+    const searchCoord = this.__normalizeSearchCoord();
     const boundary = String(process.env.NAVER_MAP_BOUNDARY || "").trim();
 
     const tryOnce = async (useBoundary: boolean, ms: number): Promise<string[]> => {
@@ -284,7 +284,7 @@ export class CompetitorService {
       url.searchParams.set("query", q);
       url.searchParams.set("type", "all");
       url.searchParams.set("page", "1");
-      url.searchParams.set("searchCoord", searchCoord); // ✅ 필수
+      url.searchParams.set("searchCoord", searchCoord);
       if (useBoundary && boundary) url.searchParams.set("boundary", boundary);
 
       const ctrl = new AbortController();
@@ -313,7 +313,6 @@ export class CompetitorService {
           );
         }
 
-        // ✅ 503 같은 경우 html이 올 수 있음 → JSON 취급 금지
         if (ct.includes("text/html") || /<!doctype html/i.test(text)) {
           throw new Error(
             `[allSearch${useBoundary ? ":html+xy" : ":html"}] status=${res.status} body=${String(text || "").slice(0, 220)}`
@@ -355,8 +354,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 추가 fallback A: m.place 검색 페이지(HTML)에서 placeId 추출
-  // - allSearch/m.map이 막혀도 여기는 종종 살아있음
+  // ✅ fallback A: m.place 검색 페이지(HTML)에서 placeId 추출
   // ==========================
   private async __findTopPlaceIdsViaMPlaceSearchHtml(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
     const q = String(keyword || "").trim();
@@ -366,14 +364,12 @@ export class CompetitorService {
     const html = await this.__fetchHtml(url, timeoutMs).catch(() => "");
     if (!html) return [];
 
-    // m.place 검색 결과에는 placeId가 다양한 형태로 섞여나옴
     const ids = this.__extractPlaceIdsFromAnyTextInOrder(html);
     return ids.slice(0, limit);
   }
 
   // ==========================
-  // ✅ 추가 fallback B: PC map(place.naver.com) 검색 HTML에서 placeId 추출
-  // - m.place/search 가 막히는 경우 보조
+  // ✅ fallback B: place.naver.com 검색 HTML에서 placeId 추출
   // ==========================
   private async __findTopPlaceIdsViaPcPlaceSearchHtml(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
     const q = String(keyword || "").trim();
@@ -386,7 +382,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 1) 지도 TOP placeId (예산 기반) - "0개로 끝나지 않게" 단계적 채우기
+  // ✅ 1) 지도 TOP placeId (예산 기반) - 단계적 채우기
   // ==========================
   async findTopPlaceIdsFromMapRank(keyword: string, opts: FindTopIdsOptions = {}): Promise<string[]> {
     const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
@@ -401,7 +397,7 @@ export class CompetitorService {
     const out: string[] = [];
     const seen = new Set<string>();
 
-    // 1) allSearch (최대 ~3초)
+    // 1) allSearch
     try {
       const ids = await this.__findTopPlaceIdsViaAllSearch(q, limit + 10, Math.min(3200, remaining()));
       this.__pushUnique(out, seen, ids, limit, exclude);
@@ -410,7 +406,7 @@ export class CompetitorService {
       console.warn("[COMP][mapRank] allSearch failed:", e);
     }
 
-    // 2) m.map (xhr sniff) - 남은 예산 내에서만
+    // 2) m.map sniff
     const leftForMap = remaining();
     if (leftForMap > 900 && out.length < limit) {
       const url = `https://m.map.naver.com/search2/search.naver?query=${encodeURIComponent(q)}`;
@@ -419,6 +415,7 @@ export class CompetitorService {
       const page = await this.__newLightPage(context, Math.min(leftForMap, 6500));
 
       const buf: string[] = [];
+
       const onRespMap = async (res: Response) => {
         try {
           const req = res.request();
@@ -486,7 +483,7 @@ export class CompetitorService {
       }
     }
 
-    // 3) m.place search HTML
+    // 3) m.place search html
     if (out.length < limit && remaining() > 700) {
       try {
         const ids = await this.__findTopPlaceIdsViaMPlaceSearchHtml(q, limit + 30, Math.min(2500, remaining()));
@@ -497,7 +494,7 @@ export class CompetitorService {
       }
     }
 
-    // 4) place.naver.com search HTML
+    // 4) place.naver.com search html
     if (out.length < limit && remaining() > 700) {
       try {
         const ids = await this.__findTopPlaceIdsViaPcPlaceSearchHtml(q, limit + 30, Math.min(2500, remaining()));
@@ -508,7 +505,6 @@ export class CompetitorService {
       }
     }
 
-    // ✅ 여기서 out이 0이어도 "가능한 만큼" 반환 (부분성공 유지)
     return out.slice(0, limit);
   }
 
@@ -528,15 +524,14 @@ export class CompetitorService {
     );
     const deadline = this.__deadlineMs(totalTimeoutMs);
 
-    // 1) map rank: "가능한 만큼" 채우기
+    // 1) map rank
     const mapIds = await this.findTopPlaceIdsFromMapRank(q, {
       excludePlaceId: exclude,
       limit,
       timeoutMs: Math.min(8500, Math.max(2500, this.__remaining(deadline)))
     }).catch(() => []);
 
-    // 2) fallback: where=place (fetch -> render)
-    //    mapIds가 부족하면 부족분만큼 metas로 채우기
+    // 2) where=place (부족분만)
     let metas: PlaceMeta[] = [];
     const needMore = Math.max(0, limit - mapIds.length);
 
@@ -544,10 +539,10 @@ export class CompetitorService {
       const remain = Math.min(12000, Math.max(4500, this.__remaining(deadline)));
       const m1 = await this.__findTopPlaceMetasFromSearchWherePlaceFetch(q, remain).catch(() => []);
       const m2 = m1.length ? [] : await this.__findTopPlaceMetasFromSearchWherePlaceRendered(q, remain).catch(() => []);
-      metas = (m1.length ? m1 : m2).slice(0, 12);
+      metas = (m1.length ? m1 : m2).slice(0, 18);
     }
 
-    // 3) 후보 합치기(중복 제거, 부족분 채우기)
+    // 3) 후보 합치기
     const candidateMetas: PlaceMeta[] = [];
     const seenPid = new Set<string>();
 
@@ -606,7 +601,6 @@ export class CompetitorService {
       if (this.__isBannedName(finalName)) finalName = "";
       if (!finalName) finalName = `place_${pid}`;
 
-      // ✅ 대표키워드는 query= 링크 기반 + 강력 필터
       const finalKeywords = this.__finalizeKeywords(enriched?.keywords || [], finalName);
       const safeKeywords = finalKeywords.length ? finalKeywords : ["대표키워드없음"];
       const source: Competitor["source"] = enriched.loaded ? "place_home" : "search_html";
@@ -783,9 +777,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ place home: 대표키워드 추출
-  // - "query= 링크" 기반으로 고정
-  // - 네트워크/NextData에서 주워도 최종 정리는 query기반 + 필터로 안정화
+  // ✅ place home: 대표키워드 추출 (query= 링크 기반 고정)
   // ==========================
   private async __fetchPlaceHomeAndExtract(placeId: string, timeoutMs: number): Promise<PlaceHomeExtract> {
     const pid = this.__normPlaceId(placeId);
@@ -813,7 +805,6 @@ export class CompetitorService {
     const context = await this.__newContext("https://m.place.naver.com/");
     const page = await this.__newLightPage(context, timeoutMs);
 
-    // ✅ 네트워크에서 keywordList류가 보이면 주워오되, 최종은 query= 링크 기반으로 정제
     const onResponseKw = async (res: Response) => {
       try {
         const req = res.request();
@@ -823,7 +814,8 @@ export class CompetitorService {
         const u = String(res.url() || "");
         if (!/m\.place\.naver\.com/.test(u)) return;
 
-        const looksKeywordish = /keyword/i.test(u) || /keywordList/i.test(u) || /represent/i.test(u) || /graphql/i.test(u) || /\/api\//i.test(u);
+        const looksKeywordish =
+          /keyword/i.test(u) || /keywordList/i.test(u) || /represent/i.test(u) || /graphql/i.test(u) || /\/api\//i.test(u);
         if (!looksKeywordish) return;
 
         const headers = res.headers?.() ?? {};
@@ -844,6 +836,7 @@ export class CompetitorService {
           if (nm && !this.__isBannedName(nm)) netState.name = nm;
         }
 
+        // ✅ 키워드는 네트워크에서도 받을 수 있지만, 최종은 query 링크 기반으로 정제됨
         if (!netState.keywords.length) {
           for (const k of ["representKeywordList", "representativeKeywordList", "representKeywords", "representativeKeywords", "keywordList", "keywords"]) {
             const arr = this.__deepFindStringArray(j, k);
@@ -869,23 +862,20 @@ export class CompetitorService {
       loaded = status === 200 && outer.length > 500;
       console.log("[COMP][placeHome] goto", { status, url, finalUrl, title: pageTitle, htmlLen: outer.length });
 
-      // ✅ 1) outer NEXT_DATA로 name만 보조 추출
       const nextOuter = this.__parseNextData(outer);
       if (nextOuter && !netState.name) {
         const nm = this.__deepFindName(nextOuter);
         if (nm && !this.__isBannedName(nm)) netState.name = nm;
       }
 
-      // ✅ 2) entry iframe
       const frame = await this.__resolveEntryFrame(page, timeoutMs);
 
-      // ✅ query= 링크 기반 키워드 추출(프레임 우선)
+      // ✅ query= 링크 기반으로 키워드 확정
       if (frame) {
         await this.__expandAndScrollFrame(frame, timeoutMs).catch(() => {});
         const kw = await this.__extractKeywordsFromQueryLinks(frame).catch(() => []);
         if (kw.length) netState.keywords = kw;
 
-        // 프레임 NEXT_DATA에서 name 보조
         if (!netState.name) {
           const frameHtml = await frame.content().catch(() => "");
           const nextFrame = frameHtml ? this.__parseNextData(frameHtml) : null;
@@ -895,12 +885,10 @@ export class CompetitorService {
           }
         }
       } else {
-        // iframe 못 잡으면 page 단에서 query= 링크 기반
         const kw = await this.__extractKeywordsFromPageDomQueryLinks(page).catch(() => []);
         if (kw.length) netState.keywords = kw;
       }
 
-      // og:title 보조
       if (!netState.name) {
         const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
         const og = m1?.[1] ? this.__cleanText(m1[1]) : "";
@@ -1008,9 +996,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 대표키워드 추출: "query=" 링크 기반 (핵심 고정)
-  // - anchor text가 아닌 경우 query 파라미터도 보조로 사용
-  // - 결과는 __finalizeKeywords에서 최종 5개로 강력 정리
+  // ✅ 대표키워드 추출: "query=" 링크 기반 (location 사용 금지)
   // ==========================
   private async __extractKeywordsFromQueryLinks(frame: Frame): Promise<string[]> {
     const raw: string[] = await frame.evaluate(() => {
@@ -1033,33 +1019,31 @@ export class CompetitorService {
         out.push(s);
       };
 
+      // ✅ location 대신 document.baseURI 사용 (TS/런타임 모두 안전)
       const parseQueryParam = (href: string): string => {
-  const base = (() => {
-    try {
-      // location 대신 baseURI 사용 (타입/런타임 모두 안전)
-      return String(document?.baseURI || "");
-    } catch {
-      return "";
-    }
-  })();
+        const base = (() => {
+          try {
+            return String((document as any)?.baseURI || "");
+          } catch {
+            return "";
+          }
+        })();
 
-  try {
-    const u = new URL(href, base || "https://m.place.naver.com/");
-    const q = u.searchParams.get("query") || u.searchParams.get("q") || "";
-    return decodeURIComponent(q || "").trim();
-  } catch {
-    // href가 상대경로/깨진 URL일 수 있음
-    const m = String(href || "").match(/[?&](?:query|q)=([^&]+)/i);
-    if (!m?.[1]) return "";
-    try {
-      return decodeURIComponent(m[1]).trim();
-    } catch {
-      return String(m[1] || "").trim();
-    }
-  }
-};
+        try {
+          const u = new URL(href, base || "https://m.place.naver.com/");
+          const q = u.searchParams.get("query") || u.searchParams.get("q") || "";
+          return decodeURIComponent(q || "").trim();
+        } catch {
+          const m = String(href || "").match(/[?&](?:query|q)=([^&]+)/i);
+          if (!m?.[1]) return "";
+          try {
+            return decodeURIComponent(m[1]).trim();
+          } catch {
+            return String(m[1] || "").trim();
+          }
+        }
+      };
 
-      // 대표키워드 섹션 우선 탐색
       const nodes = Array.from(d.querySelectorAll("span, strong, h2, h3, div, p")) as any[];
       const header = nodes.find((el) => {
         const t = clean(el?.innerText || el?.textContent);
@@ -1076,15 +1060,12 @@ export class CompetitorService {
 
           const t1 = clean(a?.innerText || a?.textContent);
           if (t1 && !isNoise(t1)) tryPush(t1);
-
           if (out.length >= 12) break;
 
-          // anchor text가 비거나 노이즈면 query 파라미터도 보조로
           if (!t1 || isNoise(t1)) {
             const qp = parseQueryParam(href);
             if (qp && !isNoise(qp)) tryPush(qp);
           }
-
           if (out.length >= 12) break;
         }
       };
@@ -1134,29 +1115,30 @@ export class CompetitorService {
         out.push(s);
       };
 
+      // ✅ location 대신 document.baseURI
       const parseQueryParam = (href: string): string => {
-  const base = (() => {
-    try {
-      return String(document?.baseURI || "");
-    } catch {
-      return "";
-    }
-  })();
+        const base = (() => {
+          try {
+            return String((document as any)?.baseURI || "");
+          } catch {
+            return "";
+          }
+        })();
 
-  try {
-    const u = new URL(href, base || "https://m.place.naver.com/");
-    const q = u.searchParams.get("query") || u.searchParams.get("q") || "";
-    return decodeURIComponent(q || "").trim();
-  } catch {
-    const m = String(href || "").match(/[?&](?:query|q)=([^&]+)/i);
-    if (!m?.[1]) return "";
-    try {
-      return decodeURIComponent(m[1]).trim();
-    } catch {
-      return String(m[1] || "").trim();
-    }
-  }
-};
+        try {
+          const u = new URL(href, base || "https://m.place.naver.com/");
+          const q = u.searchParams.get("query") || u.searchParams.get("q") || "";
+          return decodeURIComponent(q || "").trim();
+        } catch {
+          const m = String(href || "").match(/[?&](?:query|q)=([^&]+)/i);
+          if (!m?.[1]) return "";
+          try {
+            return decodeURIComponent(m[1]).trim();
+          } catch {
+            return String(m[1] || "").trim();
+          }
+        }
+      };
 
       const links = Array.from(d.querySelectorAll('a[href*="query="], a[href*="search.naver.com"]')) as any[];
       for (const a of links) {
@@ -1166,14 +1148,12 @@ export class CompetitorService {
 
         const t1 = clean(a?.innerText || a?.textContent);
         if (t1 && !isNoise(t1)) tryPush(t1);
-
         if (out.length >= 12) break;
 
         if (!t1 || isNoise(t1)) {
           const qp = parseQueryParam(href);
           if (qp && !isNoise(qp)) tryPush(qp);
         }
-
         if (out.length >= 12) break;
       }
 
@@ -1193,7 +1173,6 @@ export class CompetitorService {
 
   // ==========================
   // ✅ 최종 키워드 정리(잡음 강력 제거)
-  // - query 링크 기반이라도 마지막 필터로 "미용실/커트" 단독 등 제거
   // ==========================
   private __finalizeKeywords(keywords: string[], placeName?: string): string[] {
     const nm = this.__normNoSpace(placeName || "");
@@ -1203,15 +1182,9 @@ export class CompetitorService {
       .map((k) => k.replace(/^#/, "").trim())
       .filter(Boolean)
       .filter((k) => k.length >= 2 && k.length <= 25)
-
-      // UI/잡음 제거
       .filter((k) => !/(알림받기|방문자\s*리뷰|방문자리뷰|블로그\s*리뷰|블로그리뷰|리뷰\s*\d+|별점|평점|지도|저장|공유|길찾기|전화|예약|문의|쿠폰|이벤트|할인)/i.test(k))
       .filter((k) => !/^(홈|메뉴|가격|리뷰|사진|소개|소식|예약)$/i.test(k))
-
-      // “미용실/커트/컷” 단독 같은 일반어 제거 (원하면 여기서 완화 가능)
       .filter((k) => !/^(미용실|헤어샵|헤어살롱|커트|컷)$/i.test(k))
-
-      // 업체명/브랜드 자체 제거
       .filter((k) => {
         if (!nm) return true;
         const kk = this.__normNoSpace(k);
