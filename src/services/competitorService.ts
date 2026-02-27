@@ -1034,21 +1034,30 @@ export class CompetitorService {
       };
 
       const parseQueryParam = (href: string): string => {
-        try {
-          const u = new URL(href, location.href);
-          const q = u.searchParams.get("query") || u.searchParams.get("q") || "";
-          return decodeURIComponent(q || "").trim();
-        } catch {
-          // href가 상대경로/깨진 URL일 수 있음
-          const m = href.match(/[?&](?:query|q)=([^&]+)/i);
-          if (!m?.[1]) return "";
-          try {
-            return decodeURIComponent(m[1]).trim();
-          } catch {
-            return String(m[1] || "").trim();
-          }
-        }
-      };
+  const base = (() => {
+    try {
+      // location 대신 baseURI 사용 (타입/런타임 모두 안전)
+      return String(document?.baseURI || "");
+    } catch {
+      return "";
+    }
+  })();
+
+  try {
+    const u = new URL(href, base || "https://m.place.naver.com/");
+    const q = u.searchParams.get("query") || u.searchParams.get("q") || "";
+    return decodeURIComponent(q || "").trim();
+  } catch {
+    // href가 상대경로/깨진 URL일 수 있음
+    const m = String(href || "").match(/[?&](?:query|q)=([^&]+)/i);
+    if (!m?.[1]) return "";
+    try {
+      return decodeURIComponent(m[1]).trim();
+    } catch {
+      return String(m[1] || "").trim();
+    }
+  }
+};
 
       // 대표키워드 섹션 우선 탐색
       const nodes = Array.from(d.querySelectorAll("span, strong, h2, h3, div, p")) as any[];
@@ -1126,20 +1135,28 @@ export class CompetitorService {
       };
 
       const parseQueryParam = (href: string): string => {
-        try {
-          const u = new URL(href, location.href);
-          const q = u.searchParams.get("query") || u.searchParams.get("q") || "";
-          return decodeURIComponent(q || "").trim();
-        } catch {
-          const m = href.match(/[?&](?:query|q)=([^&]+)/i);
-          if (!m?.[1]) return "";
-          try {
-            return decodeURIComponent(m[1]).trim();
-          } catch {
-            return String(m[1] || "").trim();
-          }
-        }
-      };
+  const base = (() => {
+    try {
+      return String(document?.baseURI || "");
+    } catch {
+      return "";
+    }
+  })();
+
+  try {
+    const u = new URL(href, base || "https://m.place.naver.com/");
+    const q = u.searchParams.get("query") || u.searchParams.get("q") || "";
+    return decodeURIComponent(q || "").trim();
+  } catch {
+    const m = String(href || "").match(/[?&](?:query|q)=([^&]+)/i);
+    if (!m?.[1]) return "";
+    try {
+      return decodeURIComponent(m[1]).trim();
+    } catch {
+      return String(m[1] || "").trim();
+    }
+  }
+};
 
       const links = Array.from(d.querySelectorAll('a[href*="query="], a[href*="search.naver.com"]')) as any[];
       for (const a of links) {
