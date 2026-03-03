@@ -43,6 +43,72 @@ export class CompetitorService {
     this.browser = null;
   }
 
+    // ==========================
+  // ✅ query-param 기반 키워드만 추출 (DOM에 query 링크가 없을 때의 최후 보강)
+  // - “URL의 query/q 파라미터 값”만 채택 => 요구사항 2 유지
+  // ==========================
+  private __extractKeywordsFromAnyTextByQueryParam(text: string): string[] {
+    const s = String(text || "");
+    if (!s) return [];
+
+    const out: string[] = [];
+    const seen = new Set<string>();
+
+    const isNoise = (t: string) =>
+      /^(저장|공유|길찾기|전화|예약|리뷰|사진|홈|메뉴|가격|더보기|쿠폰|이벤트|알림받기)$/i.test(t) ||
+      /(방문자\s*리뷰|방문자리뷰|블로그\s*리뷰|블로그리뷰|별점|평점)/i.test(t) ||
+      /^(내비게이션|네비게이션|navigation)$/i.test(t) ||
+      /(로그인|동의|확인|취소|닫기)/i.test(t);
+
+    const isPromoLike = (t: string) => /(원|만원|%|할인|쿠폰|이벤트|특가)/.test(t) && /\d/.test(t);
+
+    const push = (raw: string) => {
+      const v = this.__cleanText(raw).replace(/^#/, "").trim();
+      if (!v) return;
+      if (v.length < 2 || v.length > 25) return;
+      if (isNoise(v)) return;
+      if (isPromoLike(v)) return;
+
+      const key = this.__normNoSpace(v);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      out.push(v);
+    };
+
+    // 1) URL-like 조각에서 query/q 값을 파싱
+    const urlLike = s.match(/(https?:\/\/[^\s"'<>]+|\/[^\s"'<>]+)\b/g) || [];
+    for (const u0 of urlLike) {
+      if (!/(query=|[?&]q=)/i.test(u0)) continue;
+      try {
+        const u = new URL(u0, "https://m.place.naver.com/");
+        const q = u.searchParams.get("query") || u.searchParams.get("q") || "";
+        if (q) push(decodeURIComponent(q));
+      } catch {
+        const m = u0.match(/[?&](?:query|q)=([^&]+)/i);
+        if (m?.[1]) {
+          try {
+            push(decodeURIComponent(m[1]));
+          } catch {
+            push(m[1]);
+          }
+        }
+      }
+      if (out.length >= 16) break;
+    }
+
+    // 2) JSON-ish 형태에서도 query/q 값만 (예: "query":"서대문역 미용실")
+    if (out.length < 5) {
+      const reJson = /["'](?:query|q)["']\s*:\s*["']([^"']{2,60})["']/gi;
+      for (const m of s.matchAll(reJson)) {
+        const v = m[1] || "";
+        push(v);
+        if (out.length >= 16) break;
+      }
+    }
+
+    return out.slice(0, 16);
+  }
+
   // ==========================
   // ✅ Debug logger
   // ==========================
@@ -1008,49 +1074,55 @@ export class CompetitorService {
 
   /**
    * ✅ 변경 핵심:
-   * - 대표키워드: 오직 query= 링크 기반(+query param)만 사용
-   * - response sniff / keywordList JSON / regex / nextData 키워드 deep-find 전부 비활성
+   * - 대표키워드: query param 기반만 채택
+   *   1) frame/page DOM에서 query링크 탐색
+   *   2) 실패 시: 네트워크 응답 body에서 query/q 파라미터만 “문자열 스캔”으로 추출 (query-param 원칙 유지)
    */
   private async __renderAndExtractFromPlaceHome(url: string, timeoutMs: number): Promise<PlaceHomeExtract> {
-    const netState: { name: string; keywords: string[]; kwSource: "query_links_frame" | "query_links_page" | "none" } = {
-      name: "",
-      keywords: [],
-      kwSource: "none"
-    };
+    const netState: {
+      name: string;
+      keywords: string[];
+      kwSource: "query_links_frame" | "query_links_page" | "query_sniff" | "none";
+    } = { name: "", keywords: [], kwSource: "none" };
+
     let loaded = false;
 
     const context = await this.__newContext("https://m.place.naver.com/");
     const page = await this.__newLightPage(context, timeoutMs);
 
-    // ✅ name은 스니핑으로 잡혀도 OK (키워드는 금지)
-    const onRespNameSniff = async (res: Response) => {
-      try {
-        if (netState.name) return;
+    // ✅ query-param 스니핑 버퍼 (keywordList JSON은 안 씀. query/q param만 뽑기 위함)
+    const queryBuf: string[] = [];
 
+    const onRespSniff = async (res: Response) => {
+      try {
         const req = res.request();
         const rt = req.resourceType();
-        if (rt !== "xhr" && rt !== "fetch") return;
+        if (rt !== "xhr" && rt !== "fetch" && rt !== "script") return;
 
-        const u = res.url();
-        if (!/m\.place\.naver\.com/.test(u)) return;
+        const u = String(res.url() || "");
+        if (!/naver\.com/.test(u)) return;
 
-        const headers = res.headers();
-        const ct = String(headers["content-type"] || "").toLowerCase();
-        if (!ct.includes("json") && !ct.includes("text/plain") && !ct.includes("javascript")) return;
-
+        // body에 query/q 흔적이 없으면 스킵 (성능)
         const txt = await res.text().catch(() => "");
-        if (!txt || txt.length < 20) return;
+        if (!txt || txt.length < 30) return;
         if (/<!doctype html/i.test(txt)) return;
+        if (!/(query=|[?&]q=)/i.test(txt)) return;
 
-        const j = this.__safeJsonParse(txt);
-        if (!j) return;
+        queryBuf.push(txt);
+        if (queryBuf.length > 60) queryBuf.shift();
 
-        const nm = this.__deepFindName(j);
-        if (nm && !this.__isBannedName(nm)) netState.name = nm;
+        // name은 스니핑으로 보강 OK (키워드는 절대 keywordList에서 안 가져옴)
+        if (!netState.name) {
+          const j = this.__safeJsonParse(txt);
+          if (j) {
+            const nm = this.__deepFindName(j);
+            if (nm && !this.__isBannedName(nm)) netState.name = nm;
+          }
+        }
       } catch {}
     };
 
-    page.on("response", onRespNameSniff);
+    page.on("response", onRespSniff);
 
     try {
       const resp = await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => null);
@@ -1060,7 +1132,7 @@ export class CompetitorService {
       const outer = await page.content().catch(() => "");
       loaded = status === 200 && outer.length > 500;
 
-      // outer nextData에서 name 보강은 OK
+      // name 보강: outer nextData/og:title
       const nextOuter = this.__parseNextData(outer);
       if (nextOuter && !netState.name) {
         const nm = this.__deepFindName(nextOuter);
@@ -1071,8 +1143,6 @@ export class CompetitorService {
 
       if (frame) {
         await this.__expandAndScrollFrame(frame, timeoutMs).catch(() => {});
-
-        // ✅ 1) query 링크 기반(+query param) ONLY
         const kw1 = await this.__extractKeywordsFromQueryLinks(frame).catch(() => []);
         if (kw1.length) {
           netState.keywords = kw1;
@@ -1080,7 +1150,6 @@ export class CompetitorService {
         }
       }
 
-      // frame에서 못 뽑으면 page DOM에서 query 링크 ONLY
       if (!netState.keywords.length) {
         const kw2 = await this.__extractKeywordsFromPageDomQueryLinks(page).catch(() => []);
         if (kw2.length) {
@@ -1089,7 +1158,19 @@ export class CompetitorService {
         }
       }
 
-      // og:title로 name 보강
+      // ✅ DOM에서 못 찾으면: 네트워크 응답 body에서 query/q 파라미터만 추출
+      if (!netState.keywords.length) {
+        let frameHtml = "";
+        if (frame) frameHtml = await frame.content().catch(() => "");
+
+        const merged = [outer, frameHtml, queryBuf.join("\n")].filter(Boolean).join("\n");
+        const kw3 = this.__extractKeywordsFromAnyTextByQueryParam(merged);
+        if (kw3.length) {
+          netState.keywords = kw3;
+          netState.kwSource = "query_sniff";
+        }
+      }
+
       if (!netState.name) {
         const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
         const og = m1?.[1] ? this.__cleanText(m1[1]) : "";
@@ -1099,7 +1180,6 @@ export class CompetitorService {
       const cleanedName = this.__stripNaverSuffix(netState.name);
       const finalName = this.__cleanText(cleanedName);
 
-      // ✅ 최종 키워드 정리(잡음 제거 + 5개 제한)
       const cleanedKeywords = this.__finalizeKeywords(netState.keywords, finalName);
 
       console.log("[COMP][placeHome] extracted", {
@@ -1115,7 +1195,7 @@ export class CompetitorService {
       return { name: "", keywords: [], loaded: false };
     } finally {
       try {
-        page.off("response", onRespNameSniff);
+        page.off("response", onRespSniff);
       } catch {}
       try {
         await page.close();
