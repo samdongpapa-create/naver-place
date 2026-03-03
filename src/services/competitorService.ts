@@ -1078,11 +1078,17 @@ export class CompetitorService {
    *   1) frame/page DOM에서 query링크 탐색
    *   2) 실패 시: 네트워크 응답 body에서 query/q 파라미터만 “문자열 스캔”으로 추출 (query-param 원칙 유지)
    */
-  private async __renderAndExtractFromPlaceHome(url: string, timeoutMs: number): Promise<PlaceHomeExtract> {
+    private async __renderAndExtractFromPlaceHome(url: string, timeoutMs: number): Promise<PlaceHomeExtract> {
     const netState: {
       name: string;
       keywords: string[];
-      kwSource: "query_links_frame" | "query_links_page" | "query_sniff" | "none";
+      kwSource:
+        | "query_links_frame"
+        | "query_links_page"
+        | "query_sniff"
+        | "json_sniff_fallback"
+        | "regex_fallback"
+        | "none";
     } = { name: "", keywords: [], kwSource: "none" };
 
     let loaded = false;
@@ -1090,8 +1096,87 @@ export class CompetitorService {
     const context = await this.__newContext("https://m.place.naver.com/");
     const page = await this.__newLightPage(context, timeoutMs);
 
-    // ✅ query-param 스니핑 버퍼 (keywordList JSON은 안 씀. query/q param만 뽑기 위함)
+    // ✅ query-param 스캔용 버퍼
     const queryBuf: string[] = [];
+    // ✅ json keywordList fallback 버퍼
+    const jsonKeywordBuf: string[] = [];
+
+    const sniffJsonKeywords = (j: any): string[] => {
+      const keys = [
+        "representKeywordList",
+        "representativeKeywordList",
+        "representKeywords",
+        "representativeKeywords",
+        "keywordList",
+        "keywords"
+      ];
+      for (const k of keys) {
+        const arr = this.__deepFindStringArray(j, k);
+        if (arr?.length) return arr;
+      }
+      return [];
+    };
+
+    const extractQueryParamKeywordsFromAnyText = (text: string): string[] => {
+      const s = String(text || "");
+      if (!s) return [];
+
+      const out: string[] = [];
+      const seen = new Set<string>();
+
+      const isNoise = (t: string) =>
+        /^(저장|공유|길찾기|전화|예약|리뷰|사진|홈|메뉴|가격|더보기|쿠폰|이벤트|알림받기)$/i.test(t) ||
+        /(방문자\s*리뷰|방문자리뷰|블로그\s*리뷰|블로그리뷰|별점|평점)/i.test(t) ||
+        /^(내비게이션|네비게이션|navigation)$/i.test(t) ||
+        /(로그인|동의|확인|취소|닫기)/i.test(t);
+
+      const isPromoLike = (t: string) => /(원|만원|%|할인|쿠폰|이벤트|특가)/.test(t) && /\d/.test(t);
+
+      const push = (raw: string) => {
+        const v = this.__cleanText(raw).replace(/^#/, "").trim();
+        if (!v) return;
+        if (v.length < 2 || v.length > 25) return;
+        if (isNoise(v)) return;
+        if (isPromoLike(v)) return;
+
+        const key = this.__normNoSpace(v);
+        if (!key || seen.has(key)) return;
+        seen.add(key);
+        out.push(v);
+      };
+
+      // URL-like 조각에서 query/q 값만
+      const urlLike = s.match(/(https?:\/\/[^\s"'<>]+|\/[^\s"'<>]+)\b/g) || [];
+      for (const u0 of urlLike) {
+        if (!/(query=|[?&]q=)/i.test(u0)) continue;
+        try {
+          const u = new URL(u0, "https://m.place.naver.com/");
+          const q = u.searchParams.get("query") || u.searchParams.get("q") || "";
+          if (q) push(decodeURIComponent(q));
+        } catch {
+          const m = u0.match(/[?&](?:query|q)=([^&]+)/i);
+          if (m?.[1]) {
+            try {
+              push(decodeURIComponent(m[1]));
+            } catch {
+              push(m[1]);
+            }
+          }
+        }
+        if (out.length >= 16) break;
+      }
+
+      // JSON-ish: "query":"..."
+      if (out.length < 5) {
+        const reJson = /["'](?:query|q)["']\s*:\s*["']([^"']{2,60})["']/gi;
+        for (const m of s.matchAll(reJson)) {
+          push(m[1] || "");
+          if (out.length >= 16) break;
+        }
+      }
+
+      return out.slice(0, 16);
+    };
 
     const onRespSniff = async (res: Response) => {
       try {
@@ -1102,21 +1187,30 @@ export class CompetitorService {
         const u = String(res.url() || "");
         if (!/naver\.com/.test(u)) return;
 
-        // body에 query/q 흔적이 없으면 스킵 (성능)
         const txt = await res.text().catch(() => "");
         if (!txt || txt.length < 30) return;
         if (/<!doctype html/i.test(txt)) return;
-        if (!/(query=|[?&]q=)/i.test(txt)) return;
 
-        queryBuf.push(txt);
-        if (queryBuf.length > 60) queryBuf.shift();
+        // 1) query param 흔적 버퍼
+        if (/(query=|[?&]q=)/i.test(txt)) {
+          queryBuf.push(txt);
+          if (queryBuf.length > 60) queryBuf.shift();
+        }
 
-        // name은 스니핑으로 보강 OK (키워드는 절대 keywordList에서 안 가져옴)
-        if (!netState.name) {
+        // 2) json keywordList fallback 버퍼(최후 fallback용)
+        if (/(keywordList|representKeyword|representativeKeyword|keywords)/i.test(txt)) {
           const j = this.__safeJsonParse(txt);
           if (j) {
-            const nm = this.__deepFindName(j);
-            if (nm && !this.__isBannedName(nm)) netState.name = nm;
+            if (!netState.name) {
+              const nm = this.__deepFindName(j);
+              if (nm && !this.__isBannedName(nm)) netState.name = nm;
+            }
+            const arr = sniffJsonKeywords(j);
+            if (arr.length) {
+              // 그대로 저장해두고, 최후에만 사용
+              jsonKeywordBuf.push(JSON.stringify(arr));
+              if (jsonKeywordBuf.length > 30) jsonKeywordBuf.shift();
+            }
           }
         }
       } catch {}
@@ -1132,7 +1226,6 @@ export class CompetitorService {
       const outer = await page.content().catch(() => "");
       loaded = status === 200 && outer.length > 500;
 
-      // name 보강: outer nextData/og:title
       const nextOuter = this.__parseNextData(outer);
       if (nextOuter && !netState.name) {
         const nm = this.__deepFindName(nextOuter);
@@ -1141,6 +1234,7 @@ export class CompetitorService {
 
       const frame = await this.__resolveEntryFrame(page, timeoutMs);
 
+      // 1) frame DOM query-links
       if (frame) {
         await this.__expandAndScrollFrame(frame, timeoutMs).catch(() => {});
         const kw1 = await this.__extractKeywordsFromQueryLinks(frame).catch(() => []);
@@ -1150,6 +1244,7 @@ export class CompetitorService {
         }
       }
 
+      // 2) page DOM query-links
       if (!netState.keywords.length) {
         const kw2 = await this.__extractKeywordsFromPageDomQueryLinks(page).catch(() => []);
         if (kw2.length) {
@@ -1158,16 +1253,35 @@ export class CompetitorService {
         }
       }
 
-      // ✅ DOM에서 못 찾으면: 네트워크 응답 body에서 query/q 파라미터만 추출
+      // 3) query-param sniff (HTML + frameHTML + response bodies)
       if (!netState.keywords.length) {
-        let frameHtml = "";
-        if (frame) frameHtml = await frame.content().catch(() => "");
-
+        const frameHtml = frame ? await frame.content().catch(() => "") : "";
         const merged = [outer, frameHtml, queryBuf.join("\n")].filter(Boolean).join("\n");
-        const kw3 = this.__extractKeywordsFromAnyTextByQueryParam(merged);
+        const kw3 = extractQueryParamKeywordsFromAnyText(merged);
         if (kw3.length) {
           netState.keywords = kw3;
           netState.kwSource = "query_sniff";
+        }
+      }
+
+      // 4) ✅ 최후 fallback: json keywordList sniff (query param이 “진짜 0개”일 때만)
+      if (!netState.keywords.length && jsonKeywordBuf.length) {
+        const mergedJsonArrText = jsonKeywordBuf.join("\n");
+        // jsonKeywordBuf에는 stringify된 배열이 있으니 regex로 문자열만 뽑아도 됨
+        const byRe = this.__extractKeywordArrayByRegex(mergedJsonArrText);
+        if (byRe.length) {
+          netState.keywords = byRe;
+          netState.kwSource = "json_sniff_fallback";
+        }
+      }
+
+      // 5) 마지막 regex fallback (frame/page HTML에서 keywordList 직접)
+      if (!netState.keywords.length) {
+        const frameHtml = frame ? await frame.content().catch(() => "") : "";
+        const byRe = this.__extractKeywordArrayByRegex([outer, frameHtml].join("\n"));
+        if (byRe.length) {
+          netState.keywords = byRe;
+          netState.kwSource = "regex_fallback";
         }
       }
 
@@ -1179,7 +1293,6 @@ export class CompetitorService {
 
       const cleanedName = this.__stripNaverSuffix(netState.name);
       const finalName = this.__cleanText(cleanedName);
-
       const cleanedKeywords = this.__finalizeKeywords(netState.keywords, finalName);
 
       console.log("[COMP][placeHome] extracted", {
