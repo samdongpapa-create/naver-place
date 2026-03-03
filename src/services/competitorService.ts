@@ -111,21 +111,38 @@ export class CompetitorService {
     return this.__cleanText(name).replace(/\s*네이버\s*$/i, "").trim();
   }
 
+  // ✅ 이름 오염(가격/프로모션/메뉴) 강력 차단
   private __isBannedName(name: string): boolean {
     const n0 = this.__cleanText(name);
     const n = n0.replace(/\s*네이버\s*$/i, "").trim();
     if (!n) return true;
 
+    // 기본 UI 잡음
     if (/^(광고|저장|길찾기|예약|전화|공유|블로그|리뷰|사진|홈|메뉴|가격|더보기)$/i.test(n)) return true;
     if (/^네이버\s*플레이스$/i.test(n)) return true;
     if (/네이버\s*플레이스/i.test(n) && n.length <= 12) return true;
 
+    // 리뷰/거리/시간
     if (/^방문\s*리뷰\s*\d+/i.test(n)) return true;
     if (/^블로그\s*리뷰\s*\d+/i.test(n)) return true;
     if (/리뷰\s*\d+/i.test(n) && n.length <= 15) return true;
-
     if (/^\d+(\.\d+)?\s*(m|km)$/i.test(n)) return true;
     if (/^\d+\s*분$/.test(n)) return true;
+
+    // ✅ 가격/프로모션/시술가격류 문구 강력 차단
+    if (/(^|[\s])\d{1,3}(,\d{3})+\s*원\b/.test(n)) return true; // 10,000원
+    if (/(^|[\s])\d+\s*원\b/.test(n)) return true; // 3000원
+    if (/(^|[\s])\d+\s*(천|만)\s*원\b/.test(n)) return true; // 8만원, 3천원
+    if (/(^|[\s])\d+\s*만\s*\d+\s*천\s*원\b/.test(n)) return true; // 8만4천원
+    if (/(^|[\s])\d+(\.\d+)?\s*(만원|원)\b/.test(n)) return true; // 5.9만원
+    if (/(할인|특가|이벤트|쿠폰|%|원부터|~|부터)/.test(n) && /\d/.test(n)) return true;
+
+    // ✅ 시술명+가격 패턴(상호명 오인 방지)
+    if (/(커트|컷|펌|염색|클리닉|드라이|매직|셋팅|볼륨|뿌리|다운펌|아이롱)\s*\d/.test(n)) return true;
+
+    // ✅ 숫자가 너무 많은 짧은 텍스트도 배제
+    const digits = (n.match(/\d/g) || []).length;
+    if (digits >= 4 && n.length <= 20) return true;
 
     return false;
   }
@@ -510,7 +527,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 최후 보루: search.naver where=place (fetch)
+  // ✅ 최후 보루: where=place (fetch)  ✅ 이름 오염 방지 버전
   // ==========================
   private async __findTopPlaceMetasFromSearchWherePlaceFetch(keyword: string, timeoutMs: number): Promise<PlaceMeta[]> {
     const q = String(keyword || "").trim();
@@ -526,6 +543,37 @@ export class CompetitorService {
     const metas: PlaceMeta[] = [];
     const seen = new Set<string>();
 
+    const pickNameNearIndex = (idx: number): string => {
+      if (idx < 0) return "";
+
+      const chunk = html.slice(Math.max(0, idx - 1200), Math.min(html.length, idx + 1200));
+
+      // 1) title 우선
+      const titleCand = [...chunk.matchAll(/title=["']([^"']{2,80})["']/gi)]
+        .map((x) => this.__cleanText(x[1]))
+        .filter(Boolean)
+        .filter((t) => !this.__isBannedName(t));
+
+      if (titleCand[0]) return titleCand[0];
+
+      // 2) aria-label
+      const ariaCand = [...chunk.matchAll(/aria-label=["']([^"']{2,80})["']/gi)]
+        .map((x) => this.__cleanText(x[1]))
+        .filter(Boolean)
+        .filter((t) => !this.__isBannedName(t));
+
+      if (ariaCand[0]) return ariaCand[0];
+
+      // 3) 제한적으로 텍스트 (가격/숫자/프로모션은 __isBannedName에서 컷)
+      const textCand = [...chunk.matchAll(/>\s*([가-힣A-Za-z0-9][^<>]{1,60})\s*</g)]
+        .map((x) => this.__cleanText(x[1]))
+        .filter(Boolean)
+        .filter((t) => t.length >= 2 && t.length <= 40)
+        .filter((t) => !this.__isBannedName(t));
+
+      return textCand[0] || "";
+    };
+
     for (const m of html.matchAll(reAnyPlaceId)) {
       const pid = this.__normPlaceId(m[1]);
       if (!this.__isValidPlaceId(pid)) continue;
@@ -533,33 +581,17 @@ export class CompetitorService {
       seen.add(pid);
 
       const idx = m.index ?? -1;
-      const chunk = idx >= 0 ? html.slice(Math.max(0, idx - 900), Math.min(html.length, idx + 900)) : "";
+      const name = pickNameNearIndex(idx);
 
-      const titleMatches = [...chunk.matchAll(/title=["']([^"']{2,80})["']/gi)]
-        .map((x) => this.__cleanText(x[1]))
-        .filter(Boolean)
-        .filter((t) => !this.__isBannedName(t));
-
-      const ariaMatches = [...chunk.matchAll(/aria-label=["']([^"']{2,80})["']/gi)]
-        .map((x) => this.__cleanText(x[1]))
-        .filter(Boolean)
-        .filter((t) => !this.__isBannedName(t));
-
-      const textMatches = [...chunk.matchAll(/>\s*([가-힣A-Za-z0-9][^<>]{1,50})\s*</g)]
-        .map((x) => this.__cleanText(x[1]))
-        .filter(Boolean)
-        .filter((t) => !this.__isBannedName(t));
-
-      const name = titleMatches[0] || ariaMatches[0] || textMatches[0] || "";
       metas.push({ placeId: pid, name });
-      if (metas.length >= 10) break;
+      if (metas.length >= 12) break;
     }
 
     return metas;
   }
 
   // ==========================
-  // ✅ 최후 보루: search.naver where=place (render)
+  // ✅ 최후 보루: where=place (render)
   // ==========================
   private async __findTopPlaceMetasFromSearchWherePlaceRendered(keyword: string, timeoutMs: number): Promise<PlaceMeta[]> {
     const q = String(keyword || "").trim();
@@ -949,10 +981,9 @@ export class CompetitorService {
   }
 
   /**
-   * ✅ 핵심 변경점:
-   * - frame.content()만으로 kwCount=0이 자주 뜨는 케이스 대응
-   * - page.on("response")로 "키워드/검색/대표키워드" JSON 응답을 스니핑해서 keywordList를 잡음
-   * - 스니핑으로 잡힌 키워드를 최우선 채택 (query 링크 / regex / nextData보다 우선)
+   * ✅ 핵심:
+   * - page.on("response")로 keywordList JSON 스니핑 (frame.content()가 비어도 OK)
+   * - query= 링크 기반 + (query param) 값 추출
    */
   private async __renderAndExtractFromPlaceHome(url: string, timeoutMs: number): Promise<PlaceHomeExtract> {
     const netState: { name: string; keywords: string[] } = { name: "", keywords: [] };
@@ -973,10 +1004,8 @@ export class CompetitorService {
         const u = res.url();
         if (!/m\.place\.naver\.com/.test(u)) return;
 
-        // ✅ 키워드가 지나갈만한 것들만 (너무 넓히면 잡음↑)
         const looksKeywordish =
           /keyword|keywords|represent|query|search|graphql/i.test(u) || /\/api\//i.test(u) || /\/graphql/i.test(u);
-
         if (!looksKeywordish) return;
 
         const headers = res.headers();
@@ -986,8 +1015,6 @@ export class CompetitorService {
         const txt = await res.text().catch(() => "");
         if (!txt || txt.length < 20) return;
         if (/<!doctype html/i.test(txt)) return;
-
-        // ✅ 키워드 힌트 없으면 무시 (잡음 JSON 차단)
         if (!/(keywordList|representKeyword|representativeKeyword|keywords)/i.test(txt)) return;
 
         const j = this.__safeJsonParse(txt);
@@ -1039,7 +1066,7 @@ export class CompetitorService {
       if (frame) {
         await this.__expandAndScrollFrame(frame, timeoutMs).catch(() => {});
 
-        // 1) query 링크 기반
+        // 1) query 링크 기반(+ query param)
         const kw1 = await this.__extractKeywordsFromQueryLinks(frame).catch(() => []);
         if (kw1.length) netState.keywords = kw1;
 
@@ -1089,7 +1116,7 @@ export class CompetitorService {
         }
       }
 
-      // ✅ 스니핑 결과를 최우선 반영 (핵심)
+      // ✅ 스니핑 결과 최우선
       if (sniffState.keywords.length) netState.keywords = sniffState.keywords;
       if (sniffState.name && !this.__isBannedName(sniffState.name)) netState.name = sniffState.name;
 
