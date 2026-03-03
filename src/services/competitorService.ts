@@ -1077,7 +1077,6 @@ export class CompetitorService {
    * - 대표키워드: query param 기반만 채택
    *   1) frame/page DOM에서 query링크 탐색
    *   2) 실패 시: 네트워크 응답 body에서 query/q 파라미터만 “문자열 스캔”으로 추출 (query-param 원칙 유지)
-   * - 추가: query/q가 진짜 0개인 케이스에만 json keywordList fallback 허용(최후)
    */
   private async __renderAndExtractFromPlaceHome(url: string, timeoutMs: number): Promise<PlaceHomeExtract> {
     const netState: {
@@ -1118,6 +1117,11 @@ export class CompetitorService {
       return [];
     };
 
+    const extractQueryParamKeywordsFromAnyText = (text: string): string[] => {
+      // ✅ (기존 로직 유지) 단, 클래스 내 공용도 이미 있으니 내부에서는 이것을 그대로 둠
+      return this.__extractKeywordsFromAnyTextByQueryParam(text);
+    };
+
     const onRespSniff = async (res: Response) => {
       try {
         const req = res.request();
@@ -1147,6 +1151,7 @@ export class CompetitorService {
             }
             const arr = sniffJsonKeywords(j);
             if (arr.length) {
+              // 그대로 저장해두고, 최후에만 사용
               jsonKeywordBuf.push(JSON.stringify(arr));
               if (jsonKeywordBuf.length > 30) jsonKeywordBuf.shift();
             }
@@ -1192,11 +1197,11 @@ export class CompetitorService {
         }
       }
 
-      // 3) query-param sniff (HTML + frameHTML + response bodies)  ✅ 로컬함수 제거하고 공용 메서드 사용
+      // 3) query-param sniff (HTML + frameHTML + response bodies)
       if (!netState.keywords.length) {
         const frameHtml = frame ? await frame.content().catch(() => "") : "";
         const merged = [outer, frameHtml, queryBuf.join("\n")].filter(Boolean).join("\n");
-        const kw3 = this.__extractKeywordsFromAnyTextByQueryParam(merged);
+        const kw3 = extractQueryParamKeywordsFromAnyText(merged);
         if (kw3.length) {
           netState.keywords = kw3;
           netState.kwSource = "query_sniff";
@@ -1206,6 +1211,7 @@ export class CompetitorService {
       // 4) ✅ 최후 fallback: json keywordList sniff (query param이 “진짜 0개”일 때만)
       if (!netState.keywords.length && jsonKeywordBuf.length) {
         const mergedJsonArrText = jsonKeywordBuf.join("\n");
+        // jsonKeywordBuf에는 stringify된 배열이 있으니 regex로 문자열만 뽑아도 됨
         const byRe = this.__extractKeywordArrayByRegex(mergedJsonArrText);
         if (byRe.length) {
           netState.keywords = byRe;
@@ -1598,17 +1604,13 @@ export class CompetitorService {
   // generic helpers
   // ==========================
   private async __withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-    let timer: any = null;
     const t = new Promise<T>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("withTimeout")), Math.max(1, ms));
+      const id = setTimeout(() => {
+        clearTimeout(id);
+        reject(new Error("withTimeout"));
+      }, Math.max(1, ms));
     });
-    try {
-      return await Promise.race([p, t]);
-    } finally {
-      try {
-        if (timer) clearTimeout(timer);
-      } catch {}
-    }
+    return await Promise.race([p, t]);
   }
 
   private __createLimiter(concurrency: number) {
@@ -1676,66 +1678,91 @@ export class CompetitorService {
     return "";
   }
 
-  // ==========================
-  // ✅ (추가) deep find: 특정 key 아래 "string[]/string list" 찾기
-  // ==========================
+  /**
+   * ✅ FIX: TS2339 방지용 추가
+   * - obj 내부에서 "keyName"과 동일(대소문자 무시)한 키를 찾아
+   *   그 값이 string[] (혹은 string을 포함한 배열) 이면 string[]로 반환
+   * - 값이 string 단일이면 콤마/슬래시/중점 등으로 분리 시도
+   */
   private __deepFindStringArray(obj: any, keyName: string): string[] {
-    const key = String(keyName || "").trim();
-    if (!key) return [];
+    const target = String(keyName || "").toLowerCase().trim();
+    if (!target) return [];
 
     const out: string[] = [];
     const seen = new Set<string>();
 
-    const push = (v: any) => {
-      const s = typeof v === "string" ? this.__cleanText(v) : "";
-      if (!s) return;
-      const k2 = this.__normNoSpace(s);
-      if (!k2 || seen.has(k2)) return;
-      seen.add(k2);
-      out.push(s);
+    const push = (v: string) => {
+      const t = this.__cleanText(v).replace(/^#/, "").trim();
+      if (!t) return;
+      if (t.length < 2 || t.length > 30) return;
+      const k = this.__normNoSpace(t);
+      if (!k || seen.has(k)) return;
+      seen.add(k);
+      out.push(t);
     };
 
-    const walk = (x: any) => {
-      if (!x || typeof x !== "object") return;
+    const visit = (x: any) => {
+      if (!x) return;
+      if (out.length >= 60) return;
 
       if (Array.isArray(x)) {
-        for (const it of x) walk(it);
+        for (const it of x) {
+          if (out.length >= 60) break;
+          visit(it);
+        }
         return;
       }
 
-      // 현재 오브젝트에서 keyName을 찾으면 처리
-      if (Object.prototype.hasOwnProperty.call(x, key)) {
-        const v = (x as any)[key];
+      if (typeof x !== "object") return;
 
-        // string[]
-        if (Array.isArray(v)) {
-          for (const it of v) push(it);
-        } else if (typeof v === "string") {
-          push(v);
-        } else if (v && typeof v === "object") {
-          // 혹시 {list:[...]} 같은 구조면 한 번 더 탐색
-          walk(v);
-        }
-      }
-
-      // 하위 탐색
       for (const k of Object.keys(x)) {
+        if (out.length >= 60) break;
         const v = (x as any)[k];
-        if (!v || typeof v !== "object") continue;
-        walk(v);
+
+        if (String(k).toLowerCase() === target) {
+          // array case
+          if (Array.isArray(v)) {
+            for (const it of v) {
+              if (typeof it === "string") push(it);
+              else if (it && typeof it === "object") {
+                // 흔한 케이스: { keyword: "..." } / { name: "..." }
+                const s =
+                  typeof (it as any).keyword === "string"
+                    ? (it as any).keyword
+                    : typeof (it as any).name === "string"
+                      ? (it as any).name
+                      : typeof (it as any).text === "string"
+                        ? (it as any).text
+                        : "";
+                if (s) push(s);
+              }
+              if (out.length >= 60) break;
+            }
+          } else if (typeof v === "string") {
+            // string case -> split
+            const s = String(v);
+            const parts = s
+              .split(/[,/|·•\n\r\t]+/g)
+              .map((p) => String(p || "").trim())
+              .filter(Boolean);
+            if (parts.length) for (const p of parts) push(p);
+            else push(s);
+          }
+        }
+
+        visit(v);
       }
     };
 
-    walk(obj);
-
-    // “대표키워드 후보”니까 너무 긴 건 컷
-    return out.filter((s) => s.length >= 2 && s.length <= 25).slice(0, 16);
+    visit(obj);
+    return out.slice(0, 30);
   }
 
-  // ==========================
-  // ✅ (추가) regex로 keywordList/keywords 배열 형태에서 문자열만 추출
-  // - jsonKeywordBuf(stringify된 배열) / HTML에 박혀있는 배열 둘 다 대응
-  // ==========================
+  /**
+   * ✅ FIX: TS2339 방지용 추가
+   * - HTML/JSON 텍스트에서 keywordList/keywords 류 배열을 정규식으로 추출
+   * - "string 배열"만 최대한 안전하게 뽑고, 노이즈/프로모션 제거
+   */
   private __extractKeywordArrayByRegex(text: string): string[] {
     const s = String(text || "");
     if (!s) return [];
@@ -1743,36 +1770,75 @@ export class CompetitorService {
     const out: string[] = [];
     const seen = new Set<string>();
 
+    const isNoise = (t: string) =>
+      /^(저장|공유|길찾기|전화|예약|리뷰|사진|홈|메뉴|가격|더보기|쿠폰|이벤트|알림받기)$/i.test(t) ||
+      /(방문자\s*리뷰|방문자리뷰|블로그\s*리뷰|블로그리뷰|별점|평점)/i.test(t) ||
+      /^(내비게이션|네비게이션|navigation)$/i.test(t) ||
+      /(로그인|동의|확인|취소|닫기)/i.test(t);
+
+    const isPromoLike = (t: string) => /(원|만원|%|할인|쿠폰|이벤트|특가|원부터|부터|~)/.test(t) && /\d/.test(t);
+
     const push = (raw: string) => {
       const v = this.__cleanText(raw).replace(/^#/, "").trim();
       if (!v) return;
       if (v.length < 2 || v.length > 25) return;
-
+      if (isNoise(v)) return;
+      if (isPromoLike(v)) return;
       const k = this.__normNoSpace(v);
       if (!k || seen.has(k)) return;
       seen.add(k);
       out.push(v);
     };
 
-    // 1) 가장 흔한: ["a","b","c"] 형태의 배열 조각들을 잡아 문자열만 긁기
-    //    - jsonKeywordBuf는 배열을 JSON.stringify 했으므로 이걸로 충분히 잡힘
-    const reArr = /\[\s*(?:"[^"]{1,40}"\s*(?:,\s*"[^"]{1,40}"\s*)*)\]/g;
-    const arrChunks = s.match(reArr) || [];
-    for (const chunk of arrChunks.slice(0, 30)) {
-      const reStr = /"([^"]{1,40})"/g;
-      for (const m of chunk.matchAll(reStr)) {
-        push(m[1] || "");
-        if (out.length >= 16) break;
+    // 1) JSON array blob 자체가 들어온 케이스: ["a","b",...]
+    // - stringify(arr) 형태가 jsonKeywordBuf에 들어오므로 여기서 잘 걸림
+    const reArray = /\[\s*(?:(?:"[^"]{1,60}"|'[^']{1,60}')(?:\s*,\s*(?:"[^"]{1,60}"|'[^']{1,60}'))*)\s*\]/g;
+    for (const m of s.matchAll(reArray)) {
+      const blob = m[0] || "";
+      const arr = this.__safeJsonParse(blob);
+      if (Array.isArray(arr)) {
+        for (const it of arr) {
+          if (typeof it === "string") push(it);
+          if (out.length >= 20) break;
+        }
       }
-      if (out.length >= 16) break;
+      if (out.length >= 20) break;
     }
 
-    // 2) 혹시 단일 키워드가 keywordList 안에 문자열로만 들어간 경우
-    if (out.length < 3) {
-      const reLoose = /(?:keywordList|keywords|representKeywordList|representativeKeywordList)\s*["']?\s*[:=]\s*["']([^"']{2,40})["']/gi;
-      for (const m of s.matchAll(reLoose)) {
+    // 2) key: ["..."] 형태 (keywordList / keywords / representKeywordList 등)
+    if (out.length < 5) {
+      const reKeyArray =
+        /(?:representKeywordList|representativeKeywordList|representKeywords|representativeKeywords|keywordList|keywords)\s*["']?\s*:\s*(\[[\s\S]*?\])/gi;
+      for (const m of s.matchAll(reKeyArray)) {
+        const blob = m[1] || "";
+        const arr = this.__safeJsonParse(blob);
+        if (Array.isArray(arr)) {
+          for (const it of arr) {
+            if (typeof it === "string") push(it);
+            else if (it && typeof it === "object") {
+              const v =
+                typeof (it as any).keyword === "string"
+                  ? (it as any).keyword
+                  : typeof (it as any).name === "string"
+                    ? (it as any).name
+                    : typeof (it as any).text === "string"
+                      ? (it as any).text
+                      : "";
+              if (v) push(v);
+            }
+            if (out.length >= 20) break;
+          }
+        }
+        if (out.length >= 20) break;
+      }
+    }
+
+    // 3) 마지막 보정: "keyword":"..." 같은 문자열 여러 개
+    if (out.length < 5) {
+      const rePairs = /["'](?:keyword|name|text)["']\s*:\s*["']([^"']{2,60})["']/gi;
+      for (const m of s.matchAll(rePairs)) {
         push(m[1] || "");
-        if (out.length >= 16) break;
+        if (out.length >= 20) break;
       }
     }
 
