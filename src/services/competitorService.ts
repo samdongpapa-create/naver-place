@@ -672,7 +672,6 @@ export class CompetitorService {
 
   // ==========================
   // ✅ 1) TOP5 placeId "안정 수집" (부분 성공 유지)
-  // - allSearch / m.map / m.place / pcPlace / where=place(최후)
   // ==========================
   async findTopPlaceIdsFromMapRank(keyword: string, opts: FindTopIdsOptions = {}): Promise<string[]> {
     const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
@@ -855,7 +854,6 @@ export class CompetitorService {
     );
     const deadline = this.__deadlineMs(totalTimeoutMs);
 
-    // 1) TOP5 ids
     const mapIds = await this.findTopPlaceIdsFromMapRank(q, {
       excludePlaceId: exclude,
       limit,
@@ -864,7 +862,6 @@ export class CompetitorService {
 
     let candidateMetas: PlaceMeta[] = mapIds.map((id) => ({ placeId: id, name: "" }));
 
-    // 2) 혹시라도 ids가 0이면, where=place로라도 채움 (안전장치)
     if (!candidateMetas.length) {
       const remain = Math.min(9000, Math.max(2500, this.__remaining(deadline)));
       const metas =
@@ -951,12 +948,77 @@ export class CompetitorService {
     return { name: "", keywords: [], loaded: false };
   }
 
+  /**
+   * ✅ 핵심 변경점:
+   * - frame.content()만으로 kwCount=0이 자주 뜨는 케이스 대응
+   * - page.on("response")로 "키워드/검색/대표키워드" JSON 응답을 스니핑해서 keywordList를 잡음
+   * - 스니핑으로 잡힌 키워드를 최우선 채택 (query 링크 / regex / nextData보다 우선)
+   */
   private async __renderAndExtractFromPlaceHome(url: string, timeoutMs: number): Promise<PlaceHomeExtract> {
     const netState: { name: string; keywords: string[] } = { name: "", keywords: [] };
+    const sniffState: { name: string; keywords: string[] } = { name: "", keywords: [] };
     let loaded = false;
 
     const context = await this.__newContext("https://m.place.naver.com/");
     const page = await this.__newLightPage(context, timeoutMs);
+
+    const onRespSniff = async (res: Response) => {
+      try {
+        if (sniffState.keywords.length >= 5 && sniffState.name) return;
+
+        const req = res.request();
+        const rt = req.resourceType();
+        if (rt !== "xhr" && rt !== "fetch") return;
+
+        const u = res.url();
+        if (!/m\.place\.naver\.com/.test(u)) return;
+
+        // ✅ 키워드가 지나갈만한 것들만 (너무 넓히면 잡음↑)
+        const looksKeywordish =
+          /keyword|keywords|represent|query|search|graphql/i.test(u) || /\/api\//i.test(u) || /\/graphql/i.test(u);
+
+        if (!looksKeywordish) return;
+
+        const headers = res.headers();
+        const ct = String(headers["content-type"] || "").toLowerCase();
+        if (!ct.includes("json") && !ct.includes("text/plain") && !ct.includes("javascript")) return;
+
+        const txt = await res.text().catch(() => "");
+        if (!txt || txt.length < 20) return;
+        if (/<!doctype html/i.test(txt)) return;
+
+        // ✅ 키워드 힌트 없으면 무시 (잡음 JSON 차단)
+        if (!/(keywordList|representKeyword|representativeKeyword|keywords)/i.test(txt)) return;
+
+        const j = this.__safeJsonParse(txt);
+        if (!j) return;
+
+        if (!sniffState.name) {
+          const nm = this.__deepFindName(j);
+          if (nm && !this.__isBannedName(nm)) sniffState.name = nm;
+        }
+
+        if (!sniffState.keywords.length) {
+          const keys = [
+            "representKeywordList",
+            "representativeKeywordList",
+            "representKeywords",
+            "representativeKeywords",
+            "keywordList",
+            "keywords"
+          ];
+          for (const k of keys) {
+            const arr = this.__deepFindStringArray(j, k);
+            if (arr.length) {
+              sniffState.keywords = arr;
+              break;
+            }
+          }
+        }
+      } catch {}
+    };
+
+    page.on("response", onRespSniff);
 
     try {
       const resp = await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => null);
@@ -977,18 +1039,18 @@ export class CompetitorService {
       if (frame) {
         await this.__expandAndScrollFrame(frame, timeoutMs).catch(() => {});
 
-        // 1) query 링크 기반(가장 안전)
+        // 1) query 링크 기반
         const kw1 = await this.__extractKeywordsFromQueryLinks(frame).catch(() => []);
         if (kw1.length) netState.keywords = kw1;
 
-        // 2) frame HTML에서 keywordList regex
+        // 2) frame HTML regex
         if (!netState.keywords.length) {
           const frameHtml = await frame.content().catch(() => "");
           const byRe = this.__extractKeywordArrayByRegex(frameHtml);
           if (byRe.length) netState.keywords = byRe;
         }
 
-        // 3) nextData deep-find
+        // 3) frame nextData deep-find
         if (!netState.keywords.length) {
           const frameHtml = await frame.content().catch(() => "");
           const nextFrame = frameHtml ? this.__parseNextData(frameHtml) : null;
@@ -1027,6 +1089,10 @@ export class CompetitorService {
         }
       }
 
+      // ✅ 스니핑 결과를 최우선 반영 (핵심)
+      if (sniffState.keywords.length) netState.keywords = sniffState.keywords;
+      if (sniffState.name && !this.__isBannedName(sniffState.name)) netState.name = sniffState.name;
+
       if (!netState.name) {
         const m1 = outer.match(/property=["']og:title["'][^>]*content=["']([^"']{2,80})["']/);
         const og = m1?.[1] ? this.__cleanText(m1[1]) : "";
@@ -1048,6 +1114,9 @@ export class CompetitorService {
     } catch {
       return { name: "", keywords: [], loaded: false };
     } finally {
+      try {
+        page.off("response", onRespSniff);
+      } catch {}
       try {
         await page.close();
       } catch {}
@@ -1112,7 +1181,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 대표키워드: query= 링크 기반
+  // ✅ 대표키워드: query= 링크 기반 (+ query param 값도 추출)
   // ==========================
   private async __extractKeywordsFromQueryLinks(frame: Frame): Promise<string[]> {
     const raw: string[] = await frame.evaluate(() => {
