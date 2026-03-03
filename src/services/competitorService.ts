@@ -148,22 +148,16 @@ export class CompetitorService {
 
     push(q0);
 
-    // 역명 + 업종으로 축약
-    const station = tokens.find((t) => /역$/.test(t)) || (q0.includes("역") ? (q0.match(/[가-힣A-Za-z0-9]+역/)?.[0] ?? "") : "");
-    const industry = (() => {
-      if (/미용실|헤어샵|헤어살롱|헤어/.test(q0)) return "미용실";
-      return "";
-    })();
+    const station = tokens.find((t) => /역$/.test(t)) || (q0.match(/[가-힣A-Za-z0-9]+역/)?.[0] ?? "");
+    const industry = /미용실|헤어샵|헤어살롱|헤어/.test(q0) ? "미용실" : "";
 
     if (station && industry) push(`${station} ${industry}`);
     if (tokens.length >= 2) push(`${tokens[0]} ${tokens[1]}`);
     if (tokens.length >= 3) push(`${tokens[0]} ${tokens[1]} ${tokens[2]}`);
 
-    // 마지막 토큰 제거한 버전들(상호/지점명 제거 효과)
     if (tokens.length >= 4) push(tokens.slice(0, tokens.length - 1).join(" "));
     if (tokens.length >= 5) push(tokens.slice(0, tokens.length - 2).join(" "));
 
-    // 특정 케이스: 파인트리 포함이면 서대문역 미용실로 강제 추가
     if (/파인트리/i.test(q0) && q0.includes("서대문역")) push("서대문역 미용실");
 
     return out.slice(0, 6);
@@ -198,7 +192,6 @@ export class CompetitorService {
   }
 
   private __searchCoordCandidates(): string[] {
-    // env + 기본 서울 + 약간 다른 지점(차단/랭크 편향 완화)
     const env = this.__normalizeSearchCoord();
     const presets = ["126.9780;37.5665", "126.9900;37.5700", "126.9700;37.5600"];
     const out: string[] = [];
@@ -321,7 +314,6 @@ export class CompetitorService {
 
   // ==========================
   // ✅ 0) allSearch JSON (map rank)
-  // - searchCoord 후보를 돌려서 "1개만 나오는" 케이스 완화
   // ==========================
   private async __findTopPlaceIdsViaAllSearch(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
     const q = String(keyword || "").trim();
@@ -363,7 +355,6 @@ export class CompetitorService {
             `[allSearch${useBoundary ? ":xy+boundary" : ":xy"}] status=${res.status} body=${String(text || "").slice(0, 220)}`
           );
         }
-
         if (ct.includes("text/html") || /<!doctype html/i.test(text)) {
           throw new Error(
             `[allSearch${useBoundary ? ":html+xy" : ":html"}] status=${res.status} body=${String(text || "").slice(0, 220)}`
@@ -387,7 +378,6 @@ export class CompetitorService {
     const budget = Math.max(1600, Math.min(5200, timeoutMs));
     const step = Math.max(700, Math.floor(budget / 4));
 
-    // boundary on/off + coord 후보 순회
     for (const useBoundary of [true, false]) {
       for (const c of coords) {
         try {
@@ -396,7 +386,6 @@ export class CompetitorService {
         } catch (e) {
           console.warn("[COMP][mapRank] allSearch failed:", e);
         }
-        // 너무 빠른 연타 방지(블록 완화)
         await this.__sleep(120);
       }
     }
@@ -419,7 +408,6 @@ export class CompetitorService {
 
   // ==========================
   // ✅ fallback A-2: m.place 검색 렌더링(Playwright)
-  // - 404(차단) 자주 발생 -> 웜업 + 컨텍스트 교체 재시도
   // ==========================
   private async __findTopPlaceIdsViaMPlaceSearchRendered(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
     const q = String(keyword || "").trim();
@@ -465,8 +453,7 @@ export class CompetitorService {
     }
 
     if (r1.status === 404) {
-      // 404=블록 의심 → 짧게 쉬고 1회 재시도
-      await this.__sleep(500 + Math.floor(Math.random() * 400));
+      await this.__sleep(600 + Math.floor(Math.random() * 400));
       const r2 = await runOnce().catch(() => ({ status: -1, html: "" }));
       if (r2.status !== 404 && r2.html) {
         const ids = this.__extractPlaceIdsFromAnyTextInOrder(r2.html);
@@ -523,8 +510,169 @@ export class CompetitorService {
   }
 
   // ==========================
+  // ✅ 최후 보루: search.naver where=place (fetch)
+  // ==========================
+  private async __findTopPlaceMetasFromSearchWherePlaceFetch(keyword: string, timeoutMs: number): Promise<PlaceMeta[]> {
+    const q = String(keyword || "").trim();
+    if (!q) return [];
+
+    const url = `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`;
+    const html = await this.__fetchHtml(url, timeoutMs).catch(() => "");
+    if (!html) return [];
+
+    const reAnyPlaceId =
+      /https?:\/\/(?:m\.place\.naver\.com|pcmap\.place\.naver\.com|place\.naver\.com)\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})/g;
+
+    const metas: PlaceMeta[] = [];
+    const seen = new Set<string>();
+
+    for (const m of html.matchAll(reAnyPlaceId)) {
+      const pid = this.__normPlaceId(m[1]);
+      if (!this.__isValidPlaceId(pid)) continue;
+      if (seen.has(pid)) continue;
+      seen.add(pid);
+
+      const idx = m.index ?? -1;
+      const chunk = idx >= 0 ? html.slice(Math.max(0, idx - 900), Math.min(html.length, idx + 900)) : "";
+
+      const titleMatches = [...chunk.matchAll(/title=["']([^"']{2,80})["']/gi)]
+        .map((x) => this.__cleanText(x[1]))
+        .filter(Boolean)
+        .filter((t) => !this.__isBannedName(t));
+
+      const ariaMatches = [...chunk.matchAll(/aria-label=["']([^"']{2,80})["']/gi)]
+        .map((x) => this.__cleanText(x[1]))
+        .filter(Boolean)
+        .filter((t) => !this.__isBannedName(t));
+
+      const textMatches = [...chunk.matchAll(/>\s*([가-힣A-Za-z0-9][^<>]{1,50})\s*</g)]
+        .map((x) => this.__cleanText(x[1]))
+        .filter(Boolean)
+        .filter((t) => !this.__isBannedName(t));
+
+      const name = titleMatches[0] || ariaMatches[0] || textMatches[0] || "";
+      metas.push({ placeId: pid, name });
+      if (metas.length >= 10) break;
+    }
+
+    return metas;
+  }
+
+  // ==========================
+  // ✅ 최후 보루: search.naver where=place (render)
+  // ==========================
+  private async __findTopPlaceMetasFromSearchWherePlaceRendered(keyword: string, timeoutMs: number): Promise<PlaceMeta[]> {
+    const q = String(keyword || "").trim();
+    if (!q) return [];
+
+    const url = `https://search.naver.com/search.naver?where=place&query=${encodeURIComponent(q)}`;
+
+    const context = await this.__newContext("https://search.naver.com/");
+    const page = await this.__newLightPage(context, timeoutMs);
+
+    try {
+      const resp = await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => null);
+      const st = resp?.status?.() ?? -1;
+      if (st >= 400) console.warn("[COMP][where=place] goto status", st, url);
+
+      await page.waitForTimeout(800);
+
+      const items = await page.evaluate(() => {
+        const d: any = (globalThis as any).document;
+        const out: Array<{ placeId: string; name: string }> = [];
+        if (!d || !d.querySelectorAll) return out;
+
+        const linkNodes: any[] = Array.from(
+          d.querySelectorAll('a[href*="place.naver.com"], a[href*="m.place.naver.com"], a[href*="pcmap.place.naver.com"]')
+        );
+
+        const rePid = /\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})/;
+
+        const pickNameFromContainer = (el: any) => {
+          const clean = (t: any) => String(t ?? "").replace(/\s+/g, " ").trim();
+          let cur: any = el;
+          for (let i = 0; i < 8 && cur; i++) {
+            const tag = String(cur.tagName || "").toLowerCase();
+            if (tag === "li" || tag === "article" || tag === "section" || tag === "div") break;
+            cur = cur.parentElement;
+          }
+          const root = cur || el;
+
+          const candidates: any[] = [];
+          const sels = ['span[class*="tit"]', 'a[class*="tit"]', "strong", 'span[class*="name"]', 'a[class*="name"]', "span"];
+          for (const sel of sels) {
+            const ns: any[] = Array.from(root.querySelectorAll(sel));
+            for (const n of ns) candidates.push(n);
+            if (candidates.length > 30) break;
+          }
+
+          const texts: string[] = [];
+          for (const n of candidates) {
+            const t = clean(n && (n.textContent || n.innerText));
+            if (!t) continue;
+            if (t.length < 2 || t.length > 40) continue;
+            texts.push(t);
+            if (texts.length >= 20) break;
+          }
+
+          const fallback = clean(el && (el.textContent || el.innerText));
+          if (fallback) texts.unshift(fallback);
+
+          return texts[0] || "";
+        };
+
+        for (const a of linkNodes) {
+          const href = String(a?.href || "");
+          const m = href.match(rePid);
+          const pid = String(m?.[1] || "").trim();
+          if (!pid) continue;
+
+          const name = pickNameFromContainer(a);
+          out.push({ placeId: pid, name });
+
+          if (out.length >= 200) break;
+        }
+
+        return out;
+      });
+
+      const metas: PlaceMeta[] = [];
+      const seen = new Set<string>();
+
+      for (const it of items) {
+        const pid = String(it.placeId || "").trim();
+        if (!/^\d{7,12}$/.test(pid)) continue;
+        if (seen.has(pid)) continue;
+
+        const name = this.__cleanText(it.name || "");
+        seen.add(pid);
+        metas.push({ placeId: pid, name: this.__isBannedName(name) ? "" : name });
+
+        if (metas.length >= 10) break;
+      }
+
+      if (!metas.length) {
+        const ids = items.map((x) => String(x.placeId || "").trim()).filter((id) => /^\d{7,12}$/.test(id));
+        const uniq = Array.from(new Set(ids)).slice(0, 10);
+        return uniq.map((id) => ({ placeId: id, name: "" }));
+      }
+
+      return metas;
+    } catch {
+      return [];
+    } finally {
+      try {
+        await page.close();
+      } catch {}
+      try {
+        await context.close();
+      } catch {}
+    }
+  }
+
+  // ==========================
   // ✅ 1) TOP5 placeId "안정 수집" (부분 성공 유지)
-  // - allSearch / m.map / m.place / pcPlace + query variants
+  // - allSearch / m.map / m.place / pcPlace / where=place(최후)
   // ==========================
   async findTopPlaceIdsFromMapRank(keyword: string, opts: FindTopIdsOptions = {}): Promise<string[]> {
     const limit = Math.max(1, Math.min(20, opts.limit ?? 5));
@@ -532,33 +680,30 @@ export class CompetitorService {
     const q0 = String(keyword || "").trim();
     if (!q0) return [];
 
-    const budget = Math.max(3500, Math.min(20000, Number(opts.timeoutMs ?? 9000)));
+    const budget = Math.max(4000, Math.min(22000, Number(opts.timeoutMs ?? 9000)));
     const startedAt = Date.now();
     const remaining = () => Math.max(350, budget - (Date.now() - startedAt));
 
     const out: string[] = [];
     const seen = new Set<string>();
-
     const variants = this.__buildQueryVariants(q0);
 
+    // 1) allSearch
     for (const q of variants) {
       if (out.length >= limit) break;
       if (remaining() < 650) break;
 
-      // 1) allSearch
       try {
         const ids = await this.__findTopPlaceIdsViaAllSearch(q, limit + 30, Math.min(5200, remaining()));
         this.__pushUnique(out, seen, ids, limit, exclude);
-        if (out.length >= limit) break;
       } catch (e) {
         console.warn("[COMP][mapRank] allSearch failed:", e);
       }
 
-      // 너무 빠른 연타 방지
       await this.__sleep(120);
     }
 
-    // 2) m.map sniff (막힐 수 있으니 "한번"만)
+    // 2) m.map sniff (한 번만)
     if (out.length < limit && remaining() > 900) {
       const q = variants[0] || q0;
       const url = `https://m.map.naver.com/search2/search.naver?query=${encodeURIComponent(q)}`;
@@ -633,7 +778,7 @@ export class CompetitorService {
       }
     }
 
-    // 3) m.place / pc place fallback (query variants 순회)
+    // 3) m.place / pc place fallback
     for (const q of variants) {
       if (out.length >= limit) break;
       if (remaining() < 900) break;
@@ -667,6 +812,30 @@ export class CompetitorService {
       await this.__sleep(120);
     }
 
+    // 4) ✅ 최후 보루: where=place
+    if (out.length < limit && remaining() > 900) {
+      for (const q of variants) {
+        if (out.length >= limit) break;
+        if (remaining() < 650) break;
+
+        try {
+          const metas1 = await this.__findTopPlaceMetasFromSearchWherePlaceFetch(q, Math.min(2500, remaining()));
+          const ids1 = metas1.map((m) => m.placeId).filter((id) => this.__isValidPlaceId(id));
+          this.__pushUnique(out, seen, ids1, limit, exclude);
+        } catch {}
+
+        if (out.length < limit && remaining() > 1300) {
+          try {
+            const metas2 = await this.__findTopPlaceMetasFromSearchWherePlaceRendered(q, Math.min(7500, remaining()));
+            const ids2 = metas2.map((m) => m.placeId).filter((id) => this.__isValidPlaceId(id));
+            this.__pushUnique(out, seen, ids2, limit, exclude);
+          } catch {}
+        }
+
+        await this.__sleep(120);
+      }
+    }
+
     return out.slice(0, limit);
   }
 
@@ -686,13 +855,29 @@ export class CompetitorService {
     );
     const deadline = this.__deadlineMs(totalTimeoutMs);
 
+    // 1) TOP5 ids
     const mapIds = await this.findTopPlaceIdsFromMapRank(q, {
       excludePlaceId: exclude,
       limit,
       timeoutMs: Math.min(18000, Math.max(3500, this.__remaining(deadline)))
     }).catch(() => []);
 
-    const candidateMetas: PlaceMeta[] = mapIds.map((id) => ({ placeId: id, name: "" }));
+    let candidateMetas: PlaceMeta[] = mapIds.map((id) => ({ placeId: id, name: "" }));
+
+    // 2) 혹시라도 ids가 0이면, where=place로라도 채움 (안전장치)
+    if (!candidateMetas.length) {
+      const remain = Math.min(9000, Math.max(2500, this.__remaining(deadline)));
+      const metas =
+        (await this.__findTopPlaceMetasFromSearchWherePlaceFetch(q, Math.min(2500, remain)).catch(() => [])) ||
+        (await this.__findTopPlaceMetasFromSearchWherePlaceRendered(q, Math.min(7500, remain)).catch(() => []));
+      candidateMetas = (metas || []).slice(0, limit);
+    }
+
+    candidateMetas = candidateMetas
+      .map((x) => ({ placeId: this.__normPlaceId(x.placeId), name: this.__cleanText(x.name || "") }))
+      .filter((x) => this.__isValidPlaceId(x.placeId))
+      .filter((x) => !(exclude && x.placeId === exclude))
+      .slice(0, limit);
 
     console.log("[COMP] query:", q);
     console.log("[COMP] mapIds:", mapIds);
@@ -746,9 +931,6 @@ export class CompetitorService {
 
   // ==========================
   // ✅ place home: 대표키워드 추출
-  // - 1순위: query= 링크 기반
-  // - 2순위: frame HTML에서 keywordList regex
-  // - 3순위: __NEXT_DATA deep-find
   // ==========================
   private async __fetchPlaceHomeAndExtract(placeId: string, timeoutMs: number): Promise<PlaceHomeExtract> {
     const pid = this.__normPlaceId(placeId);
@@ -799,7 +981,7 @@ export class CompetitorService {
         const kw1 = await this.__extractKeywordsFromQueryLinks(frame).catch(() => []);
         if (kw1.length) netState.keywords = kw1;
 
-        // 2) frame HTML에서 keywordList regex (중요!)
+        // 2) frame HTML에서 keywordList regex
         if (!netState.keywords.length) {
           const frameHtml = await frame.content().catch(() => "");
           const byRe = this.__extractKeywordArrayByRegex(frameHtml);
@@ -930,7 +1112,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 대표키워드: query= 링크 기반 (TS DOM lib 없어도 OK)
+  // ✅ 대표키워드: query= 링크 기반
   // ==========================
   private async __extractKeywordsFromQueryLinks(frame: Frame): Promise<string[]> {
     const raw: string[] = await frame.evaluate(() => {
@@ -978,27 +1160,22 @@ export class CompetitorService {
         }
       };
 
-      const collect = (root: any) => {
-        if (!root || !root.querySelectorAll) return;
-        const links = Array.from(root.querySelectorAll('a[href*="query="], a[href*="search.naver.com"]')) as any[];
-        for (const a of links) {
-          const href = String(a?.getAttribute?.("href") || a?.href || "");
-          if (!href) continue;
-          if (!/(query=|[?&]q=)/i.test(href)) continue;
+      const links = Array.from(d.querySelectorAll('a[href*="query="], a[href*="search.naver.com"]')) as any[];
+      for (const a of links) {
+        const href = String(a?.getAttribute?.("href") || a?.href || "");
+        if (!href) continue;
+        if (!/(query=|[?&]q=)/i.test(href)) continue;
 
-          const t1 = clean(a?.innerText || a?.textContent);
-          if (t1 && !isNoise(t1)) tryPush(t1);
+        const t1 = clean(a?.innerText || a?.textContent);
+        if (t1 && !isNoise(t1)) tryPush(t1);
 
-          if ((!t1 || isNoise(t1)) && out.length < 12) {
-            const qp = parseQueryParam(href);
-            if (qp && !isNoise(qp)) tryPush(qp);
-          }
-
-          if (out.length >= 12) break;
+        if ((!t1 || isNoise(t1)) && out.length < 12) {
+          const qp = parseQueryParam(href);
+          if (qp && !isNoise(qp)) tryPush(qp);
         }
-      };
 
-      collect(d);
+        if (out.length >= 12) break;
+      }
 
       const uniq: string[] = [];
       const seen = new Set<string>();
@@ -1092,7 +1269,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ keywordList regex fallback (frame 소스에서 직접 긁기)
+  // ✅ keywordList regex fallback
   // ==========================
   private __extractKeywordArrayByRegex(html: string): string[] {
     const text = String(html || "");
