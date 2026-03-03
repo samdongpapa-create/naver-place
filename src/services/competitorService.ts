@@ -43,7 +43,7 @@ export class CompetitorService {
     this.browser = null;
   }
 
-    // ==========================
+  // ==========================
   // ✅ query-param 기반 키워드만 추출 (DOM에 query 링크가 없을 때의 최후 보강)
   // - “URL의 query/q 파라미터 값”만 채택 => 요구사항 2 유지
   // ==========================
@@ -1077,8 +1077,9 @@ export class CompetitorService {
    * - 대표키워드: query param 기반만 채택
    *   1) frame/page DOM에서 query링크 탐색
    *   2) 실패 시: 네트워크 응답 body에서 query/q 파라미터만 “문자열 스캔”으로 추출 (query-param 원칙 유지)
+   * - 추가: query/q가 진짜 0개인 케이스에만 json keywordList fallback 허용(최후)
    */
-    private async __renderAndExtractFromPlaceHome(url: string, timeoutMs: number): Promise<PlaceHomeExtract> {
+  private async __renderAndExtractFromPlaceHome(url: string, timeoutMs: number): Promise<PlaceHomeExtract> {
     const netState: {
       name: string;
       keywords: string[];
@@ -1117,67 +1118,6 @@ export class CompetitorService {
       return [];
     };
 
-    const extractQueryParamKeywordsFromAnyText = (text: string): string[] => {
-      const s = String(text || "");
-      if (!s) return [];
-
-      const out: string[] = [];
-      const seen = new Set<string>();
-
-      const isNoise = (t: string) =>
-        /^(저장|공유|길찾기|전화|예약|리뷰|사진|홈|메뉴|가격|더보기|쿠폰|이벤트|알림받기)$/i.test(t) ||
-        /(방문자\s*리뷰|방문자리뷰|블로그\s*리뷰|블로그리뷰|별점|평점)/i.test(t) ||
-        /^(내비게이션|네비게이션|navigation)$/i.test(t) ||
-        /(로그인|동의|확인|취소|닫기)/i.test(t);
-
-      const isPromoLike = (t: string) => /(원|만원|%|할인|쿠폰|이벤트|특가)/.test(t) && /\d/.test(t);
-
-      const push = (raw: string) => {
-        const v = this.__cleanText(raw).replace(/^#/, "").trim();
-        if (!v) return;
-        if (v.length < 2 || v.length > 25) return;
-        if (isNoise(v)) return;
-        if (isPromoLike(v)) return;
-
-        const key = this.__normNoSpace(v);
-        if (!key || seen.has(key)) return;
-        seen.add(key);
-        out.push(v);
-      };
-
-      // URL-like 조각에서 query/q 값만
-      const urlLike = s.match(/(https?:\/\/[^\s"'<>]+|\/[^\s"'<>]+)\b/g) || [];
-      for (const u0 of urlLike) {
-        if (!/(query=|[?&]q=)/i.test(u0)) continue;
-        try {
-          const u = new URL(u0, "https://m.place.naver.com/");
-          const q = u.searchParams.get("query") || u.searchParams.get("q") || "";
-          if (q) push(decodeURIComponent(q));
-        } catch {
-          const m = u0.match(/[?&](?:query|q)=([^&]+)/i);
-          if (m?.[1]) {
-            try {
-              push(decodeURIComponent(m[1]));
-            } catch {
-              push(m[1]);
-            }
-          }
-        }
-        if (out.length >= 16) break;
-      }
-
-      // JSON-ish: "query":"..."
-      if (out.length < 5) {
-        const reJson = /["'](?:query|q)["']\s*:\s*["']([^"']{2,60})["']/gi;
-        for (const m of s.matchAll(reJson)) {
-          push(m[1] || "");
-          if (out.length >= 16) break;
-        }
-      }
-
-      return out.slice(0, 16);
-    };
-
     const onRespSniff = async (res: Response) => {
       try {
         const req = res.request();
@@ -1207,7 +1147,6 @@ export class CompetitorService {
             }
             const arr = sniffJsonKeywords(j);
             if (arr.length) {
-              // 그대로 저장해두고, 최후에만 사용
               jsonKeywordBuf.push(JSON.stringify(arr));
               if (jsonKeywordBuf.length > 30) jsonKeywordBuf.shift();
             }
@@ -1253,11 +1192,11 @@ export class CompetitorService {
         }
       }
 
-      // 3) query-param sniff (HTML + frameHTML + response bodies)
+      // 3) query-param sniff (HTML + frameHTML + response bodies)  ✅ 로컬함수 제거하고 공용 메서드 사용
       if (!netState.keywords.length) {
         const frameHtml = frame ? await frame.content().catch(() => "") : "";
         const merged = [outer, frameHtml, queryBuf.join("\n")].filter(Boolean).join("\n");
-        const kw3 = extractQueryParamKeywordsFromAnyText(merged);
+        const kw3 = this.__extractKeywordsFromAnyTextByQueryParam(merged);
         if (kw3.length) {
           netState.keywords = kw3;
           netState.kwSource = "query_sniff";
@@ -1267,7 +1206,6 @@ export class CompetitorService {
       // 4) ✅ 최후 fallback: json keywordList sniff (query param이 “진짜 0개”일 때만)
       if (!netState.keywords.length && jsonKeywordBuf.length) {
         const mergedJsonArrText = jsonKeywordBuf.join("\n");
-        // jsonKeywordBuf에는 stringify된 배열이 있으니 regex로 문자열만 뽑아도 됨
         const byRe = this.__extractKeywordArrayByRegex(mergedJsonArrText);
         if (byRe.length) {
           netState.keywords = byRe;
@@ -1660,13 +1598,17 @@ export class CompetitorService {
   // generic helpers
   // ==========================
   private async __withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+    let timer: any = null;
     const t = new Promise<T>((_, reject) => {
-      const id = setTimeout(() => {
-        clearTimeout(id);
-        reject(new Error("withTimeout"));
-      }, Math.max(1, ms));
+      timer = setTimeout(() => reject(new Error("withTimeout")), Math.max(1, ms));
     });
-    return await Promise.race([p, t]);
+    try {
+      return await Promise.race([p, t]);
+    } finally {
+      try {
+        if (timer) clearTimeout(timer);
+      } catch {}
+    }
   }
 
   private __createLimiter(concurrency: number) {
@@ -1732,6 +1674,109 @@ export class CompetitorService {
       }
     }
     return "";
+  }
+
+  // ==========================
+  // ✅ (추가) deep find: 특정 key 아래 "string[]/string list" 찾기
+  // ==========================
+  private __deepFindStringArray(obj: any, keyName: string): string[] {
+    const key = String(keyName || "").trim();
+    if (!key) return [];
+
+    const out: string[] = [];
+    const seen = new Set<string>();
+
+    const push = (v: any) => {
+      const s = typeof v === "string" ? this.__cleanText(v) : "";
+      if (!s) return;
+      const k2 = this.__normNoSpace(s);
+      if (!k2 || seen.has(k2)) return;
+      seen.add(k2);
+      out.push(s);
+    };
+
+    const walk = (x: any) => {
+      if (!x || typeof x !== "object") return;
+
+      if (Array.isArray(x)) {
+        for (const it of x) walk(it);
+        return;
+      }
+
+      // 현재 오브젝트에서 keyName을 찾으면 처리
+      if (Object.prototype.hasOwnProperty.call(x, key)) {
+        const v = (x as any)[key];
+
+        // string[]
+        if (Array.isArray(v)) {
+          for (const it of v) push(it);
+        } else if (typeof v === "string") {
+          push(v);
+        } else if (v && typeof v === "object") {
+          // 혹시 {list:[...]} 같은 구조면 한 번 더 탐색
+          walk(v);
+        }
+      }
+
+      // 하위 탐색
+      for (const k of Object.keys(x)) {
+        const v = (x as any)[k];
+        if (!v || typeof v !== "object") continue;
+        walk(v);
+      }
+    };
+
+    walk(obj);
+
+    // “대표키워드 후보”니까 너무 긴 건 컷
+    return out.filter((s) => s.length >= 2 && s.length <= 25).slice(0, 16);
+  }
+
+  // ==========================
+  // ✅ (추가) regex로 keywordList/keywords 배열 형태에서 문자열만 추출
+  // - jsonKeywordBuf(stringify된 배열) / HTML에 박혀있는 배열 둘 다 대응
+  // ==========================
+  private __extractKeywordArrayByRegex(text: string): string[] {
+    const s = String(text || "");
+    if (!s) return [];
+
+    const out: string[] = [];
+    const seen = new Set<string>();
+
+    const push = (raw: string) => {
+      const v = this.__cleanText(raw).replace(/^#/, "").trim();
+      if (!v) return;
+      if (v.length < 2 || v.length > 25) return;
+
+      const k = this.__normNoSpace(v);
+      if (!k || seen.has(k)) return;
+      seen.add(k);
+      out.push(v);
+    };
+
+    // 1) 가장 흔한: ["a","b","c"] 형태의 배열 조각들을 잡아 문자열만 긁기
+    //    - jsonKeywordBuf는 배열을 JSON.stringify 했으므로 이걸로 충분히 잡힘
+    const reArr = /\[\s*(?:"[^"]{1,40}"\s*(?:,\s*"[^"]{1,40}"\s*)*)\]/g;
+    const arrChunks = s.match(reArr) || [];
+    for (const chunk of arrChunks.slice(0, 30)) {
+      const reStr = /"([^"]{1,40})"/g;
+      for (const m of chunk.matchAll(reStr)) {
+        push(m[1] || "");
+        if (out.length >= 16) break;
+      }
+      if (out.length >= 16) break;
+    }
+
+    // 2) 혹시 단일 키워드가 keywordList 안에 문자열로만 들어간 경우
+    if (out.length < 3) {
+      const reLoose = /(?:keywordList|keywords|representKeywordList|representativeKeywordList)\s*["']?\s*[:=]\s*["']([^"']{2,40})["']/gi;
+      for (const m of s.matchAll(reLoose)) {
+        push(m[1] || "");
+        if (out.length >= 16) break;
+      }
+    }
+
+    return out.slice(0, 16);
   }
 
   // ==========================
