@@ -1182,6 +1182,7 @@ export class CompetitorService {
 
   // ==========================
   // ✅ 대표키워드: query= 링크 기반 (+ query param 값도 추출)
+  // ✅ 강화: a[href] 뿐 아니라 data-href/data-url/onclick/script 안의 URL도 스캔
   // ==========================
   private async __extractKeywordsFromQueryLinks(frame: Frame): Promise<string[]> {
     const raw: string[] = await frame.evaluate(() => {
@@ -1198,31 +1199,34 @@ export class CompetitorService {
         /^(내비게이션|네비게이션|navigation)$/i.test(t) ||
         /(로그인|동의|확인|취소|닫기)/i.test(t);
 
+      const isPromoLike = (s: string) => /(원|만원|%|할인|쿠폰|이벤트|특가)/.test(s) && /\d/.test(s);
+
       const tryPush = (t: string) => {
         const s = norm(t);
         if (!s) return;
         if (s.length < 2 || s.length > 25) return;
         if (isNoise(s)) return;
-        // ✅ 가격/프로모션성 query도 제거
-        if (/(원|만원|%|할인|쿠폰|이벤트|특가)/.test(s) && /\d/.test(s)) return;
+        if (isPromoLike(s)) return;
         out.push(s);
       };
 
-      const parseQueryParam = (href: string): string => {
-        const base = (() => {
-          try {
-            return String(d?.baseURI || "");
-          } catch {
-            return "";
-          }
-        })();
-
+      const base = (() => {
         try {
-          const u = new URL(href, base || "https://m.place.naver.com/");
+          return String(d?.baseURI || "https://m.place.naver.com/");
+        } catch {
+          return "https://m.place.naver.com/";
+        }
+      })();
+
+      const parseQueryParamFromUrl = (href: string): string => {
+        const h = String(href || "").trim();
+        if (!h) return "";
+        try {
+          const u = new URL(h, base);
           const q = u.searchParams.get("query") || u.searchParams.get("q") || "";
           return decodeURIComponent(q || "").trim();
         } catch {
-          const m = String(href || "").match(/[?&](?:query|q)=([^&]+)/i);
+          const m = h.match(/[?&](?:query|q)=([^&]+)/i);
           if (!m?.[1]) return "";
           try {
             return decodeURIComponent(m[1]).trim();
@@ -1232,21 +1236,61 @@ export class CompetitorService {
         }
       };
 
-      // ✅ 검색 링크 후보를 조금 넓게(단, query param 기반만)
-      const links = Array.from(d.querySelectorAll('a[href*="query="], a[href*="search.naver.com"], a[href*="search2/search.naver"]')) as any[];
-      for (const a of links) {
-        const href = String(a?.getAttribute?.("href") || a?.href || "");
-        if (!href) continue;
-        if (!/(query=|[?&]q=)/i.test(href)) continue;
+      // ✅ URL 문자열에서 query/q 뽑기 (문자열 안에 URL이 여러 개 있어도 다 뽑음)
+      const extractFromTextBlob = (blob: string) => {
+        const s = String(blob || "");
+        if (!s) return;
 
-        const qp = parseQueryParam(href);
-        if (qp && !isNoise(qp)) tryPush(qp);
+        // URL-like 조각에서 query/q 있는 것만
+        const re = /(https?:\/\/[^\s"'<>]+|\/[^\s"'<>]+)\b/g;
+        const urls = s.match(re) || [];
+        for (const u of urls) {
+          if (!/(query=|[?&]q=)/i.test(u)) continue;
+          const qp = parseQueryParamFromUrl(u);
+          if (qp) tryPush(qp);
+          if (out.length >= 20) break;
+        }
+      };
 
-        // text는 오염 가능성 있어서 "보조"로만 사용
-        const t1 = clean(a?.innerText || a?.textContent);
-        if (t1 && !isNoise(t1)) tryPush(t1);
+      // 1) a[href] + data-href/data-url/onclick 등 "속성 기반 URL" 전수 스캔
+      const nodes: any[] = Array.from(d.querySelectorAll("*"));
+      const urlAttrs = ["href", "data-href", "data-url", "data-link", "onclick"];
 
-        if (out.length >= 16) break;
+      for (const el of nodes) {
+        if (out.length >= 20) break;
+
+        for (const attr of urlAttrs) {
+          const v = clean(el?.getAttribute?.(attr));
+          if (!v) continue;
+          if (!/(query=|[?&]q=)/i.test(v)) continue;
+
+          const qp = parseQueryParamFromUrl(v);
+          if (qp) tryPush(qp);
+
+          // 텍스트도 보조로 (단, 노이즈/프로모션 컷)
+          const txt = clean(el?.innerText || el?.textContent);
+          if (txt && !isNoise(txt) && !isPromoLike(txt)) tryPush(txt);
+
+          if (out.length >= 20) break;
+        }
+      }
+
+      // 2) script 내부에서 query/q URL 흔적 스캔 (keywordList JSON은 안 봄. URL만 봄)
+      if (out.length < 5) {
+        const scripts: any[] = Array.from(d.querySelectorAll("script"));
+        for (const sc of scripts) {
+          if (out.length >= 20) break;
+          const t = sc && (sc.textContent || "");
+          if (!t) continue;
+          if (!/(query=|[?&]q=)/i.test(t)) continue;
+          extractFromTextBlob(t);
+        }
+      }
+
+      // 3) 마지막 안전장치: document HTML에서 query/q URL만 스캔
+      if (out.length < 5) {
+        const html = d.documentElement ? d.documentElement.outerHTML : "";
+        if (html && /(query=|[?&]q=)/i.test(html)) extractFromTextBlob(html);
       }
 
       const uniq: string[] = [];
@@ -1278,30 +1322,34 @@ export class CompetitorService {
         /^(내비게이션|네비게이션|navigation)$/i.test(t) ||
         /(로그인|동의|확인|취소|닫기)/i.test(t);
 
+      const isPromoLike = (s: string) => /(원|만원|%|할인|쿠폰|이벤트|특가)/.test(s) && /\d/.test(s);
+
       const tryPush = (t: string) => {
         const s = norm(t);
         if (!s) return;
         if (s.length < 2 || s.length > 25) return;
         if (isNoise(s)) return;
-        if (/(원|만원|%|할인|쿠폰|이벤트|특가)/.test(s) && /\d/.test(s)) return;
+        if (isPromoLike(s)) return;
         out.push(s);
       };
 
-      const parseQueryParam = (href: string): string => {
-        const base = (() => {
-          try {
-            return String(d?.baseURI || "");
-          } catch {
-            return "";
-          }
-        })();
-
+      const base = (() => {
         try {
-          const u = new URL(href, base || "https://m.place.naver.com/");
+          return String(d?.baseURI || "https://m.place.naver.com/");
+        } catch {
+          return "https://m.place.naver.com/";
+        }
+      })();
+
+      const parseQueryParamFromUrl = (href: string): string => {
+        const h = String(href || "").trim();
+        if (!h) return "";
+        try {
+          const u = new URL(h, base);
           const q = u.searchParams.get("query") || u.searchParams.get("q") || "";
           return decodeURIComponent(q || "").trim();
         } catch {
-          const m = String(href || "").match(/[?&](?:query|q)=([^&]+)/i);
+          const m = h.match(/[?&](?:query|q)=([^&]+)/i);
           if (!m?.[1]) return "";
           try {
             return decodeURIComponent(m[1]).trim();
@@ -1311,19 +1359,54 @@ export class CompetitorService {
         }
       };
 
-      const links = Array.from(d.querySelectorAll('a[href*="query="], a[href*="search.naver.com"], a[href*="search2/search.naver"]')) as any[];
-      for (const a of links) {
-        const href = String(a?.getAttribute?.("href") || a?.href || "");
-        if (!href) continue;
-        if (!/(query=|[?&]q=)/i.test(href)) continue;
+      const extractFromTextBlob = (blob: string) => {
+        const s = String(blob || "");
+        if (!s) return;
+        const re = /(https?:\/\/[^\s"'<>]+|\/[^\s"'<>]+)\b/g;
+        const urls = s.match(re) || [];
+        for (const u of urls) {
+          if (!/(query=|[?&]q=)/i.test(u)) continue;
+          const qp = parseQueryParamFromUrl(u);
+          if (qp) tryPush(qp);
+          if (out.length >= 20) break;
+        }
+      };
 
-        const qp = parseQueryParam(href);
-        if (qp && !isNoise(qp)) tryPush(qp);
+      const nodes: any[] = Array.from(d.querySelectorAll("*"));
+      const urlAttrs = ["href", "data-href", "data-url", "data-link", "onclick"];
 
-        const t1 = clean(a?.innerText || a?.textContent);
-        if (t1 && !isNoise(t1)) tryPush(t1);
+      for (const el of nodes) {
+        if (out.length >= 20) break;
 
-        if (out.length >= 16) break;
+        for (const attr of urlAttrs) {
+          const v = clean(el?.getAttribute?.(attr));
+          if (!v) continue;
+          if (!/(query=|[?&]q=)/i.test(v)) continue;
+
+          const qp = parseQueryParamFromUrl(v);
+          if (qp) tryPush(qp);
+
+          const txt = clean(el?.innerText || el?.textContent);
+          if (txt && !isNoise(txt) && !isPromoLike(txt)) tryPush(txt);
+
+          if (out.length >= 20) break;
+        }
+      }
+
+      if (out.length < 5) {
+        const scripts: any[] = Array.from(d.querySelectorAll("script"));
+        for (const sc of scripts) {
+          if (out.length >= 20) break;
+          const t = sc && (sc.textContent || "");
+          if (!t) continue;
+          if (!/(query=|[?&]q=)/i.test(t)) continue;
+          extractFromTextBlob(t);
+        }
+      }
+
+      if (out.length < 5) {
+        const html = d.documentElement ? d.documentElement.outerHTML : "";
+        if (html && /(query=|[?&]q=)/i.test(html)) extractFromTextBlob(html);
       }
 
       const uniq: string[] = [];
