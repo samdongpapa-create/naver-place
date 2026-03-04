@@ -535,12 +535,14 @@ async function getCompetitorsSafe(params: {
   for (const q of queries) {
     const elapsed = Date.now() - started;
     const remainingMs = totalTimeoutMs - elapsed;
-    if (remainingMs <= 500) break;
-    if (!q || !String(q).trim()) continue;
+    // ✅ 너무 시간이 적으면 다음 쿼리 자체를 스킵 (성공률 급락 + Abort 연쇄 방지)
+if (remainingMs < 4500) {
+  console.log("[PAID][COMP] skip query due to low remainingMs:", q, "remainingMs:", remainingMs);
+  continue;
+}
 
-    // ✅ perTry 예산은 "서비스에 전달"만 한다 (바깥에서 race로 자르지 않음)
-    // - 너무 짧으면 성공률이 급락하니 최소 3500ms 보장
-    const perTryTimeoutMs = Math.max(3500, Math.min(safePerTry, remainingMs));
+// ✅ perTry는 remainingMs를 절대 초과하지 않게(여유 200ms 남김)
+const perTryTimeoutMs = Math.max(3500, Math.min(safePerTry, remainingMs - 200));
 
     console.log("[PAID][COMP] try query:", q, "remainingMs:", remainingMs, "perTryTimeoutMs:", perTryTimeoutMs);
 
