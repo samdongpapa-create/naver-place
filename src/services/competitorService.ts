@@ -1098,13 +1098,20 @@ export class CompetitorService {
     if (!candidateMetas.length) return [];
 
     const enrichConcurrency = Math.max(1, Math.min(4, Number(process.env.COMPETITOR_ENRICH_CONCURRENCY || 2)));
-    const runLimited = this.__createLimiter(enrichConcurrency);
+const runLimited = this.__createLimiter(enrichConcurrency);
 
-    const enrichPromises = candidateMetas.map((m) =>
-      runLimited(() => this.__fetchPlaceHomeAndExtract(m.placeId, Math.min(18000, Math.max(6500, this.__remaining(deadline))))).catch(
-        () => ({ name: "", keywords: [] as string[], loaded: false })
-      )
-    );
+const enrichPromises = candidateMetas.map((m) =>
+  runLimited(async () => {
+    try {
+      return await this.__fetchPlaceHomeAndExtract(
+        m.placeId,
+        Math.min(18000, Math.max(6500, this.__remaining(deadline)))
+      );
+    } catch {
+      return { name: "", keywords: [] as string[], loaded: false };
+    }
+  })
+);
 
     const out: Competitor[] = [];
 
@@ -1137,6 +1144,8 @@ export class CompetitorService {
         rank: out.length + 1
       });
     }
+    console.log("[COMP][DBG] competitors_out_len", out.length);
+console.log("[COMP][DBG] competitors_out_ids", out.map(x => x.placeId));
 
     return out;
   }
@@ -1690,34 +1699,35 @@ export class CompetitorService {
     return await Promise.race([p, t]);
   }
 
-  private __createLimiter(concurrency: number) {
-    let active = 0;
-    const queue: Array<() => void> = [];
+  // ✅ FIX: limiter가 실패를 undefined로 삼키지 않게 변경
+private __createLimiter(concurrency: number) {
+  let active = 0;
+  const queue: Array<() => void> = [];
 
-    const next = () => {
-      if (active >= concurrency) return;
-      const job = queue.shift();
-      if (!job) return;
-      active++;
-      job();
-    };
+  const next = () => {
+    if (active >= concurrency) return;
+    const job = queue.shift();
+    if (!job) return;
+    active++;
+    job();
+  };
 
-    return async <T>(fn: () => Promise<T>): Promise<T> => {
-      return await new Promise<T>((resolve) => {
-        const run = () => {
-          fn()
-            .then(resolve)
-            .catch(() => resolve((undefined as unknown) as T))
-            .finally(() => {
-              active--;
-              next();
-            });
-        };
-        queue.push(run);
-        next();
-      });
-    };
-  }
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    return await new Promise<T>((resolve, reject) => {
+      const run = () => {
+        fn()
+          .then(resolve)
+          .catch(reject) // ✅ 여기 중요: reject로 전달
+          .finally(() => {
+            active--;
+            next();
+          });
+      };
+      queue.push(run);
+      next();
+    });
+  };
+}
 
   // ==========================
   // deep find helpers
