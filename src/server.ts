@@ -565,6 +565,31 @@ async function getCompetitorsSafe(params: {
           kwCount: Array.isArray(c.keywords) ? c.keywords.length : 0,
           keywords: Array.isArray(c.keywords) ? c.keywords.slice(0, 5) : []
         }));
+        if (Array.isArray(comps) && comps.length) {
+  // ✅ 디버그: 여기서 comps가 실제 몇 개인지 확인
+  try {
+    console.log(
+      "[PAID][COMP] comps_len:",
+      comps.length,
+      "ids:",
+      comps.map((x: any) => String(x?.placeId || "")).join(",")
+    );
+  } catch {}
+
+  try {
+    const snap = comps.map((c: any, i: number) => ({
+      rank: i + 1,
+      placeId: c.placeId,
+      name: c.name,
+      kwCount: Array.isArray(c.keywords) ? c.keywords.length : 0,
+      keywords: Array.isArray(c.keywords) ? c.keywords.slice(0, 5) : []
+    }));
+    console.log("[PAID][COMP] keyword snapshot:", JSON.stringify(snap));
+  } catch {}
+
+  pushMany(comps);
+  if (collected.length >= limit) break;
+}
         console.log("[PAID][COMP] keyword snapshot:", JSON.stringify(snap));
       } catch {}
 
