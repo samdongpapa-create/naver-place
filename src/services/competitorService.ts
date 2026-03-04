@@ -45,7 +45,7 @@ export class CompetitorService {
 
   // ==========================
   // ✅ query-param 기반 키워드만 추출 (DOM에 query 링크가 없을 때의 최후 보강)
-  // - “URL의 query/q 파라미터 값”만 채택 => 요구사항 2 유지
+  // - “URL의 query/q 파라미터 값”만 채택
   // ==========================
   private __extractKeywordsFromAnyTextByQueryParam(text: string): string[] {
     const s = String(text || "");
@@ -159,9 +159,10 @@ export class CompetitorService {
     return String(pid || "").trim();
   }
 
+  // ✅ FIX: 5~12로 완화 (추출은 5~12인데 여기서 7~12로 잘려 competitors=0 원인이 됨)
   private __isValidPlaceId(pid: string): boolean {
     const s = this.__normPlaceId(pid);
-    return /^\d{7,12}$/.test(s);
+    return /^\d{5,12}$/.test(s);
   }
 
   // ==========================
@@ -607,7 +608,7 @@ export class CompetitorService {
 
   // ==========================
   // ✅ 최후 보루: where=place (fetch)
-  // ✅ 변경: "텍스트 긁어서 name 추출" 제거 -> 속성(title/aria-label)만 제한적으로
+  // ✅ FIX: where=place는 "id 확보용"으로만 사용 => name은 무조건 빈 값 (오염 원천 차단)
   // ==========================
   private async __findTopPlaceMetasFromSearchWherePlaceFetch(keyword: string, timeoutMs: number): Promise<PlaceMeta[]> {
     const q = String(keyword || "").trim();
@@ -623,30 +624,7 @@ export class CompetitorService {
     const metas: PlaceMeta[] = [];
     const seen = new Set<string>();
 
-    // ✅ 안전 name: title/aria-label만 (그리고 banned면 빈 문자열)
-    const pickSafeNameNearIndex = (idx: number): string => {
-      if (idx < 0) return "";
-      const chunk = html.slice(Math.max(0, idx - 900), Math.min(html.length, idx + 900));
-
-      const titleCand = [...chunk.matchAll(/title=["']([^"']{2,80})["']/gi)]
-        .map((x) => this.__cleanText(x[1]))
-        .filter(Boolean);
-
-      for (const t of titleCand) {
-        if (!this.__isBannedName(t)) return t;
-      }
-
-      const ariaCand = [...chunk.matchAll(/aria-label=["']([^"']{2,80})["']/gi)]
-        .map((x) => this.__cleanText(x[1]))
-        .filter(Boolean);
-
-      for (const t of ariaCand) {
-        if (!this.__isBannedName(t)) return t;
-      }
-
-      // ✅ 텍스트에서 name 뽑는 건 "오염 원인"이라 금지
-      return "";
-    };
+    const pickSafeNameNearIndex = (_idx: number): string => "";
 
     for (const m of html.matchAll(reAnyPlaceId)) {
       const pid = this.__normPlaceId(m[1]);
@@ -667,7 +645,7 @@ export class CompetitorService {
 
   // ==========================
   // ✅ 최후 보루: where=place (render)
-  // ✅ 변경: container 텍스트 기반 name 추출 제거 -> aria-label/title만
+  // ✅ FIX: where=place는 "id 확보용"으로만 사용 => name은 무조건 빈 값 (오염 원천 차단)
   // ==========================
   private async __findTopPlaceMetasFromSearchWherePlaceRendered(keyword: string, timeoutMs: number): Promise<PlaceMeta[]> {
     const q = String(keyword || "").trim();
@@ -696,19 +674,7 @@ export class CompetitorService {
 
         const rePid = /\/(?:place|hairshop|restaurant|cafe|accommodation|hospital|pharmacy|beauty|bakery)\/(\d{5,12})/;
 
-        const clean = (t: any) => String(t ?? "").replace(/\s+/g, " ").trim();
-
-        const pickSafeName = (a: any) => {
-          // ✅ 안전한 속성 기반만
-          const t1 = clean(a?.getAttribute?.("title"));
-          if (t1) return t1;
-
-          const t2 = clean(a?.getAttribute?.("aria-label"));
-          if (t2) return t2;
-
-          // 검색결과에서는 a 안에 "광고/가격" 텍스트가 섞이기 쉬워서 innerText 금지
-          return "";
-        };
+        const pickSafeName = (_a: any) => "";
 
         for (const a of linkNodes) {
           const href = String(a?.href || "");
@@ -730,20 +696,17 @@ export class CompetitorService {
 
       for (const it of items) {
         const pid = String(it.placeId || "").trim();
-        if (!/^\d{7,12}$/.test(pid)) continue;
+        if (!/^\d{5,12}$/.test(pid)) continue;
         if (seen.has(pid)) continue;
 
-        const name = this.__cleanText(it.name || "");
         seen.add(pid);
-
-        // ✅ banned면 무조건 빈 문자열
-        metas.push({ placeId: pid, name: this.__isBannedName(name) ? "" : name });
+        metas.push({ placeId: pid, name: "" });
 
         if (metas.length >= 10) break;
       }
 
       if (!metas.length) {
-        const ids = items.map((x) => String(x.placeId || "").trim()).filter((id) => /^\d{7,12}$/.test(id));
+        const ids = items.map((x) => String(x.placeId || "").trim()).filter((id) => /^\d{5,12}$/.test(id));
         const uniq = Array.from(new Set(ids)).slice(0, 10);
         const out = uniq.map((id) => ({ placeId: id, name: "" }));
         this.__dbg("where=place(rendered:fallback_ids_only)", { query: q, ids: out.length, sample: out.slice(0, 3) });
@@ -924,7 +887,7 @@ export class CompetitorService {
       await this.__sleep(120);
     }
 
-    // 4) ✅ 최후 보루: where=place (id 확보용, name은 오염 방지로 거의 비움)
+    // 4) ✅ 최후 보루: where=place (id 확보용, name은 항상 비움)
     if (out.length < limit && remaining() > 900) {
       for (const q of variants) {
         if (out.length >= limit) break;
@@ -997,7 +960,7 @@ export class CompetitorService {
       .filter((x) => !(exclude && x.placeId === exclude))
       .slice(0, limit);
 
-    // ✅ name 오염 방지: 여기서도 한번 더 정리 (banned면 공백)
+    // ✅ name 오염 방지: banned면 공백
     candidateMetas = candidateMetas.map((m) => ({ placeId: m.placeId, name: this.__isBannedName(m.name) ? "" : m.name }));
 
     console.log("[COMP] query:", q);
@@ -1076,7 +1039,7 @@ export class CompetitorService {
    * ✅ 변경 핵심:
    * - 대표키워드: query param 기반만 채택
    *   1) frame/page DOM에서 query링크 탐색
-   *   2) 실패 시: 네트워크 응답 body에서 query/q 파라미터만 “문자열 스캔”으로 추출 (query-param 원칙 유지)
+   *   2) 실패 시: 네트워크 응답 body에서 query/q 파라미터만 “문자열 스캔”
    */
   private async __renderAndExtractFromPlaceHome(url: string, timeoutMs: number): Promise<PlaceHomeExtract> {
     const netState: {
@@ -1146,7 +1109,6 @@ export class CompetitorService {
             }
             const arr = sniffJsonKeywords(j);
             if (arr.length) {
-              // 그대로 저장해두고, 최후에만 사용
               jsonKeywordBuf.push(JSON.stringify(arr));
               if (jsonKeywordBuf.length > 30) jsonKeywordBuf.shift();
             }
@@ -1313,7 +1275,7 @@ export class CompetitorService {
 
   // ==========================
   // ✅ 대표키워드: query= 링크 기반 (+ query param 값도 추출)
-  // ✅ 강화: a[href] 뿐 아니라 data-href/data-url/onclick/script 안의 URL도 스캔
+  // ✅ FIX: innerText/textContent 주입 제거 (meta/버튼 텍스트가 키워드로 들어오는 원천)
   // ==========================
   private async __extractKeywordsFromQueryLinks(frame: Frame): Promise<string[]> {
     const raw: string[] = await frame.evaluate(() => {
@@ -1367,12 +1329,11 @@ export class CompetitorService {
         }
       };
 
-      // ✅ URL 문자열에서 query/q 뽑기 (문자열 안에 URL이 여러 개 있어도 다 뽑음)
+      // ✅ URL 문자열에서 query/q 뽑기
       const extractFromTextBlob = (blob: string) => {
         const s = String(blob || "");
         if (!s) return;
 
-        // URL-like 조각에서 query/q 있는 것만
         const re = /(https?:\/\/[^\s"'<>]+|\/[^\s"'<>]+)\b/g;
         const urls = s.match(re) || [];
         for (const u of urls) {
@@ -1383,7 +1344,7 @@ export class CompetitorService {
         }
       };
 
-      // 1) a[href] + data-href/data-url/onclick 등 "속성 기반 URL" 전수 스캔
+      // 1) 속성 기반 URL 전수 스캔 (href/data-*/onclick 등)
       const nodes: any[] = Array.from(d.querySelectorAll("*"));
       const urlAttrs = ["href", "data-href", "data-url", "data-link", "onclick"];
 
@@ -1398,15 +1359,11 @@ export class CompetitorService {
           const qp = parseQueryParamFromUrl(v);
           if (qp) tryPush(qp);
 
-          // 텍스트도 보조로 (단, 노이즈/프로모션 컷)
-          const txt = clean(el?.innerText || el?.textContent);
-          if (txt && !isNoise(txt) && !isPromoLike(txt)) tryPush(txt);
-
           if (out.length >= 20) break;
         }
       }
 
-      // 2) script 내부에서 query/q URL 흔적 스캔 (keywordList JSON은 안 봄. URL만 봄)
+      // 2) script 내부에서 query/q URL 흔적 스캔 (URL만)
       if (out.length < 5) {
         const scripts: any[] = Array.from(d.querySelectorAll("script"));
         for (const sc of scripts) {
@@ -1418,7 +1375,7 @@ export class CompetitorService {
         }
       }
 
-      // 3) 마지막 안전장치: document HTML에서 query/q URL만 스캔
+      // 3) 마지막: document HTML에서 query/q URL만 스캔
       if (out.length < 5) {
         const html = d.documentElement ? d.documentElement.outerHTML : "";
         if (html && /(query=|[?&]q=)/i.test(html)) extractFromTextBlob(html);
@@ -1516,9 +1473,6 @@ export class CompetitorService {
 
           const qp = parseQueryParamFromUrl(v);
           if (qp) tryPush(qp);
-
-          const txt = clean(el?.innerText || el?.textContent);
-          if (txt && !isNoise(txt) && !isPromoLike(txt)) tryPush(txt);
 
           if (out.length >= 20) break;
         }
@@ -1673,8 +1627,7 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ FIX: 누락 메서드 #1
-  // - representKeywordList / keywordList 등에서 string[] 안전 탐색
+  // ✅ representKeywordList / keywordList 등에서 string[] 안전 탐색
   // ==========================
   private __deepFindStringArray(obj: any, keyName: string): string[] {
     const target = String(keyName || "").trim();
@@ -1716,15 +1669,22 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ FIX: 누락 메서드 #2
-  // - regex_fallback이 meta(ko/utf-8/viewport…)를 키워드로 오인하던 문제 차단
-  // - JSON-ish 배열(["..",".."])만 대상으로 추출
+  // ✅ FIX: regex_fallback이 meta(ko/utf-8/viewport…)를 키워드로 오인하던 문제 차단
+  // ✅ keywordList/representKeywordList 계열 key에 붙은 JSON 배열만 대상으로 추출
   // ==========================
   private __extractKeywordArrayByRegex(text: string): string[] {
     const s = String(text || "");
     if (!s) return [];
 
-    const arrMatches = s.match(/\[\s*(?:"[^"]{2,40}"\s*,\s*){0,25}"[^"]{2,40}"\s*\]/g) || [];
+    // ✅ "아무 배열"이 아니라, 키워드 키에 붙은 배열만 캡처
+    const keyRe =
+      /["'](?:representKeywordList|representativeKeywordList|representKeywords|representativeKeywords|keywordList|keywords)["']\s*:\s*(\[\s*(?:"[^"]{2,60}"\s*,\s*){0,25}"[^"]{2,60}"\s*\])/gi;
+
+    const arrMatches: string[] = [];
+    for (const m of s.matchAll(keyRe)) {
+      if (m?.[1]) arrMatches.push(m[1]);
+      if (arrMatches.length >= 25) break;
+    }
     if (!arrMatches.length) return [];
 
     const noise = (t: string) => {
