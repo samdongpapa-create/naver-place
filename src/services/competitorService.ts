@@ -27,16 +27,6 @@ type PlaceHomeExtract = { name: string; keywords: string[]; loaded: boolean };
 export class CompetitorService {
   private browser: Browser | null = null;
 
-  // ✅ allSearch 503/차단 시 “잠깐 포기” 서킷브레이커
-  private __allSearchCircuitOpenUntil = 0;
-
-  private __isAllSearchCircuitOpen(): boolean {
-    return Date.now() < this.__allSearchCircuitOpenUntil;
-  }
-  private __openAllSearchCircuit(ms: number) {
-    this.__allSearchCircuitOpenUntil = Date.now() + Math.max(5_000, ms);
-  }
-
   private async getBrowser(): Promise<Browser> {
     if (this.browser) return this.browser;
     this.browser = await chromium.launch({
@@ -55,7 +45,7 @@ export class CompetitorService {
 
   // ==========================
   // ✅ query-param 기반 키워드만 추출 (DOM에 query 링크가 없을 때의 최후 보강)
-  // - “URL의 query/q 파라미터 값”만 채택 => 요구사항 유지
+  // - “URL의 query/q 파라미터 값”만 채택 => 요구사항 2 유지
   // ==========================
   private __extractKeywordsFromAnyTextByQueryParam(text: string): string[] {
     const s = String(text || "");
@@ -419,12 +409,9 @@ export class CompetitorService {
   }
 
   // ==========================
-  // ✅ 0) allSearch JSON (map rank) - fetch 버전
-  // ✅ 개선: 503/HTML이면 서킷 오픈 + 과다 재시도 방지
+  // ✅ 0) allSearch JSON (map rank)
   // ==========================
   private async __findTopPlaceIdsViaAllSearch(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
-    if (this.__isAllSearchCircuitOpen()) return [];
-
     const q = String(keyword || "").trim();
     if (!q) return [];
 
@@ -460,15 +447,13 @@ export class CompetitorService {
         const text = await res.text().catch(() => "");
 
         if (!res.ok) {
-          if (res.status === 503 || res.status === 429 || res.status === 403) this.__openAllSearchCircuit(2 * 60_000);
           throw new Error(
             `[allSearch${useBoundary ? ":xy+boundary" : ":xy"}] status=${res.status} body=${String(text || "").slice(0, 220)}`
           );
         }
         if (ct.includes("text/html") || /<!doctype html/i.test(text)) {
-          this.__openAllSearchCircuit(2 * 60_000);
           throw new Error(
-            `[allSearch${useBoundary ? ":html+xy+boundary" : ":html"}] status=${res.status} body=${String(text || "").slice(0, 220)}`
+            `[allSearch${useBoundary ? ":html+xy" : ":html"}] status=${res.status} body=${String(text || "").slice(0, 220)}`
           );
         }
 
@@ -489,91 +474,19 @@ export class CompetitorService {
     const budget = Math.max(1600, Math.min(5200, timeoutMs));
     const step = Math.max(700, Math.floor(budget / 4));
 
-    let tries = 0;
-    const MAX_TRIES = 3;
-
     for (const useBoundary of [true, false]) {
       for (const c of coords) {
-        tries++;
-        if (tries > MAX_TRIES) return [];
         try {
           const ids = await tryOnce(c, useBoundary, step);
           if (ids.length) return ids;
         } catch (e) {
           console.warn("[COMP][mapRank] allSearch failed:", e);
-          if (this.__isAllSearchCircuitOpen()) return [];
         }
         await this.__sleep(120);
       }
     }
 
     return [];
-  }
-
-  // ==========================
-  // ✅ 0-2) allSearch - browser(page.request) 버전 (성공률↑ 옵션)
-  // ==========================
-  private async __findTopPlaceIdsViaAllSearchViaBrowser(keyword: string, limit: number, timeoutMs: number): Promise<string[]> {
-    if (this.__isAllSearchCircuitOpen()) return [];
-
-    const q = String(keyword || "").trim();
-    if (!q) return [];
-
-    const boundary = String(process.env.NAVER_MAP_BOUNDARY || "").trim();
-    const coord = this.__normalizeSearchCoord();
-
-    const api = new URL("https://map.naver.com/p/api/search/allSearch");
-    api.searchParams.set("query", q);
-    api.searchParams.set("type", "all");
-    api.searchParams.set("page", "1");
-    api.searchParams.set("searchCoord", coord);
-    if (boundary) api.searchParams.set("boundary", boundary);
-
-    const context = await this.__newContext("https://map.naver.com/");
-    const page = await this.__newLightPage(context, timeoutMs);
-
-    try {
-      await page
-        .goto(this.__buildMapReferer(q), { waitUntil: "domcontentloaded", timeout: Math.min(timeoutMs, 7000) })
-        .catch(() => null);
-      await page.waitForTimeout(350);
-
-      const res = await page.request.get(api.toString(), {
-        headers: {
-          accept: "application/json, text/plain, */*",
-          "accept-language": "ko-KR,ko;q=0.9",
-          referer: this.__buildMapReferer(q),
-          origin: "https://map.naver.com"
-        },
-        timeout: Math.min(timeoutMs, 7000)
-      });
-
-      const st = res.status();
-      const text = await res.text().catch(() => "");
-
-      if (st === 503 || st === 429 || st === 403) this.__openAllSearchCircuit(2 * 60_000);
-      if (!res.ok()) throw new Error(`[allSearch:browser] status=${st} body=${text.slice(0, 220)}`);
-      if (/<!doctype html/i.test(text)) {
-        this.__openAllSearchCircuit(2 * 60_000);
-        throw new Error(`[allSearch:browser_html] status=${st} body=${text.slice(0, 220)}`);
-      }
-
-      const data: any = this.__safeJsonParse(text);
-      const list: any[] = data?.result?.place?.list || data?.result?.place?.items || [];
-      const ids = list
-        .map((x) => (x?.id ? String(x.id) : x?.placeId ? String(x.placeId) : ""))
-        .map((id) => this.__normPlaceId(id))
-        .filter((id) => this.__isValidPlaceId(id));
-
-      return Array.from(new Set(ids)).slice(0, limit);
-    } finally {
-      try {
-        await page.close();
-      } catch {}
-      try {
-        await context.close();
-      } catch {}
-    }
   }
 
   // ==========================
@@ -710,6 +623,7 @@ export class CompetitorService {
     const metas: PlaceMeta[] = [];
     const seen = new Set<string>();
 
+    // ✅ 안전 name: title/aria-label만 (그리고 banned면 빈 문자열)
     const pickSafeNameNearIndex = (idx: number): string => {
       if (idx < 0) return "";
       const chunk = html.slice(Math.max(0, idx - 900), Math.min(html.length, idx + 900));
@@ -730,6 +644,7 @@ export class CompetitorService {
         if (!this.__isBannedName(t)) return t;
       }
 
+      // ✅ 텍스트에서 name 뽑는 건 "오염 원인"이라 금지
       return "";
     };
 
@@ -784,12 +699,14 @@ export class CompetitorService {
         const clean = (t: any) => String(t ?? "").replace(/\s+/g, " ").trim();
 
         const pickSafeName = (a: any) => {
+          // ✅ 안전한 속성 기반만
           const t1 = clean(a?.getAttribute?.("title"));
           if (t1) return t1;
 
           const t2 = clean(a?.getAttribute?.("aria-label"));
           if (t2) return t2;
 
+          // 검색결과에서는 a 안에 "광고/가격" 텍스트가 섞이기 쉬워서 innerText 금지
           return "";
         };
 
@@ -819,6 +736,7 @@ export class CompetitorService {
         const name = this.__cleanText(it.name || "");
         seen.add(pid);
 
+        // ✅ banned면 무조건 빈 문자열
         metas.push({ placeId: pid, name: this.__isBannedName(name) ? "" : name });
 
         if (metas.length >= 10) break;
@@ -867,23 +785,14 @@ export class CompetitorService {
       this.__dbg("top5_stage", { stage, added: Math.max(0, after - before), total: after, ...extra });
     };
 
-    // 1) allSearch (browser 우선 -> fetch)
+    // 1) allSearch
     for (const q of variants) {
       if (out.length >= limit) break;
       if (remaining() < 650) break;
 
       const before = out.length;
       try {
-        let ids: string[] = [];
-
-        // ✅ 브라우저 기반 먼저 (성공률↑)
-        ids = await this.__findTopPlaceIdsViaAllSearchViaBrowser(q, limit + 30, Math.min(7000, remaining())).catch(() => []);
-
-        // ✅ 그래도 없으면 fetch 버전 (서킷/tries 적용됨)
-        if (!ids.length) {
-          ids = await this.__findTopPlaceIdsViaAllSearch(q, limit + 30, Math.min(5200, remaining())).catch(() => []);
-        }
-
+        const ids = await this.__findTopPlaceIdsViaAllSearch(q, limit + 30, Math.min(5200, remaining()));
         this.__pushUnique(out, seen, ids, limit, exclude);
       } catch (e) {
         console.warn("[COMP][mapRank] allSearch failed:", e);
@@ -1098,20 +1007,13 @@ export class CompetitorService {
     if (!candidateMetas.length) return [];
 
     const enrichConcurrency = Math.max(1, Math.min(4, Number(process.env.COMPETITOR_ENRICH_CONCURRENCY || 2)));
-const runLimited = this.__createLimiter(enrichConcurrency);
+    const runLimited = this.__createLimiter(enrichConcurrency);
 
-const enrichPromises = candidateMetas.map((m) =>
-  runLimited(async () => {
-    try {
-      return await this.__fetchPlaceHomeAndExtract(
-        m.placeId,
-        Math.min(18000, Math.max(6500, this.__remaining(deadline)))
-      );
-    } catch {
-      return { name: "", keywords: [] as string[], loaded: false };
-    }
-  })
-);
+    const enrichPromises = candidateMetas.map((m) =>
+      runLimited(() => this.__fetchPlaceHomeAndExtract(m.placeId, Math.min(18000, Math.max(6500, this.__remaining(deadline))))).catch(
+        () => ({ name: "", keywords: [] as string[], loaded: false })
+      )
+    );
 
     const out: Competitor[] = [];
 
@@ -1144,8 +1046,6 @@ const enrichPromises = candidateMetas.map((m) =>
         rank: out.length + 1
       });
     }
-    console.log("[COMP][DBG] competitors_out_len", out.length);
-console.log("[COMP][DBG] competitors_out_ids", out.map(x => x.placeId));
 
     return out;
   }
@@ -1177,7 +1077,6 @@ console.log("[COMP][DBG] competitors_out_ids", out.map(x => x.placeId));
    * - 대표키워드: query param 기반만 채택
    *   1) frame/page DOM에서 query링크 탐색
    *   2) 실패 시: 네트워크 응답 body에서 query/q 파라미터만 “문자열 스캔”으로 추출 (query-param 원칙 유지)
-   * - 최후 fallback: JSON keywordList/regex (query가 진짜 0개일 때만)
    */
   private async __renderAndExtractFromPlaceHome(url: string, timeoutMs: number): Promise<PlaceHomeExtract> {
     const netState: {
@@ -1197,7 +1096,9 @@ console.log("[COMP][DBG] competitors_out_ids", out.map(x => x.placeId));
     const context = await this.__newContext("https://m.place.naver.com/");
     const page = await this.__newLightPage(context, timeoutMs);
 
+    // ✅ query-param 스캔용 버퍼
     const queryBuf: string[] = [];
+    // ✅ json keywordList fallback 버퍼
     const jsonKeywordBuf: string[] = [];
 
     const sniffJsonKeywords = (j: any): string[] => {
@@ -1245,6 +1146,7 @@ console.log("[COMP][DBG] competitors_out_ids", out.map(x => x.placeId));
             }
             const arr = sniffJsonKeywords(j);
             if (arr.length) {
+              // 그대로 저장해두고, 최후에만 사용
               jsonKeywordBuf.push(JSON.stringify(arr));
               if (jsonKeywordBuf.length > 30) jsonKeywordBuf.shift();
             }
@@ -1465,10 +1367,12 @@ console.log("[COMP][DBG] competitors_out_ids", out.map(x => x.placeId));
         }
       };
 
+      // ✅ URL 문자열에서 query/q 뽑기 (문자열 안에 URL이 여러 개 있어도 다 뽑음)
       const extractFromTextBlob = (blob: string) => {
         const s = String(blob || "");
         if (!s) return;
 
+        // URL-like 조각에서 query/q 있는 것만
         const re = /(https?:\/\/[^\s"'<>]+|\/[^\s"'<>]+)\b/g;
         const urls = s.match(re) || [];
         for (const u of urls) {
@@ -1479,6 +1383,7 @@ console.log("[COMP][DBG] competitors_out_ids", out.map(x => x.placeId));
         }
       };
 
+      // 1) a[href] + data-href/data-url/onclick 등 "속성 기반 URL" 전수 스캔
       const nodes: any[] = Array.from(d.querySelectorAll("*"));
       const urlAttrs = ["href", "data-href", "data-url", "data-link", "onclick"];
 
@@ -1493,6 +1398,7 @@ console.log("[COMP][DBG] competitors_out_ids", out.map(x => x.placeId));
           const qp = parseQueryParamFromUrl(v);
           if (qp) tryPush(qp);
 
+          // 텍스트도 보조로 (단, 노이즈/프로모션 컷)
           const txt = clean(el?.innerText || el?.textContent);
           if (txt && !isNoise(txt) && !isPromoLike(txt)) tryPush(txt);
 
@@ -1500,6 +1406,7 @@ console.log("[COMP][DBG] competitors_out_ids", out.map(x => x.placeId));
         }
       }
 
+      // 2) script 내부에서 query/q URL 흔적 스캔 (keywordList JSON은 안 봄. URL만 봄)
       if (out.length < 5) {
         const scripts: any[] = Array.from(d.querySelectorAll("script"));
         for (const sc of scripts) {
@@ -1511,6 +1418,7 @@ console.log("[COMP][DBG] competitors_out_ids", out.map(x => x.placeId));
         }
       }
 
+      // 3) 마지막 안전장치: document HTML에서 query/q URL만 스캔
       if (out.length < 5) {
         const html = d.documentElement ? d.documentElement.outerHTML : "";
         if (html && /(query=|[?&]q=)/i.test(html)) extractFromTextBlob(html);
@@ -1659,7 +1567,7 @@ console.log("[COMP][DBG] competitors_out_ids", out.map(x => x.placeId));
       .filter((k) => k.length >= 2 && k.length <= 25)
       .filter(
         (k) =>
-          !/(알림받기|방문자\s*리뷰|방문자리뷰|블로그\s*리뷰|블로그리뷰|리뷰\s*\d+|별점|평점|지도|저장|공유|길찾기|전화|예약|문의|쿠폰|이벤트|할인|내비게이션|네비게이션|navigation)/i.test(
+          !/(알림받기|방문자\s*리뷰|방문자리뷰|블로그\s*리뷰|블로그리뷰|리뷰\s*\d+|별점|평점|지도|저장|공유|길찾기|전화|예약|문의|쿠폰|이벤트|할인|내비게이션|네비게이션|navigation|ko|utf-8|utf8|x-ua-compatible|ua-compatible|ieedge|ie-edge|viewport|_viewport|content-type|text\/html)/i.test(
             k
           )
       )
@@ -1699,35 +1607,34 @@ console.log("[COMP][DBG] competitors_out_ids", out.map(x => x.placeId));
     return await Promise.race([p, t]);
   }
 
-  // ✅ FIX: limiter가 실패를 undefined로 삼키지 않게 변경
-private __createLimiter(concurrency: number) {
-  let active = 0;
-  const queue: Array<() => void> = [];
+  private __createLimiter(concurrency: number) {
+    let active = 0;
+    const queue: Array<() => void> = [];
 
-  const next = () => {
-    if (active >= concurrency) return;
-    const job = queue.shift();
-    if (!job) return;
-    active++;
-    job();
-  };
+    const next = () => {
+      if (active >= concurrency) return;
+      const job = queue.shift();
+      if (!job) return;
+      active++;
+      job();
+    };
 
-  return async <T>(fn: () => Promise<T>): Promise<T> => {
-    return await new Promise<T>((resolve, reject) => {
-      const run = () => {
-        fn()
-          .then(resolve)
-          .catch(reject) // ✅ 여기 중요: reject로 전달
-          .finally(() => {
-            active--;
-            next();
-          });
-      };
-      queue.push(run);
-      next();
-    });
-  };
-}
+    return async <T>(fn: () => Promise<T>): Promise<T> => {
+      return await new Promise<T>((resolve) => {
+        const run = () => {
+          fn()
+            .then(resolve)
+            .catch(() => resolve((undefined as unknown) as T))
+            .finally(() => {
+              active--;
+              next();
+            });
+        };
+        queue.push(run);
+        next();
+      });
+    };
+  }
 
   // ==========================
   // deep find helpers
@@ -1765,124 +1672,122 @@ private __createLimiter(concurrency: number) {
     return "";
   }
 
-  // ✅ TS 에러 해결 1) __deepFindStringArray 추가
+  // ==========================
+  // ✅ FIX: 누락 메서드 #1
+  // - representKeywordList / keywordList 등에서 string[] 안전 탐색
+  // ==========================
   private __deepFindStringArray(obj: any, keyName: string): string[] {
-    const key = String(keyName || "").trim();
-    if (!key) return [];
+    const target = String(keyName || "").trim();
+    if (!obj || typeof obj !== "object" || !target) return [];
 
     const out: string[] = [];
     const seen = new Set<string>();
 
-    const visit = (node: any) => {
-      if (!node || typeof node !== "object") return;
+    const push = (v: any) => {
+      const t = this.__cleanText(v);
+      if (!t) return;
+      const k = this.__normNoSpace(t);
+      if (!k || seen.has(k)) return;
+      seen.add(k);
+      out.push(t);
+    };
 
-      if (Array.isArray(node)) {
-        for (const it of node) visit(it);
+    const walk = (x: any) => {
+      if (!x || typeof x !== "object") return;
+
+      if (Array.isArray(x)) {
+        for (const it of x) walk(it);
         return;
       }
 
-      for (const k of Object.keys(node)) {
-        const v = (node as any)[k];
-
-        if (k === key) {
-          // case A) ["a","b"]
-          if (Array.isArray(v)) {
-            for (const it of v) {
-              if (typeof it === "string") {
-                const t = this.__cleanText(it);
-                if (!t) continue;
-                const nk = this.__normNoSpace(t);
-                if (!nk || seen.has(nk)) continue;
-                seen.add(nk);
-                out.push(t);
-              } else if (it && typeof it === "object") {
-                // case B) [{ keyword: "..." }, { name: "..." }]
-                for (const kk of ["keyword", "name", "value", "text", "title"]) {
-                  const vv = (it as any)[kk];
-                  if (typeof vv === "string") {
-                    const t = this.__cleanText(vv);
-                    if (!t) continue;
-                    const nk = this.__normNoSpace(t);
-                    if (!nk || seen.has(nk)) continue;
-                    seen.add(nk);
-                    out.push(t);
-                  }
-                }
-              }
-            }
-          } else if (typeof v === "string") {
-            // case C) "a,b,c"
-            const parts = v.split(/[,\n]/).map((x) => this.__cleanText(x)).filter(Boolean);
-            for (const p of parts) {
-              const nk = this.__normNoSpace(p);
-              if (!nk || seen.has(nk)) continue;
-              seen.add(nk);
-              out.push(p);
-            }
+      for (const [k, v] of Object.entries(x)) {
+        if (k === target && Array.isArray(v)) {
+          for (const it of v) {
+            if (typeof it === "string") push(it);
           }
+        } else {
+          walk(v);
         }
-
-        visit(v);
-        if (out.length >= 50) return;
       }
     };
 
-    visit(obj);
-
-    // 마지막 필터(노이즈/프로모션/너무긴것 제거)
-    return out
-      .map((x) => x.replace(/^#/, "").trim())
-      .filter(Boolean)
-      .filter((x) => x.length >= 2 && x.length <= 25)
-      .filter((x) => !/(로그인|동의|확인|취소|닫기)/i.test(x))
-      .slice(0, 50);
+    walk(obj);
+    return out.slice(0, 30);
   }
 
-  // ✅ TS 에러 해결 2) __extractKeywordArrayByRegex 추가
-  // - JSON stringify된 배열 / HTML / script 텍스트에서 "키워드 후보"만 뽑아냄 (최후 fallback)
+  // ==========================
+  // ✅ FIX: 누락 메서드 #2
+  // - regex_fallback이 meta(ko/utf-8/viewport…)를 키워드로 오인하던 문제 차단
+  // - JSON-ish 배열(["..",".."])만 대상으로 추출
+  // ==========================
   private __extractKeywordArrayByRegex(text: string): string[] {
     const s = String(text || "");
     if (!s) return [];
 
+    const arrMatches = s.match(/\[\s*(?:"[^"]{2,40}"\s*,\s*){0,25}"[^"]{2,40}"\s*\]/g) || [];
+    if (!arrMatches.length) return [];
+
+    const noise = (t: string) => {
+      const x = t.toLowerCase();
+
+      // ✅ HTML/meta/헤더 토큰 강력 차단
+      if (
+        x === "ko" ||
+        x === "utf-8" ||
+        x === "utf8" ||
+        x.includes("x-ua-compatible") ||
+        x.includes("ua-compatible") ||
+        x.includes("ie=edge") ||
+        x.includes("ieedge") ||
+        x.includes("viewport") ||
+        x.startsWith("_viewport") ||
+        x.includes("content-type") ||
+        x.includes("text/html")
+      )
+        return true;
+
+      // 기본 UI/잡음
+      if (
+        /^(저장|공유|길찾기|전화|예약|리뷰|사진|홈|메뉴|가격|더보기|쿠폰|이벤트|알림받기)$/i.test(t) ||
+        /(방문자\s*리뷰|방문자리뷰|블로그\s*리뷰|블로그리뷰|별점|평점)/i.test(t) ||
+        /(로그인|동의|확인|취소|닫기)/i.test(t)
+      )
+        return true;
+
+      // 프로모션/가격
+      if (/(원|만원|%|할인|쿠폰|이벤트|특가)/.test(t) && /\d/.test(t)) return true;
+
+      // 한글이 하나도 없고 영문/숫자/기호만이면 대부분 헤더 토큰
+      if (!/[가-힣]/.test(t) && /^[a-z0-9\-_]+$/i.test(t)) return true;
+
+      return false;
+    };
+
     const out: string[] = [];
     const seen = new Set<string>();
 
-    const push = (raw: string) => {
-      const v = this.__cleanText(raw).replace(/^#/, "").trim();
-      if (!v) return;
-      if (v.length < 2 || v.length > 25) return;
+    for (const chunk of arrMatches) {
+      let arr: any = null;
+      try {
+        arr = JSON.parse(chunk);
+      } catch {
+        arr = null;
+      }
+      if (!Array.isArray(arr)) continue;
 
-      // 잡음/프로모션 컷
-      if (
-        /^(저장|공유|길찾기|전화|예약|리뷰|사진|홈|메뉴|가격|더보기|쿠폰|이벤트|알림받기)$/i.test(v) ||
-        /(방문자\s*리뷰|방문자리뷰|블로그\s*리뷰|블로그리뷰|별점|평점)/i.test(v) ||
-        /(로그인|동의|확인|취소|닫기)/i.test(v)
-      )
-        return;
-      if (/(원|만원|%|할인|쿠폰|이벤트|특가)/.test(v) && /\d/.test(v)) return;
+      for (const v of arr) {
+        if (typeof v !== "string") continue;
+        const t = this.__cleanText(v).replace(/^#/, "").trim();
+        if (!t) continue;
+        if (t.length < 2 || t.length > 25) continue;
+        if (noise(t)) continue;
 
-      const k = this.__normNoSpace(v);
-      if (!k || seen.has(k)) return;
-      seen.add(k);
-      out.push(v);
-    };
+        const key = this.__normNoSpace(t);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push(t);
 
-    // 1) ["키워드1","키워드2"] 형태에서 추출
-    const reQuoted = /["']([^"']{2,40})["']/g;
-    for (const m of s.matchAll(reQuoted)) {
-      const v = m[1] || "";
-      // 너무 흔한 key 문자열 제외
-      if (/^(keywordList|keywords|representKeyword|representativeKeyword|name|title|value)$/i.test(v)) continue;
-      push(v);
-      if (out.length >= 40) break;
-    }
-
-    // 2) keyword:"..." / name:"..." 형태 보강
-    if (out.length < 5) {
-      const reKV = /(?:keyword|name|title|value|text)\s*["']?\s*[:=]\s*["']([^"']{2,40})["']/gi;
-      for (const m of s.matchAll(reKV)) {
-        push(m[1] || "");
-        if (out.length >= 40) break;
+        if (out.length >= 16) return out.slice(0, 16);
       }
     }
 
